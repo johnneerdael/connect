@@ -18,7 +18,12 @@ fn packaging_assets_exist() {
     );
     assert_file_contains(
         &repo_root.join(".github/workflows/release.yml"),
-        ["actions/upload-artifact@v4", "pkgbuild", "wix build"],
+        [
+            "actions/upload-artifact@v4",
+            "pkgbuild",
+            "wix build",
+            "WixToolset.Util.wixext",
+        ],
     );
     assert_file_contains(
         &repo_root.join("README.md"),
