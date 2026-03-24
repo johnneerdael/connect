@@ -21,6 +21,8 @@ fn packaging_assets_exist() {
         [
             "actions/upload-artifact@v4",
             "pkgbuild",
+            "PACKAGE_VERSION",
+            "github.ref_type == 'tag'",
             "wix build",
             "WixToolset.Util.wixext",
         ],
