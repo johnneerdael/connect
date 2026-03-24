@@ -61,7 +61,9 @@ impl CopySpec {
 
     pub fn remote_profile(&self) -> &str {
         match (&self.source, &self.destination) {
-            (CopyEndpoint::Remote(remote), _) | (_, CopyEndpoint::Remote(remote)) => &remote.profile,
+            (CopyEndpoint::Remote(remote), _) | (_, CopyEndpoint::Remote(remote)) => {
+                &remote.profile
+            }
             _ => unreachable!("copy specs must have exactly one remote endpoint"),
         }
     }

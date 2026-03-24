@@ -14,6 +14,6 @@ pub mod commands {
 pub mod types;
 
 pub use types::{
-    AddArgs, Cli, Command, CopyArgs, EditArgs, HostkeysArgs, HostkeysCommand,
-    HostkeysDeleteArgs, HostkeysListArgs, ListArgs, RemoveArgs, ShowArgs,
+    AddArgs, Cli, Command, CopyArgs, EditArgs, HostkeysArgs, HostkeysCommand, HostkeysDeleteArgs,
+    HostkeysListArgs, ListArgs, RemoveArgs, ShowArgs,
 };

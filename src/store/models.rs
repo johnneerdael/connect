@@ -10,7 +10,11 @@ pub struct ProfileInput {
 }
 
 impl ProfileInput {
-    pub fn new(name: impl Into<String>, host: impl Into<String>, username: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        host: impl Into<String>,
+        username: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             host: host.into(),

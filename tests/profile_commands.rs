@@ -46,7 +46,11 @@ impl TestHarness {
         let harness = Self::new();
         harness
             .app()
-            .save_profile(ProfileInput::new(name, format!("{name}.example.com"), "deploy"))
+            .save_profile(ProfileInput::new(
+                name,
+                format!("{name}.example.com"),
+                "deploy",
+            ))
             .unwrap();
         harness
     }
@@ -196,7 +200,10 @@ fn add_command_rejects_duplicate_profile_names() {
         .app()
         .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
         .unwrap();
-    harness.secrets().set_password("prod", "old-secret").unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "old-secret")
+        .unwrap();
     harness
         .app()
         .update_profile_secret_flags("prod", true, false, false)
@@ -212,7 +219,13 @@ fn add_command_rejects_duplicate_profile_names() {
         key_passphrase: None,
     };
 
-    let error = add::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
     assert_eq!(error.to_string(), "profile 'prod' already exists");
 
     let profile = harness.app().get_profile("prod").unwrap();
@@ -239,9 +252,18 @@ fn add_command_rejects_reserved_profile_name() {
         key_passphrase: None,
     };
 
-    let error = add::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
     assert_eq!(error.to_string(), "profile name 'list' is reserved");
-    assert!(matches!(harness.app().get_profile("list"), Err(Error::ProfileNotFound(_))));
+    assert!(matches!(
+        harness.app().get_profile("list"),
+        Err(Error::ProfileNotFound(_))
+    ));
 }
 
 #[test]
@@ -258,12 +280,21 @@ fn add_command_rejects_single_letter_profile_name() {
         key_passphrase: None,
     };
 
-    let error = add::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
     assert_eq!(
         error.to_string(),
         "single-letter profile names are reserved to avoid Windows path ambiguity"
     );
-    assert!(matches!(harness.app().get_profile("c"), Err(Error::ProfileNotFound(_))));
+    assert!(matches!(
+        harness.app().get_profile("c"),
+        Err(Error::ProfileNotFound(_))
+    ));
 }
 
 #[test]
@@ -413,7 +444,13 @@ fn edit_command_rejects_reserved_profile_name() {
         key_passphrase: None,
     };
 
-    let error = edit::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
     assert_eq!(error.to_string(), "profile name 'list' is reserved");
 
     let profile = harness.app().get_profile("list").unwrap();
@@ -438,7 +475,13 @@ fn edit_command_allows_existing_single_letter_profile_name() {
         key_passphrase: None,
     };
 
-    edit::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap();
+    edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
 
     let profile = harness.app().get_profile("c").unwrap();
     assert_eq!(profile.host, "prod-2.example.com");
@@ -614,7 +657,7 @@ fn runtime_app_defaults_to_keyring_secret_store() {
 fn profile_delete_keeps_metadata_when_secret_cleanup_fails() {
     let root = unique_temp_path("connect-delete-failure");
     let paths = AppPaths::from_root(&root);
-    let secrets = Arc::new(DeleteFailsSecretStore::default());
+    let secrets = Arc::new(DeleteFailsSecretStore);
     let app = App::new(paths, secrets).unwrap();
 
     app.save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
@@ -640,7 +683,9 @@ async fn connect_uses_profile_and_rejects_host_key_mismatch() {
         .connect_profile("prod", &ssh, &FakePrompt::default())
         .await;
 
-    assert!(matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key"));
+    assert!(
+        matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key")
+    );
 }
 
 #[tokio::test]
@@ -649,9 +694,15 @@ async fn connect_tries_private_key_before_password() {
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
         .secrets()
-        .set_private_key("prod", "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n")
+        .set_private_key(
+            "prod",
+            "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+        )
         .unwrap();
-    harness.secrets().set_password("prod", "super-secret").unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
     harness
         .app()
         .update_profile_secret_flags("prod", true, true, false)
@@ -672,7 +723,10 @@ async fn connect_tries_private_key_before_password() {
 async fn connect_propagates_remote_exit_status() {
     let harness = TestHarness::with_profile("prod");
     harness.save_hostkey("prod.example.com", 22, "fp-123");
-    harness.secrets().set_password("prod", "super-secret").unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
     harness
         .app()
         .update_profile_secret_flags("prod", true, false, false)
@@ -706,7 +760,9 @@ async fn copy_uses_profile_and_rejects_host_key_mismatch() {
         .copy(&spec, &ssh, &FakePrompt::default())
         .await;
 
-    assert!(matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key"));
+    assert!(
+        matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key")
+    );
 }
 
 #[tokio::test]
@@ -715,9 +771,15 @@ async fn copy_tries_private_key_before_password() {
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
         .secrets()
-        .set_private_key("prod", "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n")
+        .set_private_key(
+            "prod",
+            "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+        )
         .unwrap();
-    harness.secrets().set_password("prod", "super-secret").unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
     harness
         .app()
         .update_profile_secret_flags("prod", true, true, false)
@@ -741,7 +803,11 @@ async fn copy_tries_private_key_before_password() {
     assert_eq!(ssh.auth_attempts(), vec!["key", "password"]);
     assert_eq!(
         ssh.transfers(),
-        vec![(CopyDirection::Upload, source.path().to_path_buf(), "/tmp/artifact.txt".into())]
+        vec![(
+            CopyDirection::Upload,
+            source.path().to_path_buf(),
+            "/tmp/artifact.txt".into()
+        )]
     );
 }
 
@@ -749,7 +815,10 @@ async fn copy_tries_private_key_before_password() {
 async fn copy_rejects_remote_directory_without_recursive_flag() {
     let harness = TestHarness::with_profile("prod");
     harness.save_hostkey("prod.example.com", 22, "fp-123");
-    harness.secrets().set_password("prod", "super-secret").unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
     harness
         .app()
         .update_profile_secret_flags("prod", true, false, false)
@@ -785,7 +854,12 @@ async fn copy_accepts_explicit_remote_prefix_for_single_letter_profile() {
         .unwrap();
 
     let destination = unique_temp_path("connect-copy-single-letter");
-    let spec = parse_copy_spec("@p:/tmp/artifact.txt", &destination.to_string_lossy(), false).unwrap();
+    let spec = parse_copy_spec(
+        "@p:/tmp/artifact.txt",
+        &destination.to_string_lossy(),
+        false,
+    )
+    .unwrap();
     let ssh = FakeCopySshClient::with_hostkey("fp-123");
     ssh.state
         .lock()
@@ -819,15 +893,22 @@ async fn copy_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
         .save_profile(ProfileInput::new("@prod", "prod.example.com", "deploy"))
         .unwrap();
     harness.save_hostkey("prod.example.com", 22, "fp-123");
-    harness.secrets().set_password("@prod", "super-secret").unwrap();
+    harness
+        .secrets()
+        .set_password("@prod", "super-secret")
+        .unwrap();
     harness
         .app()
         .update_profile_secret_flags("@prod", true, false, false)
         .unwrap();
 
     let destination = unique_temp_path("connect-copy-at-profile");
-    let spec = parse_copy_spec("@@prod:/tmp/artifact.txt", &destination.to_string_lossy(), false)
-        .unwrap();
+    let spec = parse_copy_spec(
+        "@@prod:/tmp/artifact.txt",
+        &destination.to_string_lossy(),
+        false,
+    )
+    .unwrap();
     let ssh = FakeCopySshClient::with_hostkey("fp-123");
     ssh.state
         .lock()
@@ -1128,9 +1209,9 @@ impl SshClient for FakeCopySshClient {
         >,
     > {
         let state = Arc::clone(&self.state);
-        Box::pin(async move {
-            Ok(Box::new(FakeCopySession { state }) as Box<dyn SshSession + Send>)
-        })
+        Box::pin(
+            async move { Ok(Box::new(FakeCopySession { state }) as Box<dyn SshSession + Send>) },
+        )
     }
 }
 
@@ -1182,9 +1263,8 @@ impl SshSession for FakeCopySession {
     fn remote_file_type<'a>(
         &'a mut self,
         path: &'a str,
-    ) -> Pin<
-        Box<dyn Future<Output = connect::error::Result<Option<RemoteFileType>>> + Send + 'a>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<RemoteFileType>>> + Send + 'a>>
+    {
         let file_type = self.state.lock().unwrap().remote_paths.get(path).copied();
         Box::pin(async move { Ok(file_type) })
     }
@@ -1192,11 +1272,8 @@ impl SshSession for FakeCopySession {
     fn read_remote_dir<'a>(
         &'a mut self,
         path: &'a str,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = connect::error::Result<Vec<RemoteDirectoryEntry>>> + Send + 'a,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Vec<RemoteDirectoryEntry>>> + Send + 'a>>
+    {
         let entries = self
             .state
             .lock()
@@ -1221,9 +1298,11 @@ impl SshSession for FakeCopySession {
         remote_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
         let mut state = self.state.lock().unwrap();
-        state
-            .transfers
-            .push((CopyDirection::Upload, local_path.to_path_buf(), remote_path.into()));
+        state.transfers.push((
+            CopyDirection::Upload,
+            local_path.to_path_buf(),
+            remote_path.into(),
+        ));
         Box::pin(async move { Ok(()) })
     }
 
@@ -1233,9 +1312,11 @@ impl SshSession for FakeCopySession {
         local_path: &'a Path,
     ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
         let mut state = self.state.lock().unwrap();
-        state
-            .transfers
-            .push((CopyDirection::Download, local_path.to_path_buf(), remote_path.into()));
+        state.transfers.push((
+            CopyDirection::Download,
+            local_path.to_path_buf(),
+            remote_path.into(),
+        ));
         Box::pin(async move { Ok(()) })
     }
 }
@@ -1314,9 +1395,9 @@ impl SshClient for FakeConnectSshClient {
         >,
     > {
         let state = Arc::clone(&self.state);
-        Box::pin(async move {
-            Ok(Box::new(FakeConnectSession { state }) as Box<dyn SshSession + Send>)
-        })
+        Box::pin(
+            async move { Ok(Box::new(FakeConnectSession { state }) as Box<dyn SshSession + Send>) },
+        )
     }
 }
 
@@ -1339,8 +1420,9 @@ impl SshSession for FakeConnectSession {
         _username: &'a str,
         _private_key: &'a str,
         _passphrase: Option<&'a str>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>,
+    > {
         let result = {
             let mut state = self.state.lock().unwrap();
             state.auth_attempts.push("key");
@@ -1353,8 +1435,9 @@ impl SshSession for FakeConnectSession {
         &'a mut self,
         _username: &'a str,
         _password: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>,
+    > {
         let result = {
             let mut state = self.state.lock().unwrap();
             state.auth_attempts.push("password");

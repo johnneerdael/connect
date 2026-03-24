@@ -26,16 +26,17 @@ use crate::{
     terminal::interactive::InteractiveTerminal,
 };
 
-use super::{
-    verify_observed_host_key, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
-};
+use super::{verify_observed_host_key, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType};
+
+type DynSshSession = Box<dyn SshSession + Send + 'static>;
+type SshResultFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 pub trait SshClient: Send + Sync {
     fn connect<'a>(
         &'a self,
         profile: &'a Profile,
         expected_host_key: Option<&'a HostKeyRecord>,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SshSession + Send + 'static>>> + Send + 'a>>;
+    ) -> SshResultFuture<'a, DynSshSession>;
 }
 
 pub trait SshSession: Send {
@@ -112,14 +113,10 @@ impl SshClient for RusshClient {
         &'a self,
         profile: &'a Profile,
         expected_host_key: Option<&'a HostKeyRecord>,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SshSession + Send + 'static>>> + Send + 'a>>
-    {
+    ) -> SshResultFuture<'a, DynSshSession> {
         Box::pin(async move {
-            let handler = HostKeyRecorder::new(
-                &profile.host,
-                profile.port,
-                expected_host_key.cloned(),
-            );
+            let handler =
+                HostKeyRecorder::new(&profile.host, profile.port, expected_host_key.cloned());
             let observed_state = Arc::clone(&handler.observed);
             let mismatch_state = Arc::clone(&handler.host_key_mismatch);
             let config = Arc::new(client::Config {
@@ -127,17 +124,19 @@ impl SshClient for RusshClient {
                 ..Default::default()
             });
 
-            let handle = match client::connect(config, (profile.host.as_str(), profile.port), handler)
-                .await
-            {
-                Ok(handle) => handle,
-                Err(error) => {
-                    if host_key_mismatch(&mismatch_state)? {
-                        return Err(Error::new("saved host key does not match the server host key"));
+            let handle =
+                match client::connect(config, (profile.host.as_str(), profile.port), handler).await
+                {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        if host_key_mismatch(&mismatch_state)? {
+                            return Err(Error::new(
+                                "saved host key does not match the server host key",
+                            ));
+                        }
+                        return Err(map_ssh_error(error));
                     }
-                    return Err(map_ssh_error(error));
-                }
-            };
+                };
             let observed = host_key_from_state(&observed_state)?;
 
             Ok(Box::new(RusshSession {
@@ -145,7 +144,7 @@ impl SshClient for RusshClient {
                 observed,
                 terminal: self.terminal.clone(),
                 sftp: None,
-            }) as Box<dyn SshSession + Send>)
+            }) as DynSshSession)
         })
     }
 }
@@ -175,7 +174,10 @@ impl RusshSession {
             self.sftp = Some(sftp);
         }
 
-        Ok(self.sftp.as_mut().expect("sftp session should be initialized"))
+        Ok(self
+            .sftp
+            .as_mut()
+            .expect("sftp session should be initialized"))
     }
 }
 
@@ -379,17 +381,14 @@ impl client::Handler for HostKeyRecorder {
                 .to_string(),
             public_key: server_public_key.public_key_base64(),
         };
-        *self
-            .observed
-            .lock()
-            .map_err(|_| russh::Error::IO(std::io::Error::other("host key recorder lock poisoned")))?
-            = Some(observed.clone());
+        *self.observed.lock().map_err(|_| {
+            russh::Error::IO(std::io::Error::other("host key recorder lock poisoned"))
+        })? = Some(observed.clone());
         if let Some(expected_host_key) = self.expected_host_key.as_ref() {
             if verify_observed_host_key(Some(expected_host_key), &observed).is_err() {
-                *self
-                    .host_key_mismatch
-                    .lock()
-                    .map_err(|_| russh::Error::IO(std::io::Error::other("host key mismatch lock poisoned")))? = true;
+                *self.host_key_mismatch.lock().map_err(|_| {
+                    russh::Error::IO(std::io::Error::other("host key mismatch lock poisoned"))
+                })? = true;
                 return Ok(false);
             }
         }

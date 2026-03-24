@@ -34,7 +34,9 @@ pub fn verify_observed_host_key(
     match stored {
         None => Ok(HostKeyVerification::TrustOnFirstUse),
         Some(record) if host_key_matches(record, observed) => Ok(HostKeyVerification::Trusted),
-        Some(_) => Err(Error::new("saved host key does not match the server host key")),
+        Some(_) => Err(Error::new(
+            "saved host key does not match the server host key",
+        )),
     }
 }
 

@@ -14,12 +14,8 @@ fn connect_test_bin() -> Command {
 #[test]
 fn parse_copy_spec_accepts_upload_from_local_to_remote() {
     let file = temp_file("connect-copy-file", "artifact.txt", "hello");
-    let spec = parse_copy_spec(
-        file.to_string_lossy().as_ref(),
-        "prod:/tmp/file.txt",
-        false,
-    )
-    .unwrap();
+    let spec =
+        parse_copy_spec(file.to_string_lossy().as_ref(), "prod:/tmp/file.txt", false).unwrap();
 
     match &spec.source {
         CopyEndpoint::Local(path) => assert_eq!(path, &file),
@@ -132,11 +128,7 @@ fn copy_rejects_directory_without_recursive_flag() {
     std::fs::write(tree.join("nested/file.txt"), "hello").unwrap();
 
     connect_test_bin()
-        .args([
-            "copy",
-            tree.to_string_lossy().as_ref(),
-            "prod:/tmp/tree",
-        ])
+        .args(["copy", tree.to_string_lossy().as_ref(), "prod:/tmp/tree"])
         .assert()
         .failure()
         .stderr(contains("--recursive"));

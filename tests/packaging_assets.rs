@@ -33,8 +33,8 @@ fn packaging_assets_exist() {
 }
 
 fn assert_file_contains<const N: usize>(path: &PathBuf, needles: [&str; N]) {
-    let contents =
-        fs::read_to_string(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let contents = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
 
     for needle in needles {
         assert!(

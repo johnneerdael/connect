@@ -109,7 +109,13 @@ fn hostkey_get_returns_saved_record_fields() {
 
     harness
         .app()
-        .save_host_key("prod.example.com", 22, "ssh-ed25519", "fp-123", "pubkey-123")
+        .save_host_key(
+            "prod.example.com",
+            22,
+            "ssh-ed25519",
+            "fp-123",
+            "pubkey-123",
+        )
         .unwrap();
 
     let record = harness
@@ -166,7 +172,10 @@ fn hostkey_delete_requires_host_port_format() {
     )
     .unwrap_err();
 
-    assert_eq!(error.to_string(), "host key target must be in host:port format");
+    assert_eq!(
+        error.to_string(),
+        "host key target must be in host:port format"
+    );
 }
 
 #[test]
@@ -175,7 +184,13 @@ fn hostkeys_list_command_routes_through_binary() {
 
     harness
         .app()
-        .save_host_key("prod.example.com", 22, "ssh-ed25519", "fp-123", "pubkey-123")
+        .save_host_key(
+            "prod.example.com",
+            22,
+            "ssh-ed25519",
+            "fp-123",
+            "pubkey-123",
+        )
         .unwrap();
 
     connect_test_bin()
@@ -192,7 +207,13 @@ fn hostkeys_delete_command_routes_through_binary() {
 
     harness
         .app()
-        .save_host_key("prod.example.com", 22, "ssh-ed25519", "fp-123", "pubkey-123")
+        .save_host_key(
+            "prod.example.com",
+            22,
+            "ssh-ed25519",
+            "fp-123",
+            "pubkey-123",
+        )
         .unwrap();
 
     connect_test_bin()
@@ -433,9 +454,9 @@ impl SshClient for FakeSshClient {
         >,
     > {
         let observed = self.observed.clone();
-        Box::pin(async move {
-            Ok(Box::new(FakeSshSession { observed }) as Box<dyn SshSession + Send>)
-        })
+        Box::pin(
+            async move { Ok(Box::new(FakeSshSession { observed }) as Box<dyn SshSession + Send>) },
+        )
     }
 }
 

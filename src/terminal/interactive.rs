@@ -4,9 +4,7 @@ use crossterm::terminal;
 use russh::{Channel, ChannelId, ChannelMsg};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
-use crate::{
-    error::{Error, Result},
-};
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Default)]
 pub struct InteractiveTerminal;
@@ -87,7 +85,8 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn new() -> Result<Self> {
-        terminal::enable_raw_mode().map_err(|error| Error::new(format!("terminal error: {error}")))?;
+        terminal::enable_raw_mode()
+            .map_err(|error| Error::new(format!("terminal error: {error}")))?;
         Ok(Self { enabled: true })
     }
 }
