@@ -8,11 +8,17 @@ use crate::{
     terminal::prompt::Prompt,
 };
 
-use super::add::{validate_non_empty, validate_port, validate_profile_name};
+use super::add::{
+    is_windows_drive_profile_name, validate_non_empty, validate_port, validate_profile_name,
+};
 
 pub fn run(app: &App, _prompt: &dyn Prompt, args: &EditArgs, writer: &mut dyn Write) -> Result<()> {
     let existing = app.get_profile(&args.name)?;
-    let name = validate_profile_name(args.name.clone())?;
+    let name = if is_windows_drive_profile_name(&existing.name) {
+        existing.name.clone()
+    } else {
+        validate_profile_name(args.name.clone())?
+    };
     let host = match &args.host {
         Some(host) => validate_non_empty("host", host.clone())?,
         None => existing.host,

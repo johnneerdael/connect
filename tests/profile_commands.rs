@@ -421,7 +421,7 @@ fn edit_command_rejects_reserved_profile_name() {
 }
 
 #[test]
-fn edit_command_rejects_single_letter_profile_name() {
+fn edit_command_allows_existing_single_letter_profile_name() {
     let harness = TestHarness::new();
     harness
         .app()
@@ -438,14 +438,10 @@ fn edit_command_rejects_single_letter_profile_name() {
         key_passphrase: None,
     };
 
-    let error = edit::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "single-letter profile names are reserved to avoid Windows path ambiguity"
-    );
+    edit::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap();
 
     let profile = harness.app().get_profile("c").unwrap();
-    assert_eq!(profile.host, "prod.example.com");
+    assert_eq!(profile.host, "prod-2.example.com");
 }
 
 #[test]
@@ -770,6 +766,47 @@ async fn copy_rejects_remote_directory_without_recursive_flag() {
         .unwrap_err();
 
     assert!(error.to_string().contains("--recursive"));
+
+    let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn copy_accepts_explicit_remote_prefix_for_single_letter_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("p", "prod.example.com", "deploy"))
+        .unwrap();
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness.secrets().set_password("p", "super-secret").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("p", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-single-letter");
+    let spec = parse_copy_spec("@p:/tmp/artifact.txt", &destination.to_string_lossy(), false).unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+    ssh.state
+        .lock()
+        .unwrap()
+        .remote_paths
+        .insert("/tmp/artifact.txt".into(), RemoteFileType::File);
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Download,
+            destination.join("artifact.txt"),
+            "/tmp/artifact.txt".into()
+        )]
+    );
 
     let _ = fs::remove_dir_all(destination);
 }

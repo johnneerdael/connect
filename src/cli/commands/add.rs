@@ -82,7 +82,7 @@ pub(crate) fn validate_port(port: u16) -> Result<u16> {
     }
 }
 
-fn is_windows_drive_profile_name(name: &str) -> bool {
+pub(crate) fn is_windows_drive_profile_name(name: &str) -> bool {
     name.len() == 1
         && name
             .chars()

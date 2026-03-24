@@ -72,6 +72,24 @@ fn parse_copy_spec_treats_windows_drive_paths_as_local_destination() {
 }
 
 #[test]
+fn parse_copy_spec_accepts_explicit_remote_prefix_for_single_letter_profile() {
+    let spec = parse_copy_spec("@p:/tmp/file.txt", "./downloads/file.txt", false).unwrap();
+
+    match &spec.source {
+        CopyEndpoint::Remote(remote) => {
+            assert_eq!(remote.profile, "p");
+            assert_eq!(remote.path, "/tmp/file.txt");
+        }
+        other => panic!("expected remote source, got {other:?}"),
+    }
+
+    match &spec.destination {
+        CopyEndpoint::Local(path) => assert_eq!(path, Path::new("./downloads/file.txt")),
+        other => panic!("expected local destination, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_copy_spec_rejects_local_to_local_invocations() {
     let error = parse_copy_spec("fixtures/file.txt", "./downloads/file.txt", false).unwrap_err();
     assert_eq!(

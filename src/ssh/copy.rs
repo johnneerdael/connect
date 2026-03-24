@@ -293,9 +293,14 @@ fn parse_endpoint(field: &str, value: &str) -> Result<CopyEndpoint> {
 }
 
 fn parse_remote_path(value: &str) -> Option<RemotePath> {
-    let (profile, path) = value.split_once(':')?;
-    let profile = profile.trim();
-    if profile.is_empty() || !path.starts_with('/') || is_windows_drive_path(profile, path) {
+    let (raw_profile, path) = value.split_once(':')?;
+    let forced_remote = raw_profile.starts_with('@');
+    let profile = raw_profile.trim_start_matches('@').trim();
+    if profile.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+
+    if !forced_remote && is_windows_drive_path(profile, path) {
         return None;
     }
 
@@ -381,6 +386,17 @@ mod tests {
             parse_remote_path("prod:/tmp/file.txt"),
             Some(RemotePath {
                 profile: "prod".into(),
+                path: "/tmp/file.txt".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_remote_path_accepts_explicit_remote_prefix() {
+        assert_eq!(
+            parse_remote_path("@p:/tmp/file.txt"),
+            Some(RemotePath {
+                profile: "p".into(),
                 path: "/tmp/file.txt".into(),
             })
         );
