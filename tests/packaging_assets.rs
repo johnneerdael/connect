@@ -20,7 +20,7 @@ fn packaging_assets_exist() {
     );
     assert_file_contains(
         &repo_root.join("packaging/windows/connect.wxs"),
-        ["ProgramFiles64Folder", "PATH", "connect.exe"],
+        ["ProgramFiles64Folder", "Environment", "PATH", "connect.exe"],
     );
     assert_file_contains(
         &repo_root.join(".github/workflows/release.yml"),
@@ -31,8 +31,6 @@ fn packaging_assets_exist() {
             "GITHUB_REF_NAME",
             "pkgbuild",
             "wix build",
-            "WixToolset.Util.wixext/6.0.2",
-            "WixToolset.Util.wixext",
         ],
     );
     assert_file_contains(
