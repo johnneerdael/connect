@@ -5,8 +5,12 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+keyring = "4.0.0-rc.3"
+keyring-core = "0.7.2"
+rusqlite = { version = "0.39", features = ["bundled"] }
+thiserror = "2.0"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
-

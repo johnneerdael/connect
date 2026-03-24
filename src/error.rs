@@ -1,25 +1,25 @@
-use std::fmt;
+use thiserror::Error as ThisError;
 
-#[derive(Debug, Clone)]
-pub struct Error {
-    message: String,
+#[derive(Debug, ThisError)]
+pub enum Error {
+    #[error("{0}")]
+    Message(String),
+    #[error("unable to resolve per-user application directories")]
+    MissingAppDirectories,
+    #[error("profile '{0}' was not found")]
+    ProfileNotFound(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Keyring(#[from] keyring_core::Error),
 }
 
 impl Error {
     pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
+        Self::Message(message.into())
     }
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
-
