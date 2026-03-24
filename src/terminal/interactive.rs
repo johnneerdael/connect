@@ -1,10 +1,12 @@
-use std::env;
+use std::{env, future::Future, pin::Pin};
 
 use crossterm::terminal;
 use russh::{Channel, ChannelId, ChannelMsg};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{Error, Result};
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct InteractiveTerminal;
@@ -26,25 +28,34 @@ impl InteractiveTerminal {
         S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
     {
         let _raw_mode = RawModeGuard::new()?;
+        let mut channel = RusshChannelAdapter { channel };
         let mut stdin = io::stdin();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
+        self.attach_io(&mut channel, &mut stdin, &mut stdout, &mut stderr)
+            .await
+    }
+
+    async fn attach_io<C, I, O, E>(
+        &self,
+        channel: &mut C,
+        stdin: &mut I,
+        stdout: &mut O,
+        stderr: &mut E,
+    ) -> Result<u32>
+    where
+        C: SessionChannel,
+        I: AsyncRead + Unpin,
+        O: AsyncWrite + Unpin,
+        E: AsyncWrite + Unpin,
+    {
         let mut buffer = vec![0; 1024];
         let mut stdin_open = true;
         let mut exit_status = None;
 
         loop {
             tokio::select! {
-                read = stdin.read(&mut buffer), if stdin_open => {
-                    match read {
-                        Ok(0) => {
-                            stdin_open = false;
-                            channel.eof().await.map_err(map_ssh_error)?;
-                        }
-                        Ok(count) => channel.data(&buffer[..count]).await.map_err(map_ssh_error)?,
-                        Err(error) => return Err(Error::from(error)),
-                    }
-                }
+                biased;
                 message = channel.wait() => {
                     let Some(message) = message else {
                         break;
@@ -62,6 +73,7 @@ impl InteractiveTerminal {
                         ChannelMsg::Eof | ChannelMsg::Close => break,
                         ChannelMsg::ExitStatus { exit_status: status } => {
                             exit_status = Some(status);
+                            break;
                         }
                         ChannelMsg::ExitSignal { signal_name, .. } => {
                             return Err(Error::new(format!(
@@ -70,6 +82,16 @@ impl InteractiveTerminal {
                             )));
                         }
                         _ => {}
+                    }
+                }
+                read = stdin.read(&mut buffer), if stdin_open => {
+                    match read {
+                        Ok(0) => {
+                            stdin_open = false;
+                            channel.eof().await?;
+                        }
+                        Ok(count) => channel.data(&buffer[..count]).await?,
+                        Err(error) => return Err(Error::from(error)),
                     }
                 }
             }
@@ -101,4 +123,133 @@ impl Drop for RawModeGuard {
 
 fn map_ssh_error(error: impl std::fmt::Display) -> Error {
     Error::new(format!("ssh error: {error}"))
+}
+
+trait SessionChannel {
+    fn data<'a>(&'a self, data: &'a [u8]) -> BoxFuture<'a, Result<()>>;
+    fn eof<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
+    fn wait<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>>;
+}
+
+struct RusshChannelAdapter<'a, S>
+where
+    S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
+{
+    channel: &'a mut Channel<S>,
+}
+
+impl<S> SessionChannel for RusshChannelAdapter<'_, S>
+where
+    S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
+{
+    fn data<'a>(&'a self, data: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.channel.data(data).await.map_err(map_ssh_error) })
+    }
+
+    fn eof<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.channel.eof().await.map_err(map_ssh_error) })
+    }
+
+    fn wait<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>> {
+        Box::pin(async move { self.channel.wait().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+        task::{Context, Poll},
+    };
+
+    use tokio::io::{sink, AsyncRead, ReadBuf};
+    use tokio::time::{timeout, Duration};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn attach_returns_on_exit_status_without_waiting_for_channel_close() {
+        let terminal = InteractiveTerminal;
+        let mut channel =
+            FakeSessionChannel::with_messages([ChannelMsg::ExitStatus { exit_status: 23 }]);
+        let mut stdin = PendingReader;
+        let mut stdout = sink();
+        let mut stderr = sink();
+
+        let exit_status = timeout(
+            Duration::from_millis(100),
+            terminal.attach_io(&mut channel, &mut stdin, &mut stdout, &mut stderr),
+        )
+        .await
+        .expect("session loop should stop on exit status")
+        .expect("session loop should return successfully");
+
+        assert_eq!(exit_status, 23);
+        assert_eq!(channel.sent_data_len(), 0);
+    }
+
+    struct PendingReader;
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    struct FakeSessionChannel {
+        messages: VecDeque<ChannelMsg>,
+        sent_data: Mutex<Vec<Vec<u8>>>,
+        eof_count: AtomicUsize,
+    }
+
+    impl FakeSessionChannel {
+        fn with_messages(messages: impl IntoIterator<Item = ChannelMsg>) -> Self {
+            Self {
+                messages: messages.into_iter().collect(),
+                sent_data: Mutex::new(Vec::new()),
+                eof_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn sent_data_len(&self) -> usize {
+            self.sent_data.lock().expect("poisoned sent_data").len()
+        }
+    }
+
+    impl SessionChannel for FakeSessionChannel {
+        fn data<'a>(&'a self, data: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.sent_data
+                    .lock()
+                    .expect("poisoned sent_data")
+                    .push(data.to_vec());
+                Ok(())
+            })
+        }
+
+        fn eof<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.eof_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn wait<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>> {
+            Box::pin(async move {
+                if let Some(message) = self.messages.pop_front() {
+                    Some(message)
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+    }
 }
