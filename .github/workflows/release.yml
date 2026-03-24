@@ -72,7 +72,7 @@ jobs:
         run: |
           dotnet tool install --global wix
           $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
-          wix extension add WixToolset.Util.wixext
+          wix extension add WixToolset.Util.wixext/6.0.2
 
       - name: Package Windows installer
         if: matrix.kind == 'windows'

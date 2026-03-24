@@ -31,6 +31,7 @@ fn packaging_assets_exist() {
             "GITHUB_REF_NAME",
             "pkgbuild",
             "wix build",
+            "WixToolset.Util.wixext/6.0.2",
             "WixToolset.Util.wixext",
         ],
     );
