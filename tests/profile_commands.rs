@@ -811,6 +811,48 @@ async fn copy_accepts_explicit_remote_prefix_for_single_letter_profile() {
     let _ = fs::remove_dir_all(destination);
 }
 
+#[tokio::test]
+async fn copy_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("@prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness.secrets().set_password("@prod", "super-secret").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("@prod", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-at-profile");
+    let spec = parse_copy_spec("@@prod:/tmp/artifact.txt", &destination.to_string_lossy(), false)
+        .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+    ssh.state
+        .lock()
+        .unwrap()
+        .remote_paths
+        .insert("/tmp/artifact.txt".into(), RemoteFileType::File);
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Download,
+            destination.join("artifact.txt"),
+            "/tmp/artifact.txt".into()
+        )]
+    );
+
+    let _ = fs::remove_dir_all(destination);
+}
+
 fn unique_temp_path(prefix: &str) -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
