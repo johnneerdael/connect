@@ -56,6 +56,10 @@ pub(crate) fn validate_profile_name(value: String) -> Result<String> {
     let name = validate_non_empty("name", value)?;
     if RESERVED_PROFILE_NAMES.contains(&name.as_str()) {
         Err(Error::new(format!("profile name '{name}' is reserved")))
+    } else if is_windows_drive_profile_name(&name) {
+        Err(Error::new(
+            "single-letter profile names are reserved to avoid Windows path ambiguity",
+        ))
     } else {
         Ok(name)
     }
@@ -76,6 +80,14 @@ pub(crate) fn validate_port(port: u16) -> Result<u16> {
     } else {
         Ok(port)
     }
+}
+
+fn is_windows_drive_profile_name(name: &str) -> bool {
+    name.len() == 1
+        && name
+            .chars()
+            .next()
+            .is_some_and(|value| value.is_ascii_alphabetic())
 }
 
 const RESERVED_PROFILE_NAMES: &[&str] = &[

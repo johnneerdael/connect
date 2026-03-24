@@ -245,6 +245,28 @@ fn add_command_rejects_reserved_profile_name() {
 }
 
 #[test]
+fn add_command_rejects_single_letter_profile_name() {
+    let harness = TestHarness::new();
+
+    let args = AddArgs {
+        name: "c".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        password: None,
+        private_key: None,
+        key_passphrase: None,
+    };
+
+    let error = add::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "single-letter profile names are reserved to avoid Windows path ambiguity"
+    );
+    assert!(matches!(harness.app().get_profile("c"), Err(Error::ProfileNotFound(_))));
+}
+
+#[test]
 fn add_command_rolls_back_secrets_when_secret_write_fails() {
     let root = unique_temp_path("connect-add-secret-failure");
     let paths = AppPaths::from_root(&root);
@@ -395,6 +417,34 @@ fn edit_command_rejects_reserved_profile_name() {
     assert_eq!(error.to_string(), "profile name 'list' is reserved");
 
     let profile = harness.app().get_profile("list").unwrap();
+    assert_eq!(profile.host, "prod.example.com");
+}
+
+#[test]
+fn edit_command_rejects_single_letter_profile_name() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("c", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "c".into(),
+        host: Some("prod-2.example.com".into()),
+        user: None,
+        port: None,
+        password: None,
+        private_key: None,
+        key_passphrase: None,
+    };
+
+    let error = edit::run(harness.app(), &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "single-letter profile names are reserved to avoid Windows path ambiguity"
+    );
+
+    let profile = harness.app().get_profile("c").unwrap();
     assert_eq!(profile.host, "prod.example.com");
 }
 
