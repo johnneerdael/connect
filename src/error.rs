@@ -4,6 +4,8 @@ use thiserror::Error as ThisError;
 pub enum Error {
     #[error("{0}")]
     Message(String),
+    #[error("remote session exited with status {0}")]
+    RemoteExitStatus(u32),
     #[error("unable to resolve per-user application directories")]
     MissingAppDirectories,
     #[error("profile '{0}' was not found")]

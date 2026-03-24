@@ -16,8 +16,8 @@ use connect::{
         types::{HostkeysCommand, HostkeysDeleteArgs, HostkeysListArgs},
     },
     error::Error,
-    secrets::MemorySecretStore,
-    ssh::{ObservedHostKey, ObservedHostKeySource},
+    secrets::{MemorySecretStore, SecretStore},
+    ssh::{ObservedHostKey, SshClient, SshSession},
     store::{HostKeyStore, ProfileInput},
     terminal::prompt::Prompt,
 };
@@ -25,6 +25,7 @@ use connect::{
 struct TestHarness {
     root: PathBuf,
     app: App,
+    secrets: Arc<MemorySecretStore>,
 }
 
 impl TestHarness {
@@ -32,9 +33,9 @@ impl TestHarness {
         let root = unique_temp_path("connect-hostkey-tests");
         let paths = AppPaths::from_root(&root);
         let secrets = Arc::new(MemorySecretStore::default());
-        let app = App::new(paths, secrets).expect("app should initialize");
+        let app = App::new(paths, secrets.clone()).expect("app should initialize");
 
-        Self { root, app }
+        Self { root, app, secrets }
     }
 
     fn with_saved_hostkey(host: &str, port: u16) -> Self {
@@ -52,6 +53,11 @@ impl TestHarness {
             .app()
             .save_profile(ProfileInput::new(name, "prod.example.com", "deploy"))
             .expect("profile should be saved");
+        harness.secrets.set_password(name, "super-secret").unwrap();
+        harness
+            .app()
+            .update_profile_secret_flags(name, true, false, false)
+            .unwrap();
         harness
     }
 
@@ -414,12 +420,57 @@ impl FakeSshClient {
     }
 }
 
-impl ObservedHostKeySource for FakeSshClient {
-    fn observe_host_key<'a>(
+impl SshClient for FakeSshClient {
+    fn connect<'a>(
         &'a self,
         _profile: &'a connect::store::Profile,
+        _expected_host_key: Option<&'a connect::store::HostKeyRecord>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Box<dyn SshSession + Send + 'static>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let observed = self.observed.clone();
+        Box::pin(async move {
+            Ok(Box::new(FakeSshSession { observed }) as Box<dyn SshSession + Send>)
+        })
+    }
+}
+
+struct FakeSshSession {
+    observed: ObservedHostKey,
+}
+
+impl SshSession for FakeSshSession {
+    fn observe_host_key<'a>(
+        &'a self,
     ) -> Pin<Box<dyn Future<Output = connect::error::Result<ObservedHostKey>> + Send + 'a>> {
         let observed = self.observed.clone();
         Box::pin(async move { Ok(observed) })
+    }
+
+    fn authenticate_public_key<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _private_key: &'a str,
+        _passphrase: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        Box::pin(async move { Ok(false) })
+    }
+
+    fn authenticate_password<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _password: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        Box::pin(async move { Ok(true) })
+    }
+
+    fn open_shell<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u32>> + Send + 'a>> {
+        Box::pin(async move { Ok(0) })
     }
 }

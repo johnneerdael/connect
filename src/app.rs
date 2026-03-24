@@ -10,12 +10,12 @@ use directories::ProjectDirs;
 
 use crate::{
     cli::{
-        commands::{add, completion, edit, hostkeys, list, remove, show, version},
+        commands::{add, completion, connect, edit, hostkeys, list, remove, show, version},
         Cli, Command, HostkeysCommand,
     },
     error::{Error, Result},
     secrets::{KeyringSecretStore, SecretStore},
-    ssh::{verify_observed_host_key, HostKeyVerification, ObservedHostKeySource},
+    ssh::{connect_profile as ssh_connect_profile, ProfileAuth, SshClient, SshConnectionContext},
     store::{Database, HostKeyStore, Profile, ProfileInput, ProfileStore},
     terminal::prompt::StdioPrompt,
 };
@@ -234,35 +234,11 @@ impl App {
     pub async fn connect_profile(
         &self,
         name: &str,
-        ssh: &dyn ObservedHostKeySource,
+        ssh: &dyn SshClient,
         prompt: &dyn crate::terminal::prompt::Prompt,
     ) -> Result<()> {
         let profile = self.get_profile(name)?;
-        let observed = ssh.observe_host_key(&profile).await?;
-        if observed.host != profile.host || observed.port != profile.port {
-            return Err(Error::new(
-                "observed host key endpoint does not match selected profile",
-            ));
-        }
-        let stored = self.hostkey_store.get(&profile.host, profile.port)?;
-
-        match verify_observed_host_key(stored.as_ref(), &observed)? {
-            HostKeyVerification::Trusted => Ok(()),
-            HostKeyVerification::TrustOnFirstUse => {
-                if !prompt.confirm_host_key_trust(&observed)? {
-                    return Err(Error::new("host key was not trusted"));
-                }
-
-                self.hostkey_store.save(
-                    &profile.host,
-                    profile.port,
-                    &observed.algorithm,
-                    &observed.fingerprint,
-                    &observed.public_key,
-                )?;
-                Ok(())
-            }
-        }
+        ssh_connect_profile(ssh, &profile, self, prompt).await
     }
 }
 
@@ -323,6 +299,34 @@ impl App {
             ))),
         }
     }
+
+    fn load_profile_auth(&self, profile: &Profile) -> Result<ProfileAuth> {
+        Ok(ProfileAuth {
+            password: self.secrets.get_password(&profile.name)?,
+            private_key: self.secrets.get_private_key(&profile.name)?,
+            key_passphrase: self.secrets.get_key_passphrase(&profile.name)?,
+        })
+    }
+}
+
+impl SshConnectionContext for App {
+    fn load_profile_auth(&self, profile: &Profile) -> Result<ProfileAuth> {
+        App::load_profile_auth(self, profile)
+    }
+
+    fn load_host_key(&self, profile: &Profile) -> Result<Option<crate::store::HostKeyRecord>> {
+        self.hostkey_store.get(&profile.host, profile.port)
+    }
+
+    fn save_host_key(&self, observed: &crate::ssh::ObservedHostKey) -> Result<()> {
+        self.hostkey_store.save(
+            &observed.host,
+            observed.port,
+            &observed.algorithm,
+            &observed.fingerprint,
+            &observed.public_key,
+        )
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -365,9 +369,11 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         None => {
-            let _profile = cli.profile;
-            let _app = App::load()?;
-            Ok(())
+            let app = App::load()?;
+            match cli.profile {
+                Some(profile) => connect::run(&app, &prompt, &profile),
+                None => Ok(()),
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 pub mod commands {
     pub mod add;
     pub mod completion;
+    pub mod connect;
     pub mod edit;
     pub mod hostkeys;
     pub mod list;

@@ -38,5 +38,8 @@ fn root_version_prints_binary_version() {
 #[test]
 fn positional_profile_parses_as_default_connect_action() {
     let mut cmd = connect_test_bin();
-    cmd.arg("prod").assert().success();
+    cmd.arg("prod")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("profile 'prod' was not found"));
 }

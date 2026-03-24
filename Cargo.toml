@@ -5,11 +5,14 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 directories = "6.0"
 keyring = "4.0.0-rc.3"
 keyring-core = "0.7.2"
+russh = "0.58.0"
 rusqlite = { version = "0.39", features = ["bundled"] }
 thiserror = "2.0"
+tokio = { version = "1", features = ["io-std", "io-util", "rt-multi-thread"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

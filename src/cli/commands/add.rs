@@ -9,7 +9,7 @@ use crate::{
 };
 
 pub fn run(app: &App, prompt: &dyn Prompt, args: &AddArgs, writer: &mut dyn Write) -> Result<()> {
-    let name = require_value("name", Some(args.name.clone()))?;
+    let name = validate_profile_name(require_value("name", Some(args.name.clone()))?)?;
     match app.get_profile(&name) {
         Ok(_) => return Err(Error::new(format!("profile '{name}' already exists"))),
         Err(Error::ProfileNotFound(_)) => {}
@@ -52,6 +52,15 @@ fn require_value(field: &str, value: Option<String>) -> Result<String> {
     }
 }
 
+pub(crate) fn validate_profile_name(value: String) -> Result<String> {
+    let name = validate_non_empty("name", value)?;
+    if RESERVED_PROFILE_NAMES.contains(&name.as_str()) {
+        Err(Error::new(format!("profile name '{name}' is reserved")))
+    } else {
+        Ok(name)
+    }
+}
+
 pub(crate) fn validate_non_empty(field: &str, value: String) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -68,3 +77,16 @@ pub(crate) fn validate_port(port: u16) -> Result<u16> {
         Ok(port)
     }
 }
+
+const RESERVED_PROFILE_NAMES: &[&str] = &[
+    "add",
+    "edit",
+    "remove",
+    "list",
+    "show",
+    "copy",
+    "hostkeys",
+    "completion",
+    "version",
+    "help",
+];
