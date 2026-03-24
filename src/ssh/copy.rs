@@ -295,7 +295,7 @@ fn parse_endpoint(field: &str, value: &str) -> Result<CopyEndpoint> {
 fn parse_remote_path(value: &str) -> Option<RemotePath> {
     let (profile, path) = value.split_once(':')?;
     let profile = profile.trim();
-    if profile.is_empty() || !path.starts_with('/') {
+    if profile.is_empty() || !path.starts_with('/') || is_windows_drive_path(profile, path) {
         return None;
     }
 
@@ -303,6 +303,15 @@ fn parse_remote_path(value: &str) -> Option<RemotePath> {
         profile: profile.to_string(),
         path: path.to_string(),
     })
+}
+
+fn is_windows_drive_path(profile: &str, path: &str) -> bool {
+    profile.len() == 1
+        && profile
+            .chars()
+            .next()
+            .is_some_and(|drive| drive.is_ascii_alphabetic())
+        && path.starts_with('/')
 }
 
 fn validate_local_source(path: &Path, recursive: bool) -> Result<()> {
@@ -354,5 +363,26 @@ fn join_remote(base: &str, name: &str) -> String {
         format!("/{name}")
     } else {
         format!("{}/{}", base.trim_end_matches('/'), name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_remote_path, RemotePath};
+
+    #[test]
+    fn parse_remote_path_rejects_windows_drive_paths() {
+        assert_eq!(parse_remote_path("C:/Users/alice/file.txt"), None);
+    }
+
+    #[test]
+    fn parse_remote_path_accepts_profile_syntax() {
+        assert_eq!(
+            parse_remote_path("prod:/tmp/file.txt"),
+            Some(RemotePath {
+                profile: "prod".into(),
+                path: "/tmp/file.txt".into(),
+            })
+        );
     }
 }
