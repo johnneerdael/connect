@@ -30,6 +30,8 @@ use super::{verify_observed_host_key, ObservedHostKey, RemoteDirectoryEntry, Rem
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
 type SshResultFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX_MISSES: usize = 3;
 
 pub trait SshClient: Send + Sync {
     fn connect<'a>(
@@ -106,6 +108,15 @@ impl RusshClient {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn config() -> client::Config {
+        client::Config {
+            inactivity_timeout: None,
+            keepalive_interval: Some(KEEPALIVE_INTERVAL),
+            keepalive_max: KEEPALIVE_MAX_MISSES,
+            ..Default::default()
+        }
+    }
 }
 
 impl SshClient for RusshClient {
@@ -119,10 +130,7 @@ impl SshClient for RusshClient {
                 HostKeyRecorder::new(&profile.host, profile.port, expected_host_key.cloned());
             let observed_state = Arc::clone(&handler.observed);
             let mismatch_state = Arc::clone(&handler.host_key_mismatch);
-            let config = Arc::new(client::Config {
-                inactivity_timeout: Some(Duration::from_secs(30)),
-                ..Default::default()
-            });
+            let config = Arc::new(Self::config());
 
             let handle =
                 match client::connect(config, (profile.host.as_str(), profile.port), handler).await
@@ -146,6 +154,20 @@ impl SshClient for RusshClient {
                 sftp: None,
             }) as DynSshSession)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_config_uses_keepalives_without_idle_disconnects() {
+        let config = RusshClient::config();
+
+        assert_eq!(config.inactivity_timeout, None);
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, KEEPALIVE_MAX_MISSES);
     }
 }
 
