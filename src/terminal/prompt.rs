@@ -1,11 +1,23 @@
 use std::io::{self, Write};
 
 use crate::error::{Error, Result};
+use crate::ssh::ObservedHostKey;
 
 pub trait Prompt {
     fn prompt(&self, key: &str, message: &str, default: Option<&str>) -> Result<String>;
     fn prompt_secret(&self, key: &str, message: &str) -> Result<Option<String>>;
     fn confirm(&self, key: &str, message: &str, default: bool) -> Result<bool>;
+
+    fn confirm_host_key_trust(&self, host_key: &ObservedHostKey) -> Result<bool> {
+        self.confirm(
+            "hostkey.trust",
+            &format!(
+                "Trust this host key?\nHost: {}\nPort: {}\nAlgorithm: {}\nFingerprint: {}",
+                host_key.host, host_key.port, host_key.algorithm, host_key.fingerprint
+            ),
+            false,
+        )
+    }
 }
 
 #[derive(Debug, Default)]

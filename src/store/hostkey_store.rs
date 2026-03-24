@@ -1,4 +1,4 @@
-use rusqlite::{params, Row};
+use rusqlite::{params, OptionalExtension, Row};
 
 use crate::error::Result;
 
@@ -26,6 +26,10 @@ impl HostKeyStore {
     ) -> Result<()> {
         let connection = self.database.connect()?;
         connection.execute(
+            "DELETE FROM host_keys WHERE host = ?1 AND port = ?2",
+            params![host, i64::from(port)],
+        )?;
+        connection.execute(
             "
             INSERT INTO host_keys (host, port, algorithm, fingerprint, public_key)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -35,6 +39,25 @@ impl HostKeyStore {
             params![host, i64::from(port), algorithm, fingerprint, public_key],
         )?;
         Ok(())
+    }
+
+    pub fn get(&self, host: &str, port: u16) -> Result<Option<HostKeyRecord>> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "
+            SELECT id, host, port, algorithm, fingerprint, public_key, accepted_at
+            FROM host_keys
+            WHERE host = ?1 AND port = ?2
+            ORDER BY accepted_at DESC, id DESC
+            LIMIT 1
+            ",
+        )?;
+
+        let record = statement
+            .query_row(params![host, i64::from(port)], map_host_key)
+            .optional()?;
+
+        Ok(record)
     }
 
     pub fn list(&self) -> Result<Vec<HostKeyRecord>> {
@@ -57,6 +80,15 @@ impl HostKeyStore {
     pub fn delete(&self, id: i64) -> Result<bool> {
         let connection = self.database.connect()?;
         let affected = connection.execute("DELETE FROM host_keys WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn delete_host_port(&self, host: &str, port: u16) -> Result<bool> {
+        let connection = self.database.connect()?;
+        let affected = connection.execute(
+            "DELETE FROM host_keys WHERE host = ?1 AND port = ?2",
+            params![host, i64::from(port)],
+        )?;
         Ok(affected > 0)
     }
 }

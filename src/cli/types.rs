@@ -33,7 +33,7 @@ pub enum Command {
     /// Copy SSH files to a remote host.
     Copy,
     /// Inspect SSH host keys for a profile.
-    Hostkeys,
+    Hostkeys(HostkeysArgs),
     /// Generate shell completion scripts.
     Completion,
     /// Print the application version.
@@ -91,4 +91,29 @@ pub struct ListArgs;
 pub struct ShowArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct HostkeysArgs {
+    #[command(subcommand)]
+    pub command: Option<HostkeysCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum HostkeysCommand {
+    /// List saved SSH host keys.
+    List(HostkeysListArgs),
+    /// Delete a saved SSH host key by host:port.
+    Delete(HostkeysDeleteArgs),
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct HostkeysListArgs;
+
+#[derive(Args, Debug, Clone)]
+pub struct HostkeysDeleteArgs {
+    #[arg(value_name = "HOST:PORT")]
+    pub target: String,
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }

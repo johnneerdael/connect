@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -9,17 +10,19 @@ use directories::ProjectDirs;
 
 use crate::{
     cli::{
-        commands::{add, completion, edit, list, remove, show, version},
-        Cli, Command,
+        commands::{add, completion, edit, hostkeys, list, remove, show, version},
+        Cli, Command, HostkeysCommand,
     },
     error::{Error, Result},
     secrets::{KeyringSecretStore, SecretStore},
+    ssh::{verify_observed_host_key, HostKeyVerification, ObservedHostKeySource},
     store::{Database, HostKeyStore, Profile, ProfileInput, ProfileStore},
     terminal::prompt::StdioPrompt,
 };
 
 const APP_NAME: &str = "connect";
 const DATABASE_FILE: &str = "connect.db";
+const APP_ROOT_ENV: &str = "CONNECT_APP_ROOT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
@@ -30,6 +33,10 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn detect() -> Result<Self> {
+        if let Some(root) = env::var_os(APP_ROOT_ENV) {
+            return Ok(Self::from_root(Path::new(&root)));
+        }
+
         let project_dirs =
             ProjectDirs::from("", "", APP_NAME).ok_or(Error::MissingAppDirectories)?;
         Ok(Self::from_project_dirs(&project_dirs))
@@ -74,7 +81,7 @@ impl AppPaths {
 pub struct App {
     _paths: AppPaths,
     profile_store: ProfileStore,
-    _hostkey_store: HostKeyStore,
+    hostkey_store: HostKeyStore,
     secrets: Arc<dyn SecretStore>,
     secret_backend: SecretBackend,
 }
@@ -131,7 +138,7 @@ impl App {
         Ok(Self {
             _paths: paths,
             profile_store: ProfileStore::new(database.clone()),
-            _hostkey_store: HostKeyStore::new(database),
+            hostkey_store: HostKeyStore::new(database),
             secrets,
             secret_backend,
         })
@@ -201,6 +208,60 @@ impl App {
             Ok(())
         } else {
             Err(Error::ProfileNotFound(name.to_string()))
+        }
+    }
+
+    pub fn save_host_key(
+        &self,
+        host: &str,
+        port: u16,
+        algorithm: &str,
+        fingerprint: &str,
+        public_key: &str,
+    ) -> Result<()> {
+        self.hostkey_store
+            .save(host, port, algorithm, fingerprint, public_key)
+    }
+
+    pub fn list_host_keys(&self) -> Result<Vec<crate::store::HostKeyRecord>> {
+        self.hostkey_store.list()
+    }
+
+    pub fn delete_host_key(&self, host: &str, port: u16) -> Result<bool> {
+        self.hostkey_store.delete_host_port(host, port)
+    }
+
+    pub async fn connect_profile(
+        &self,
+        name: &str,
+        ssh: &dyn ObservedHostKeySource,
+        prompt: &dyn crate::terminal::prompt::Prompt,
+    ) -> Result<()> {
+        let profile = self.get_profile(name)?;
+        let observed = ssh.observe_host_key(&profile).await?;
+        if observed.host != profile.host || observed.port != profile.port {
+            return Err(Error::new(
+                "observed host key endpoint does not match selected profile",
+            ));
+        }
+        let stored = self.hostkey_store.get(&profile.host, profile.port)?;
+
+        match verify_observed_host_key(stored.as_ref(), &observed)? {
+            HostKeyVerification::Trusted => Ok(()),
+            HostKeyVerification::TrustOnFirstUse => {
+                if !prompt.confirm_host_key_trust(&observed)? {
+                    return Err(Error::new("host key was not trusted"));
+                }
+
+                self.hostkey_store.save(
+                    &profile.host,
+                    profile.port,
+                    &observed.algorithm,
+                    &observed.fingerprint,
+                    &observed.public_key,
+                )?;
+                Ok(())
+            }
         }
     }
 }
@@ -290,9 +351,16 @@ pub fn run() -> Result<()> {
             let app = App::load()?;
             show::run(&app, &args, &mut stdout)
         }
+        Some(Command::Hostkeys(args)) => {
+            let app = App::load()?;
+            let command = args
+                .command
+                .unwrap_or(HostkeysCommand::List(Default::default()));
+            hostkeys::run(&app, &prompt, &command, &mut stdout)
+        }
         Some(Command::Completion) => completion::run(),
         Some(Command::Version) => version::run(),
-        Some(Command::Copy) | Some(Command::Hostkeys) => {
+        Some(Command::Copy) => {
             let _app = App::load()?;
             Ok(())
         }
