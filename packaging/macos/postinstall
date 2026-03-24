@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+printf 'connect is installed at /usr/local/bin/connect\n'
+printf 'If /usr/local/bin is not on PATH in your shell, add it manually.\n'

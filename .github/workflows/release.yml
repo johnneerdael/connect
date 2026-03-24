@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Package ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            kind: linux
+            artifact_name: connect-linux-x86_64
+            package_name: connect-linux-x86_64.tar.gz
+          - os: macos-latest
+            kind: macos
+            artifact_name: connect-macos-x86_64
+            package_name: connect-macos.pkg
+          - os: windows-latest
+            kind: windows
+            artifact_name: connect-windows-x64
+            package_name: connect-windows-x64.msi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Linux tarball
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/connect dist/connect
+          cp packaging/install.sh dist/install.sh
+          tar -C dist -czf dist/${{ matrix.package_name }} connect install.sh
+
+      - name: Package macOS installer
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p distroot/usr/local/bin dist
+          cp target/release/connect distroot/usr/local/bin/connect
+          chmod 755 distroot/usr/local/bin/connect
+          pkgbuild \
+            --root distroot \
+            --scripts packaging/macos \
+            --identifier com.connect.cli \
+            --version "$version" \
+            --install-location / \
+            dist/${{ matrix.package_name }}
+
+      - name: Install WiX
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: dotnet tool install --global wix
+
+      - name: Package Windows installer
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\connect.exe dist\connect.exe
+          $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
+          wix build packaging\windows\connect.wxs -b "SourceDir=$PWD\dist" -d ProductVersion=$version -o dist\${{ matrix.package_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.package_name }}
