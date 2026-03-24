@@ -6,11 +6,17 @@ fn packaging_assets_exist() {
 
     assert_file_contains(
         &repo_root.join("packaging/install.sh"),
-        ["/usr/local/bin/connect", "PATH", "CONNECT_INSTALL_PREFIX"],
+        [
+            "/usr/local/bin/connect",
+            "CONNECT_INSTALL_PREFIX",
+            "/etc/profile.d/connect.sh",
+            ".profile",
+            "export PATH=",
+        ],
     );
     assert_file_contains(
         &repo_root.join("packaging/macos/postinstall"),
-        ["/usr/local/bin/connect", "PATH"],
+        ["/usr/local/bin/connect", "/etc/paths.d/connect", "PATH"],
     );
     assert_file_contains(
         &repo_root.join("packaging/windows/connect.wxs"),
@@ -20,9 +26,10 @@ fn packaging_assets_exist() {
         &repo_root.join(".github/workflows/release.yml"),
         [
             "actions/upload-artifact@v4",
+            "cargo metadata --no-deps --format-version 1",
+            "ConvertFrom-Json",
+            "GITHUB_REF_NAME",
             "pkgbuild",
-            "PACKAGE_VERSION",
-            "github.ref_type == 'tag'",
             "wix build",
             "WixToolset.Util.wixext",
         ],

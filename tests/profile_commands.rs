@@ -125,9 +125,11 @@ fn add_command_imports_private_key_and_persists_profile() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: None,
+        password: false,
+        password_stdin: false,
         private_key: Some(temp_key.path().into()),
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     add::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
@@ -155,9 +157,11 @@ fn add_command_prompts_for_missing_required_fields() {
         host: None,
         user: None,
         port: None,
-        password: None,
+        password: false,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     add::run(harness.app(), &prompt, &args, &mut output).unwrap();
@@ -168,8 +172,12 @@ fn add_command_prompts_for_missing_required_fields() {
 }
 
 #[test]
-fn add_command_stores_password_from_flag() {
+fn add_command_stores_password_and_key_passphrase_from_secret_prompt() {
     let harness = TestHarness::new();
+    let temp_key = TestKey::write_temp_pem();
+    let prompt = FakePrompt::new()
+        .with_secret("password", "super-secret")
+        .with_secret("key_passphrase", "unlock");
     let mut output = Vec::new();
 
     let args = AddArgs {
@@ -177,19 +185,101 @@ fn add_command_stores_password_from_flag() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: Some("super-secret".into()),
-        private_key: None,
-        key_passphrase: None,
+        password: true,
+        password_stdin: false,
+        private_key: Some(temp_key.path().into()),
+        key_passphrase: true,
+        key_passphrase_stdin: false,
     };
 
-    add::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
+    add::run(harness.app(), &prompt, &args, &mut output).unwrap();
 
     let profile = harness.app().get_profile("prod").unwrap();
     assert!(profile.has_password);
+    assert!(profile.has_private_key);
+    assert!(profile.has_key_passphrase);
     assert_eq!(
         harness.secrets().get_password("prod").unwrap(),
         Some("super-secret".into())
     );
+    assert_eq!(
+        harness.secrets().get_key_passphrase("prod").unwrap(),
+        Some("unlock".into())
+    );
+}
+
+#[test]
+fn add_command_rejects_invalid_host() {
+    let harness = TestHarness::new();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("not a host name".into()),
+        user: Some("deploy".into()),
+        port: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "host must be a valid hostname, fqdn, or IP address"
+    );
+}
+
+#[test]
+fn add_command_accepts_absolute_fqdn_and_internal_hostname() {
+    let harness = TestHarness::new();
+
+    let fqdn_args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com.".into()),
+        user: Some("deploy".into()),
+        port: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &fqdn_args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let internal_args = AddArgs {
+        name: "stage".into(),
+        host: Some("stage_api".into()),
+        user: Some("deploy".into()),
+        port: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &internal_args,
+        &mut Vec::new(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -214,9 +304,11 @@ fn add_command_rejects_duplicate_profile_names() {
         host: Some("prod-2.example.com".into()),
         user: Some("root".into()),
         port: Some(2200),
-        password: Some("new-secret".into()),
+        password: false,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     let error = add::run(
@@ -247,9 +339,11 @@ fn add_command_rejects_reserved_profile_name() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: None,
+        password: false,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     let error = add::run(
@@ -275,9 +369,11 @@ fn add_command_rejects_single_letter_profile_name() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: None,
+        password: false,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     let error = add::run(
@@ -304,17 +400,22 @@ fn add_command_rolls_back_secrets_when_secret_write_fails() {
     let secrets = Arc::new(FailsOnKeyPassphraseSecretStore::default());
     let app = App::new(paths, secrets.clone()).unwrap();
 
+    let prompt = FakePrompt::new()
+        .with_secret("password", "super-secret")
+        .with_secret("key_passphrase", "unlock");
     let args = AddArgs {
         name: "prod".into(),
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: Some("super-secret".into()),
+        password: true,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: Some("unlock".into()),
+        key_passphrase: true,
+        key_passphrase_stdin: false,
     };
 
-    let error = add::run(&app, &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = add::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
     assert_eq!(error.to_string(), "key passphrase write failed");
     assert!(matches!(
         app.get_profile("prod"),
@@ -333,17 +434,22 @@ fn add_command_preserves_primary_error_when_rollback_fails() {
     let secrets = Arc::new(FailsOnKeyPassphraseAndDeleteSecretStore::default());
     let app = App::new(paths, secrets).unwrap();
 
+    let prompt = FakePrompt::new()
+        .with_secret("password", "super-secret")
+        .with_secret("key_passphrase", "unlock");
     let args = AddArgs {
         name: "prod".into(),
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: Some("super-secret".into()),
+        password: true,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: Some("unlock".into()),
+        key_passphrase: true,
+        key_passphrase_stdin: false,
     };
 
-    let error = add::run(&app, &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = add::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
     let message = error.to_string();
     assert!(message.contains("key passphrase write failed"));
     assert!(message.contains("rollback failed"));
@@ -357,23 +463,20 @@ fn add_command_rolls_back_new_secrets_when_metadata_save_fails() {
     let harness = TestHarness::new();
     break_database(&harness.root);
 
+    let prompt = FakePrompt::new().with_secret("password", "super-secret");
     let args = AddArgs {
         name: "prod".into(),
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
-        password: Some("super-secret".into()),
+        password: true,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
-    let error = add::run(
-        harness.app(),
-        &FakePrompt::default(),
-        &args,
-        &mut Vec::new(),
-    )
-    .unwrap_err();
+    let error = add::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap_err();
     assert!(error.to_string().contains("directory") || error.to_string().contains("unable"));
     assert!(matches!(
         harness.app().get_profile("prod"),
@@ -386,6 +489,7 @@ fn add_command_rolls_back_new_secrets_when_metadata_save_fails() {
 fn edit_command_updates_only_supplied_fields() {
     let harness = TestHarness::new();
     let temp_key = TestKey::write_temp_pem();
+    let prompt = FakePrompt::new().with_secret("password", "new-password");
 
     harness
         .app()
@@ -397,18 +501,14 @@ fn edit_command_updates_only_supplied_fields() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: Some(2200),
-        password: Some("new-password".into()),
+        password: true,
+        password_stdin: false,
         private_key: Some(temp_key.path().into()),
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
-    edit::run(
-        harness.app(),
-        &FakePrompt::default(),
-        &args,
-        &mut Vec::new(),
-    )
-    .unwrap();
+    edit::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap();
 
     let profile = harness.app().get_profile("prod").unwrap();
     assert_eq!(profile.host, "prod-2.example.com");
@@ -427,6 +527,68 @@ fn edit_command_updates_only_supplied_fields() {
 }
 
 #[test]
+fn edit_command_rejects_invalid_host() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: Some("not a host name".into()),
+        user: None,
+        port: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    let error = edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "host must be a valid hostname, fqdn, or IP address"
+    );
+}
+
+#[test]
+fn edit_command_accepts_absolute_fqdn() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com.".into()),
+        user: None,
+        port: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+}
+
+#[test]
 fn edit_command_rejects_reserved_profile_name() {
     let harness = TestHarness::new();
     harness
@@ -439,9 +601,11 @@ fn edit_command_rejects_reserved_profile_name() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: None,
-        password: None,
+        password: false,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     let error = edit::run(
@@ -470,9 +634,11 @@ fn edit_command_allows_existing_single_letter_profile_name() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: None,
-        password: None,
+        password: false,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
     };
 
     edit::run(
@@ -506,17 +672,22 @@ fn edit_command_rolls_back_overwritten_secrets_when_secret_write_fails() {
     )
     .unwrap();
 
+    let prompt = FakePrompt::new()
+        .with_secret("password", "new-secret")
+        .with_secret("key_passphrase", "unlock");
     let args = EditArgs {
         name: "prod".into(),
         host: Some("prod-2.example.com".into()),
         user: None,
         port: None,
-        password: Some("new-secret".into()),
+        password: true,
+        password_stdin: false,
         private_key: None,
-        key_passphrase: Some("unlock".into()),
+        key_passphrase: true,
+        key_passphrase_stdin: false,
     };
 
-    let error = edit::run(&app, &FakePrompt::default(), &args, &mut Vec::new()).unwrap_err();
+    let error = edit::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
     assert_eq!(error.to_string(), "key passphrase write failed");
 
     let profile = app.get_profile("prod").unwrap();
@@ -1099,6 +1270,11 @@ impl FakePrompt {
 
     fn with_confirm(mut self, key: &str, value: bool) -> Self {
         self.confirm.insert(key.to_string(), value);
+        self
+    }
+
+    fn with_secret(mut self, key: &str, value: &str) -> Self {
+        self.secret.insert(key.to_string(), value.to_string());
         self
     }
 }

@@ -88,12 +88,15 @@ impl Drop for TestHarness {
 #[test]
 fn hostkey_delete_removes_saved_record() {
     let harness = TestHarness::with_saved_hostkey("prod.example.com", 22);
+    let record = harness
+        .hostkey_record("prod.example.com", 22)
+        .expect("host key should exist");
 
     hostkeys::run(
         harness.app(),
         &FakePrompt::unused(),
         &HostkeysCommand::Delete(HostkeysDeleteArgs {
-            target: "prod.example.com:22".into(),
+            target: record.id.to_string(),
             yes: true,
         }),
         &mut Vec::new(),
@@ -142,6 +145,12 @@ fn hostkey_list_prints_deterministic_rows() {
         .app()
         .save_host_key("a.example.com", 22, "ssh-ed25519", "fp-a", "pub-a")
         .unwrap();
+    let record_a = harness
+        .hostkey_record("a.example.com", 22)
+        .expect("host key should exist");
+    let record_b = harness
+        .hostkey_record("b.example.com", 2200)
+        .expect("host key should exist");
 
     hostkeys::run(
         harness.app(),
@@ -153,29 +162,30 @@ fn hostkey_list_prints_deterministic_rows() {
 
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "a.example.com:22\tssh-ed25519\tfp-a\nb.example.com:2200\tssh-rsa\tfp-b\n"
+        format!(
+            "{id_a}\ta.example.com:22\tssh-ed25519\tfp-a\n{id_b}\tb.example.com:2200\tssh-rsa\tfp-b\n",
+            id_a = record_a.id,
+            id_b = record_b.id,
+        )
     );
 }
 
 #[test]
-fn hostkey_delete_requires_host_port_format() {
+fn hostkey_delete_requires_numeric_id() {
     let harness = TestHarness::new();
 
     let error = hostkeys::run(
         harness.app(),
         &FakePrompt::unused(),
         &HostkeysCommand::Delete(HostkeysDeleteArgs {
-            target: "prod.example.com".into(),
+            target: "prod.example.com:22".into(),
             yes: true,
         }),
         &mut Vec::new(),
     )
     .unwrap_err();
 
-    assert_eq!(
-        error.to_string(),
-        "host key target must be in host:port format"
-    );
+    assert_eq!(error.to_string(), "host key target must be a numeric id");
 }
 
 #[test]
@@ -192,13 +202,19 @@ fn hostkeys_list_command_routes_through_binary() {
             "pubkey-123",
         )
         .unwrap();
+    let record = harness
+        .hostkey_record("prod.example.com", 22)
+        .expect("host key should exist");
 
     connect_test_bin()
         .env("CONNECT_APP_ROOT", &harness.root)
         .args(["hostkeys", "list"])
         .assert()
         .success()
-        .stdout("prod.example.com:22\tssh-ed25519\tfp-123\n");
+        .stdout(format!(
+            "{}\tprod.example.com:22\tssh-ed25519\tfp-123\n",
+            record.id
+        ));
 }
 
 #[test]
@@ -215,13 +231,16 @@ fn hostkeys_delete_command_routes_through_binary() {
             "pubkey-123",
         )
         .unwrap();
+    let record = harness
+        .hostkey_record("prod.example.com", 22)
+        .expect("host key should exist");
 
     connect_test_bin()
         .env("CONNECT_APP_ROOT", &harness.root)
-        .args(["hostkeys", "delete", "prod.example.com:22", "--yes"])
+        .args(["hostkeys", "delete", &record.id.to_string(), "--yes"])
         .assert()
         .success()
-        .stdout("Removed host key 'prod.example.com:22'.\n");
+        .stdout(format!("Removed host key '{}'.\n", record.id));
 
     assert!(!harness.hostkey_exists("prod.example.com", 22));
 }

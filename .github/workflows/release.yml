@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PACKAGE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.1.0' }}
 
 jobs:
   build:
@@ -51,7 +50,11 @@ jobs:
         if: matrix.kind == 'macos'
         shell: bash
         run: |
-          version="${PACKAGE_VERSION#v}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(pkg[\"version\"] for pkg in json.load(sys.stdin)[\"packages\"] if pkg[\"name\"] == \"connect\"))')"
+          fi
           mkdir -p distroot/usr/local/bin dist
           cp target/release/connect distroot/usr/local/bin/connect
           chmod 755 distroot/usr/local/bin/connect
@@ -76,7 +79,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = $env:PACKAGE_VERSION.TrimStart('v')
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+            $version = ($metadata.packages | Where-Object { $_.name -eq 'connect' } | Select-Object -First 1).version
+          }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\connect.exe dist\connect.exe
           $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"

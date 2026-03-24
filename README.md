@@ -4,9 +4,9 @@
 
 ## Install
 
-Linux users can unpack the release tarball and run `./install.sh`. The script copies the `connect` binary into `/usr/local/bin` by default; set `CONNECT_INSTALL_PREFIX` if you want a different prefix. It does not create app data directories during install.
+Linux users can unpack the release tarball and run `./install.sh`. The script copies the `connect` binary into `/usr/local/bin` by default, updates `PATH` automatically when needed, and does not create app data directories during install. Set `CONNECT_INSTALL_PREFIX` if you want a different prefix.
 
-macOS users can install the `.pkg` release. The package places `connect` in `/usr/local/bin/connect`, which is already on PATH for most shells. If your shell does not search `/usr/local/bin`, add it to PATH manually.
+macOS users can install the `.pkg` release. The package places `connect` in `/usr/local/bin/connect` and ensures `/usr/local/bin` is available on `PATH` for new shell sessions.
 
 Windows users can install the `.msi` release. The installer puts `connect.exe` under `Program Files` and updates the machine PATH.
 
@@ -16,6 +16,18 @@ Add a profile:
 
 ```bash
 connect add prod --host prod.example.com --user alice
+```
+
+Store a password securely without exposing it on the command line:
+
+```bash
+connect add prod --host prod.example.com --user alice --password
+```
+
+Provision a password non-interactively from standard input:
+
+```bash
+printf '%s\n' "$CONNECT_PASSWORD" | connect add prod --host prod.example.com --user alice --password-stdin
 ```
 
 Open an interactive SSH session:
@@ -45,13 +57,13 @@ Host key commands:
 
 ```bash
 connect hostkeys list
-connect hostkeys delete prod.example.com:22
+connect hostkeys delete 1
 ```
 
 Shell completions are available with:
 
 ```bash
-connect completion
+connect completion bash
 ```
 
 ## Storage

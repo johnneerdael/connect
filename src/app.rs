@@ -229,6 +229,10 @@ impl App {
         self.hostkey_store.list()
     }
 
+    pub fn delete_host_key_by_id(&self, id: i64) -> Result<bool> {
+        self.hostkey_store.delete(id)
+    }
+
     pub fn delete_host_key(&self, host: &str, port: u16) -> Result<bool> {
         self.hostkey_store.delete_host_port(host, port)
     }
@@ -374,7 +378,7 @@ pub fn run() -> Result<()> {
                 .unwrap_or(HostkeysCommand::List(Default::default()));
             hostkeys::run(&app, &prompt, &command, &mut stdout)
         }
-        Some(Command::Completion) => completion::run(),
+        Some(Command::Completion(args)) => completion::run(&args),
         Some(Command::Version) => version::run(),
         Some(Command::Copy(args)) => {
             let app = App::load()?;

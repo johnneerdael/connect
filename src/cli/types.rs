@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use clap_complete::Shell;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,7 +36,7 @@ pub enum Command {
     /// Inspect SSH host keys for a profile.
     Hostkeys(HostkeysArgs),
     /// Generate shell completion scripts.
-    Completion,
+    Completion(CompletionArgs),
     /// Print the application version.
     Version,
 }
@@ -50,12 +51,16 @@ pub struct AddArgs {
     pub user: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
-    #[arg(long)]
-    pub password: Option<String>,
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub password: bool,
+    #[arg(long = "password-stdin", conflicts_with = "password")]
+    pub password_stdin: bool,
     #[arg(long = "private-key", value_name = "PATH")]
     pub private_key: Option<PathBuf>,
-    #[arg(long = "key-passphrase")]
-    pub key_passphrase: Option<String>,
+    #[arg(long = "key-passphrase", conflicts_with = "key_passphrase_stdin")]
+    pub key_passphrase: bool,
+    #[arg(long = "key-passphrase-stdin", conflicts_with = "key_passphrase")]
+    pub key_passphrase_stdin: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -68,12 +73,16 @@ pub struct EditArgs {
     pub user: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
-    #[arg(long)]
-    pub password: Option<String>,
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub password: bool,
+    #[arg(long = "password-stdin", conflicts_with = "password")]
+    pub password_stdin: bool,
     #[arg(long = "private-key", value_name = "PATH")]
     pub private_key: Option<PathBuf>,
-    #[arg(long = "key-passphrase")]
-    pub key_passphrase: Option<String>,
+    #[arg(long = "key-passphrase", conflicts_with = "key_passphrase_stdin")]
+    pub key_passphrase: bool,
+    #[arg(long = "key-passphrase-stdin", conflicts_with = "key_passphrase")]
+    pub key_passphrase_stdin: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -103,6 +112,12 @@ pub struct CopyArgs {
     pub destination: String,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct CompletionArgs {
+    #[arg(value_name = "SHELL")]
+    pub shell: Shell,
+}
+
 #[derive(Args, Debug, Clone, Default)]
 pub struct HostkeysArgs {
     #[command(subcommand)]
@@ -113,7 +128,7 @@ pub struct HostkeysArgs {
 pub enum HostkeysCommand {
     /// List saved SSH host keys.
     List(HostkeysListArgs),
-    /// Delete a saved SSH host key by host:port.
+    /// Delete a saved SSH host key by id.
     Delete(HostkeysDeleteArgs),
 }
 
@@ -122,7 +137,7 @@ pub struct HostkeysListArgs;
 
 #[derive(Args, Debug, Clone)]
 pub struct HostkeysDeleteArgs {
-    #[arg(value_name = "HOST:PORT")]
+    #[arg(value_name = "ID")]
     pub target: String,
     #[arg(long, short = 'y')]
     pub yes: bool,

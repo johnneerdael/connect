@@ -23,8 +23,8 @@ fn list(app: &App, writer: &mut dyn Write) -> Result<()> {
     for record in app.list_host_keys()? {
         writeln!(
             writer,
-            "{}:{}\t{}\t{}",
-            record.host, record.port, record.algorithm, record.fingerprint
+            "{}\t{}:{}\t{}\t{}",
+            record.id, record.host, record.port, record.algorithm, record.fingerprint
         )
         .map_err(Error::from)?;
     }
@@ -38,12 +38,12 @@ fn delete(
     args: &HostkeysDeleteArgs,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    let (host, port) = parse_host_port(&args.target)?;
+    let id = parse_host_key_id(&args.target)?;
 
     if !args.yes
         && !prompt.confirm(
             "hostkeys.delete",
-            &format!("Delete saved host key for {host}:{port}?"),
+            &format!("Delete saved host key '{id}'?"),
             false,
         )?
     {
@@ -51,30 +51,22 @@ fn delete(
         return Ok(());
     }
 
-    if app.delete_host_key(&host, port)? {
-        writeln!(writer, "Removed host key '{host}:{port}'.").map_err(Error::from)
+    if app.delete_host_key_by_id(id)? {
+        writeln!(writer, "Removed host key '{id}'.").map_err(Error::from)
     } else {
-        Err(Error::new(format!(
-            "host key '{host}:{port}' was not found"
-        )))
+        Err(Error::new(format!("host key '{id}' was not found")))
     }
 }
 
-fn parse_host_port(value: &str) -> Result<(String, u16)> {
-    let (host, port) = value
-        .rsplit_once(':')
-        .ok_or_else(|| Error::new("host key target must be in host:port format"))?;
+fn parse_host_key_id(value: &str) -> Result<i64> {
+    let id = value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| Error::new("host key target must be a numeric id"))?;
 
-    if host.trim().is_empty() {
-        return Err(Error::new("host key target must be in host:port format"));
+    if id <= 0 {
+        return Err(Error::new("host key target must be a numeric id"));
     }
 
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| Error::new("host key target must be in host:port format"))?;
-    if port == 0 {
-        return Err(Error::new("host key target must be in host:port format"));
-    }
-
-    Ok((host.trim().to_string(), port))
+    Ok(id)
 }

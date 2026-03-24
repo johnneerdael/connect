@@ -50,11 +50,7 @@ impl Prompt for StdioPrompt {
     }
 
     fn prompt_secret(&self, _key: &str, message: &str) -> Result<Option<String>> {
-        let mut stdout = io::stdout().lock();
-        write!(stdout, "{message}: ")?;
-        stdout.flush()?;
-
-        let input = read_line()?;
+        let input = rpassword::prompt_password(format!("{message}: "))?;
         let trimmed = input.trim();
         if trimmed.is_empty() {
             Ok(None)

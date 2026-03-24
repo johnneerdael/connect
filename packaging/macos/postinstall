@@ -1,5 +1,14 @@
 #!/bin/sh
 set -eu
 
+BIN_DIR="/usr/local/bin"
+PATHS_FILE="/etc/paths"
+PATHS_ENTRY="/etc/paths.d/connect"
+
+if ! grep -Fxq "$BIN_DIR" "$PATHS_FILE" 2>/dev/null; then
+  mkdir -p /etc/paths.d
+  printf '%s\n' "$BIN_DIR" >"$PATHS_ENTRY"
+fi
+
 printf 'connect is installed at /usr/local/bin/connect\n'
-printf 'If /usr/local/bin is not on PATH in your shell, add it manually.\n'
+printf 'PATH will include %s for new shell sessions.\n' "$BIN_DIR"

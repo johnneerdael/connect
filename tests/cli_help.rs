@@ -43,3 +43,23 @@ fn positional_profile_parses_as_default_connect_action() {
         .failure()
         .stderr(predicates::str::contains("profile 'prod' was not found"));
 }
+
+#[test]
+fn completion_command_accepts_shell_argument() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["completion", "bash"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("connect"));
+}
+
+#[test]
+fn add_help_lists_secure_secret_input_flags() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["add", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--password"))
+        .stdout(predicates::str::contains("--password-stdin"))
+        .stdout(predicates::str::contains("--key-passphrase-stdin"));
+}
