@@ -33,6 +33,21 @@ pub async fn connect_profile(
     context: &dyn SshConnectionContext,
     prompt: &dyn Prompt,
 ) -> Result<()> {
+    let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
+    let exit_status = session.open_shell().await?;
+    if exit_status == 0 {
+        Ok(())
+    } else {
+        Err(Error::RemoteExitStatus(exit_status))
+    }
+}
+
+pub(crate) async fn connect_authenticated_session(
+    ssh: &dyn SshClient,
+    profile: &Profile,
+    context: &dyn SshConnectionContext,
+    prompt: &dyn Prompt,
+) -> Result<Box<dyn SshSession + Send + 'static>> {
     let stored = context.load_host_key(profile)?;
     let mut session = ssh.connect(profile, stored.as_ref()).await?;
     let observed = session.observe_host_key().await?;
@@ -54,12 +69,7 @@ pub async fn connect_profile(
 
     let auth = context.load_profile_auth(profile)?;
     authenticate_session(&mut *session, profile, &auth).await?;
-    let exit_status = session.open_shell().await?;
-    if exit_status == 0 {
-        Ok(())
-    } else {
-        Err(Error::RemoteExitStatus(exit_status))
-    }
+    Ok(session)
 }
 
 pub async fn authenticate_session(

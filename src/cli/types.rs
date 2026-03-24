@@ -30,8 +30,8 @@ pub enum Command {
     List(ListArgs),
     /// Show details for an SSH profile.
     Show(ShowArgs),
-    /// Copy SSH files to a remote host.
-    Copy,
+    /// Copy files between the local machine and a remote host.
+    Copy(CopyArgs),
     /// Inspect SSH host keys for a profile.
     Hostkeys(HostkeysArgs),
     /// Generate shell completion scripts.
@@ -91,6 +91,16 @@ pub struct ListArgs;
 pub struct ShowArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CopyArgs {
+    #[arg(long, short = 'r')]
+    pub recursive: bool,
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
+    #[arg(value_name = "DESTINATION")]
+    pub destination: String,
 }
 
 #[derive(Args, Debug, Clone, Default)]

@@ -1,0 +1,358 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    error::{Error, Result},
+    store::Profile,
+    terminal::prompt::Prompt,
+};
+
+use super::{auth::connect_authenticated_session, SshClient, SshConnectionContext, SshSession};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePath {
+    pub profile: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyEndpoint {
+    Local(PathBuf),
+    Remote(RemotePath),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteFileType {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDirectoryEntry {
+    pub name: String,
+    pub file_type: RemoteFileType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopySpec {
+    pub source: CopyEndpoint,
+    pub destination: CopyEndpoint,
+    pub recursive: bool,
+}
+
+impl CopySpec {
+    pub fn direction(&self) -> CopyDirection {
+        match (&self.source, &self.destination) {
+            (CopyEndpoint::Local(_), CopyEndpoint::Remote(_)) => CopyDirection::Upload,
+            (CopyEndpoint::Remote(_), CopyEndpoint::Local(_)) => CopyDirection::Download,
+            _ => unreachable!("copy specs must have exactly one remote endpoint"),
+        }
+    }
+
+    pub fn remote_profile(&self) -> &str {
+        match (&self.source, &self.destination) {
+            (CopyEndpoint::Remote(remote), _) | (_, CopyEndpoint::Remote(remote)) => &remote.profile,
+            _ => unreachable!("copy specs must have exactly one remote endpoint"),
+        }
+    }
+}
+
+pub fn parse_copy_spec(source: &str, destination: &str, recursive: bool) -> Result<CopySpec> {
+    let source = parse_endpoint("source", source)?;
+    let destination = parse_endpoint("destination", destination)?;
+
+    match (&source, &destination) {
+        (CopyEndpoint::Local(local), CopyEndpoint::Remote(_)) => {
+            validate_local_source(local, recursive)?
+        }
+        (CopyEndpoint::Remote(_), CopyEndpoint::Local(_)) => {}
+        _ => {
+            return Err(Error::new(
+                "copy requires exactly one remote path in profile:/path format",
+            ))
+        }
+    }
+
+    Ok(CopySpec {
+        source,
+        destination,
+        recursive,
+    })
+}
+
+pub async fn copy_profile(
+    ssh: &dyn SshClient,
+    spec: &CopySpec,
+    profile: &Profile,
+    context: &dyn SshConnectionContext,
+    prompt: &dyn Prompt,
+) -> Result<()> {
+    let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
+    execute_copy(&mut *session, spec).await
+}
+
+async fn execute_copy(session: &mut dyn SshSession, spec: &CopySpec) -> Result<()> {
+    match (&spec.source, &spec.destination) {
+        (CopyEndpoint::Local(source), CopyEndpoint::Remote(destination)) => {
+            upload(session, source, &destination.path, spec.recursive).await
+        }
+        (CopyEndpoint::Remote(source), CopyEndpoint::Local(destination)) => {
+            download(session, &source.path, destination, spec.recursive).await
+        }
+        _ => Err(Error::new(
+            "copy requires exactly one remote path in profile:/path format",
+        )),
+    }
+}
+
+async fn upload(
+    session: &mut dyn SshSession,
+    source: &Path,
+    destination: &str,
+    recursive: bool,
+) -> Result<()> {
+    let metadata = fs::metadata(source)?;
+    if metadata.is_dir() {
+        if !recursive {
+            return Err(Error::new("copying directories requires --recursive"));
+        }
+
+        let root = resolve_remote_directory_target(session, source, destination).await?;
+        upload_dir_recursive(session, source, &root).await
+    } else if metadata.is_file() {
+        let target = resolve_remote_file_target(session, source, destination).await?;
+        if let Some(parent) = remote_parent(&target) {
+            session.create_remote_dir_all(&parent).await?;
+        }
+        session.upload_file(source, &target).await
+    } else {
+        Err(Error::new(format!(
+            "unsupported local file type: {}",
+            source.display()
+        )))
+    }
+}
+
+async fn download(
+    session: &mut dyn SshSession,
+    source: &str,
+    destination: &Path,
+    recursive: bool,
+) -> Result<()> {
+    match session.remote_file_type(source).await? {
+        Some(RemoteFileType::Directory) => {
+            if !recursive {
+                return Err(Error::new("copying directories requires --recursive"));
+            }
+
+            let root = resolve_local_directory_target(source, destination)?;
+            download_dir_recursive(session, source, &root).await
+        }
+        Some(RemoteFileType::File) | Some(RemoteFileType::Symlink) => {
+            let target = resolve_local_file_target(source, destination)?;
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            session.download_file(source, &target).await
+        }
+        Some(RemoteFileType::Other) => Err(Error::new(format!(
+            "unsupported remote file type: {source}"
+        ))),
+        None => Err(Error::new(format!("remote path was not found: {source}"))),
+    }
+}
+
+async fn upload_dir_recursive(
+    session: &mut dyn SshSession,
+    local_dir: &Path,
+    remote_dir: &str,
+) -> Result<()> {
+    let mut stack = vec![(local_dir.to_path_buf(), remote_dir.to_string())];
+
+    while let Some((local_dir, remote_dir)) = stack.pop() {
+        session.create_remote_dir_all(&remote_dir).await?;
+
+        for entry in fs::read_dir(&local_dir)? {
+            let entry = entry?;
+            let local_path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let remote_path = join_remote(&remote_dir, &name);
+            let file_type = entry.file_type()?;
+
+            if file_type.is_dir() {
+                stack.push((local_path, remote_path));
+            } else if file_type.is_file() {
+                session.upload_file(&local_path, &remote_path).await?;
+            } else {
+                return Err(Error::new(format!(
+                    "unsupported local file type: {}",
+                    local_path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn download_dir_recursive(
+    session: &mut dyn SshSession,
+    remote_dir: &str,
+    local_dir: &Path,
+) -> Result<()> {
+    let mut stack = vec![(remote_dir.to_string(), local_dir.to_path_buf())];
+
+    while let Some((remote_dir, local_dir)) = stack.pop() {
+        fs::create_dir_all(&local_dir)?;
+
+        for entry in session.read_remote_dir(&remote_dir).await? {
+            let remote_path = join_remote(&remote_dir, &entry.name);
+            let local_path = local_dir.join(&entry.name);
+
+            match entry.file_type {
+                RemoteFileType::Directory => {
+                    stack.push((remote_path, local_path));
+                }
+                RemoteFileType::File | RemoteFileType::Symlink => {
+                    session.download_file(&remote_path, &local_path).await?;
+                }
+                RemoteFileType::Other => {
+                    return Err(Error::new(format!(
+                        "unsupported remote file type: {remote_path}"
+                    )))
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_remote_file_target(
+    session: &mut dyn SshSession,
+    source: &Path,
+    destination: &str,
+) -> Result<String> {
+    match session.remote_file_type(destination).await? {
+        Some(RemoteFileType::Directory) => Ok(join_remote(destination, &local_name(source)?)),
+        _ => Ok(destination.to_string()),
+    }
+}
+
+async fn resolve_remote_directory_target(
+    session: &mut dyn SshSession,
+    source: &Path,
+    destination: &str,
+) -> Result<String> {
+    match session.remote_file_type(destination).await? {
+        Some(RemoteFileType::Directory) => Ok(join_remote(destination, &local_name(source)?)),
+        Some(_) => Err(Error::new(
+            "cannot copy a directory onto an existing remote file",
+        )),
+        None => Ok(destination.to_string()),
+    }
+}
+
+fn resolve_local_file_target(source: &str, destination: &Path) -> Result<PathBuf> {
+    if path_is_directory(destination)? {
+        Ok(destination.join(remote_name(source)?))
+    } else {
+        Ok(destination.to_path_buf())
+    }
+}
+
+fn resolve_local_directory_target(source: &str, destination: &Path) -> Result<PathBuf> {
+    if path_is_directory(destination)? {
+        Ok(destination.join(remote_name(source)?))
+    } else {
+        Ok(destination.to_path_buf())
+    }
+}
+
+fn parse_endpoint(field: &str, value: &str) -> Result<CopyEndpoint> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::new(format!("{field} cannot be empty")));
+    }
+
+    match parse_remote_path(trimmed) {
+        Some(remote) => Ok(CopyEndpoint::Remote(remote)),
+        None => Ok(CopyEndpoint::Local(PathBuf::from(trimmed))),
+    }
+}
+
+fn parse_remote_path(value: &str) -> Option<RemotePath> {
+    let (profile, path) = value.split_once(':')?;
+    let profile = profile.trim();
+    if profile.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+
+    Some(RemotePath {
+        profile: profile.to_string(),
+        path: path.to_string(),
+    })
+}
+
+fn validate_local_source(path: &Path, recursive: bool) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_dir() && !recursive {
+        return Err(Error::new("copying directories requires --recursive"));
+    }
+    Ok(())
+}
+
+fn path_is_directory(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::from(error)),
+    }
+}
+
+fn local_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| Error::new(format!("path has no file name: {}", path.display())))
+}
+
+fn remote_name(path: &str) -> Result<String> {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| Error::new(format!("path has no file name: {path}")))
+}
+
+fn remote_parent(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
+
+    trimmed.rfind('/').map(|index| {
+        if index == 0 {
+            "/".to_string()
+        } else {
+            trimmed[..index].to_string()
+        }
+    })
+}
+
+fn join_remote(base: &str, name: &str) -> String {
+    if base == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), name)
+    }
+}

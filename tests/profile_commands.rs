@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -16,7 +18,10 @@ use connect::{
     },
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
-    ssh::{ObservedHostKey, SshClient, SshSession},
+    ssh::{
+        parse_copy_spec, CopyDirection, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
+        SshClient, SshSession,
+    },
     store::ProfileInput,
     terminal::prompt::Prompt,
 };
@@ -637,6 +642,88 @@ async fn connect_propagates_remote_exit_status() {
     assert!(matches!(error, Error::RemoteExitStatus(23)));
 }
 
+#[tokio::test]
+async fn copy_uses_profile_and_rejects_host_key_mismatch() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "expected-fingerprint");
+    let source = TestFile::write_temp("artifact.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/artifact.txt",
+        false,
+    )
+    .unwrap();
+
+    let ssh = FakeCopySshClient::with_hostkey("different-fingerprint");
+    let result = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await;
+
+    assert!(matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key"));
+}
+
+#[tokio::test]
+async fn copy_tries_private_key_before_password() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_private_key("prod", "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n")
+        .unwrap();
+    harness.secrets().set_password("prod", "super-secret").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, true, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("artifact.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/artifact.txt",
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::key_rejected_then_password_succeeds();
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.auth_attempts(), vec!["key", "password"]);
+    assert_eq!(
+        ssh.transfers(),
+        vec![(CopyDirection::Upload, source.path().to_path_buf(), "/tmp/artifact.txt".into())]
+    );
+}
+
+#[tokio::test]
+async fn copy_rejects_remote_directory_without_recursive_flag() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness.secrets().set_password("prod", "super-secret").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-download");
+    let spec = parse_copy_spec("prod:/var/log", &destination.to_string_lossy(), false).unwrap();
+    let ssh = FakeCopySshClient::with_remote_directory("/var/log");
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("--recursive"));
+
+    let _ = fs::remove_dir_all(destination);
+}
+
 fn unique_temp_path(prefix: &str) -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -837,6 +924,194 @@ struct FakeConnectSshClient {
 }
 
 #[derive(Debug, Clone)]
+struct FakeCopySshClient {
+    state: Arc<std::sync::Mutex<FakeCopyState>>,
+}
+
+#[derive(Debug, Clone)]
+struct FakeCopyState {
+    observed: ObservedHostKey,
+    auth_attempts: Vec<&'static str>,
+    key_result: bool,
+    password_result: bool,
+    remote_paths: HashMap<String, RemoteFileType>,
+    remote_directories: HashMap<String, Vec<RemoteDirectoryEntry>>,
+    transfers: Vec<(CopyDirection, PathBuf, String)>,
+}
+
+impl FakeCopySshClient {
+    fn with_hostkey(fingerprint: &str) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(FakeCopyState {
+                observed: ObservedHostKey {
+                    host: "prod.example.com".into(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".into(),
+                    fingerprint: fingerprint.into(),
+                    public_key: format!("public-key-{fingerprint}"),
+                },
+                auth_attempts: Vec::new(),
+                key_result: true,
+                password_result: true,
+                remote_paths: HashMap::new(),
+                remote_directories: HashMap::new(),
+                transfers: Vec::new(),
+            })),
+        }
+    }
+
+    fn key_rejected_then_password_succeeds() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().key_result = false;
+        client
+    }
+
+    fn with_remote_directory(path: &str) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client
+            .state
+            .lock()
+            .unwrap()
+            .remote_paths
+            .insert(path.into(), RemoteFileType::Directory);
+        client
+    }
+
+    fn auth_attempts(&self) -> Vec<&'static str> {
+        self.state.lock().unwrap().auth_attempts.clone()
+    }
+
+    fn transfers(&self) -> Vec<(CopyDirection, PathBuf, String)> {
+        self.state.lock().unwrap().transfers.clone()
+    }
+}
+
+impl SshClient for FakeCopySshClient {
+    fn connect<'a>(
+        &'a self,
+        _profile: &'a connect::store::Profile,
+        _expected_host_key: Option<&'a connect::store::HostKeyRecord>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Box<dyn SshSession + Send + 'static>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            Ok(Box::new(FakeCopySession { state }) as Box<dyn SshSession + Send>)
+        })
+    }
+}
+
+struct FakeCopySession {
+    state: Arc<std::sync::Mutex<FakeCopyState>>,
+}
+
+impl SshSession for FakeCopySession {
+    fn observe_host_key<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<ObservedHostKey>> + Send + 'a>> {
+        let observed = self.state.lock().unwrap().observed.clone();
+        Box::pin(async move { Ok(observed) })
+    }
+
+    fn authenticate_public_key<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _private_key: &'a str,
+        _passphrase: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("key");
+            state.key_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn authenticate_password<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _password: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("password");
+            state.password_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn open_shell<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u32>> + Send + 'a>> {
+        Box::pin(async move { Ok(0) })
+    }
+
+    fn remote_file_type<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = connect::error::Result<Option<RemoteFileType>>> + Send + 'a>,
+    > {
+        let file_type = self.state.lock().unwrap().remote_paths.get(path).copied();
+        Box::pin(async move { Ok(file_type) })
+    }
+
+    fn read_remote_dir<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Vec<RemoteDirectoryEntry>>> + Send + 'a,
+        >,
+    > {
+        let entries = self
+            .state
+            .lock()
+            .unwrap()
+            .remote_directories
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(entries) })
+    }
+
+    fn create_remote_dir_all<'a>(
+        &'a mut self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn upload_file<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .transfers
+            .push((CopyDirection::Upload, local_path.to_path_buf(), remote_path.into()));
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn download_file<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .transfers
+            .push((CopyDirection::Download, local_path.to_path_buf(), remote_path.into()));
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FakeConnectState {
     observed: ObservedHostKey,
     auth_attempts: Vec<&'static str>,
@@ -972,6 +1247,31 @@ impl SshSession for FakeConnectSession {
 struct TestKey {
     path: PathBuf,
     contents: &'static str,
+}
+
+struct TestFile {
+    path: PathBuf,
+}
+
+impl TestFile {
+    fn write_temp(name: &str, contents: &str) -> Self {
+        let root = unique_temp_path("connect-test-file");
+        let path = root.join(name);
+        std::fs::write(&path, contents).expect("test file should be written");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestFile {
+    fn drop(&mut self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
 }
 
 impl TestKey {

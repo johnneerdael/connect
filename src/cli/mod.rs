@@ -2,6 +2,7 @@ pub mod commands {
     pub mod add;
     pub mod completion;
     pub mod connect;
+    pub mod copy;
     pub mod edit;
     pub mod hostkeys;
     pub mod list;
@@ -13,6 +14,6 @@ pub mod commands {
 pub mod types;
 
 pub use types::{
-    AddArgs, Cli, Command, EditArgs, HostkeysArgs, HostkeysCommand, HostkeysDeleteArgs,
-    HostkeysListArgs, ListArgs, RemoveArgs, ShowArgs,
+    AddArgs, Cli, Command, CopyArgs, EditArgs, HostkeysArgs, HostkeysCommand,
+    HostkeysDeleteArgs, HostkeysListArgs, ListArgs, RemoveArgs, ShowArgs,
 };

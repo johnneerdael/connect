@@ -10,12 +10,15 @@ use directories::ProjectDirs;
 
 use crate::{
     cli::{
-        commands::{add, completion, connect, edit, hostkeys, list, remove, show, version},
+        commands::{add, completion, connect, copy, edit, hostkeys, list, remove, show, version},
         Cli, Command, HostkeysCommand,
     },
     error::{Error, Result},
     secrets::{KeyringSecretStore, SecretStore},
-    ssh::{connect_profile as ssh_connect_profile, ProfileAuth, SshClient, SshConnectionContext},
+    ssh::{
+        connect_profile as ssh_connect_profile, copy_profile as ssh_copy_profile, CopySpec,
+        ProfileAuth, SshClient, SshConnectionContext,
+    },
     store::{Database, HostKeyStore, Profile, ProfileInput, ProfileStore},
     terminal::prompt::StdioPrompt,
 };
@@ -240,6 +243,16 @@ impl App {
         let profile = self.get_profile(name)?;
         ssh_connect_profile(ssh, &profile, self, prompt).await
     }
+
+    pub async fn copy(
+        &self,
+        spec: &CopySpec,
+        ssh: &dyn SshClient,
+        prompt: &dyn crate::terminal::prompt::Prompt,
+    ) -> Result<()> {
+        let profile = self.get_profile(spec.remote_profile())?;
+        ssh_copy_profile(ssh, spec, &profile, self, prompt).await
+    }
 }
 
 impl App {
@@ -364,9 +377,9 @@ pub fn run() -> Result<()> {
         }
         Some(Command::Completion) => completion::run(),
         Some(Command::Version) => version::run(),
-        Some(Command::Copy) => {
-            let _app = App::load()?;
-            Ok(())
+        Some(Command::Copy(args)) => {
+            let app = App::load()?;
+            copy::run(&app, &prompt, &args)
         }
         None => {
             let app = App::load()?;

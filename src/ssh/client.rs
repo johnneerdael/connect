@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
@@ -10,6 +11,14 @@ use russh::{
     keys::{self, PrivateKeyWithHashAlg, PublicKeyBase64},
     Disconnect,
 };
+use russh_sftp::{
+    client::{error::Error as SftpError, SftpSession},
+    protocol::{OpenFlags, StatusCode},
+};
+use tokio::{
+    fs::File,
+    io::{copy, AsyncWriteExt},
+};
 
 use crate::{
     error::{Error, Result},
@@ -17,7 +26,9 @@ use crate::{
     terminal::interactive::InteractiveTerminal,
 };
 
-use super::{verify_observed_host_key, ObservedHostKey};
+use super::{
+    verify_observed_host_key, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
+};
 
 pub trait SshClient: Send + Sync {
     fn connect<'a>(
@@ -46,6 +57,43 @@ pub trait SshSession: Send {
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
 
     fn open_shell<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>>;
+
+    fn remote_file_type<'a>(
+        &'a mut self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RemoteFileType>>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn read_remote_dir<'a>(
+        &'a mut self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RemoteDirectoryEntry>>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn create_remote_dir_all<'a>(
+        &'a mut self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn upload_file<'a>(
+        &'a mut self,
+        _local_path: &'a Path,
+        _remote_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn download_file<'a>(
+        &'a mut self,
+        _remote_path: &'a str,
+        _local_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +144,7 @@ impl SshClient for RusshClient {
                 handle,
                 observed,
                 terminal: self.terminal.clone(),
+                sftp: None,
             }) as Box<dyn SshSession + Send>)
         })
     }
@@ -105,6 +154,29 @@ struct RusshSession {
     handle: Handle<HostKeyRecorder>,
     observed: ObservedHostKey,
     terminal: InteractiveTerminal,
+    sftp: Option<SftpSession>,
+}
+
+impl RusshSession {
+    async fn sftp(&mut self) -> Result<&mut SftpSession> {
+        if self.sftp.is_none() {
+            let channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(map_ssh_error)?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(map_ssh_error)?;
+            let sftp = SftpSession::new(channel.into_stream())
+                .await
+                .map_err(map_sftp_error)?;
+            self.sftp = Some(sftp);
+        }
+
+        Ok(self.sftp.as_mut().expect("sftp session should be initialized"))
+    }
 }
 
 impl SshSession for RusshSession {
@@ -176,6 +248,96 @@ impl SshSession for RusshSession {
                 .await
                 .map_err(map_ssh_error)?;
             Ok(exit_status)
+        })
+    }
+
+    fn remote_file_type<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RemoteFileType>>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            match sftp.metadata(path).await {
+                Ok(metadata) => Ok(Some(map_remote_file_type(metadata.file_type()))),
+                Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                    Ok(None)
+                }
+                Err(error) => Err(map_sftp_error(error)),
+            }
+        })
+    }
+
+    fn read_remote_dir<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RemoteDirectoryEntry>>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let entries = sftp.read_dir(path).await.map_err(map_sftp_error)?;
+            Ok(entries
+                .map(|entry| RemoteDirectoryEntry {
+                    name: entry.file_name(),
+                    file_type: map_remote_file_type(entry.file_type()),
+                })
+                .collect())
+        })
+    }
+
+    fn create_remote_dir_all<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if path.is_empty() || path == "/" {
+                return Ok(());
+            }
+
+            let sftp = self.sftp().await?;
+            let mut current = String::new();
+            for component in path.split('/').filter(|segment| !segment.is_empty()) {
+                current.push('/');
+                current.push_str(component);
+                if !sftp.try_exists(&current).await.map_err(map_sftp_error)? {
+                    sftp.create_dir(&current).await.map_err(map_sftp_error)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn upload_file<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let mut local = File::open(local_path).await?;
+            let mut remote = sftp
+                .open_with_flags(
+                    remote_path,
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                )
+                .await
+                .map_err(map_sftp_error)?;
+            copy(&mut local, &mut remote).await?;
+            remote.shutdown().await?;
+            Ok(())
+        })
+    }
+
+    fn download_file<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let mut remote = sftp.open(remote_path).await.map_err(map_sftp_error)?;
+            let mut local = File::create(local_path).await?;
+            copy(&mut remote, &mut local).await?;
+            local.flush().await?;
+            Ok(())
         })
     }
 }
@@ -251,4 +413,20 @@ fn host_key_mismatch(state: &Arc<Mutex<bool>>) -> Result<bool> {
 
 fn map_ssh_error(error: impl std::fmt::Display) -> Error {
     Error::new(format!("ssh error: {error}"))
+}
+
+fn map_sftp_error(error: impl std::fmt::Display) -> Error {
+    Error::new(format!("sftp error: {error}"))
+}
+
+fn map_remote_file_type(file_type: russh_sftp::protocol::FileType) -> RemoteFileType {
+    if file_type.is_dir() {
+        RemoteFileType::Directory
+    } else if file_type.is_file() {
+        RemoteFileType::File
+    } else if file_type.is_symlink() {
+        RemoteFileType::Symlink
+    } else {
+        RemoteFileType::Other
+    }
 }
