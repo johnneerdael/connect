@@ -334,7 +334,7 @@ mod tests {
             &mut progress_writer,
             "resume test".into(),
             Some(std::fs::metadata(&source_path).unwrap().len()),
-            true,
+            ProgressMode::Interactive,
             6,
         )
         .await
@@ -348,10 +348,52 @@ mod tests {
             .expect("progress should be readable");
 
         assert_eq!(bytes_copied, 19);
-        assert!(progress.contains("\rresume test: 6/19 bytes"));
-        assert!(progress.contains("\rresume test: 19/19 bytes"));
-        assert!(!progress.contains("\rresume test: 0/19 bytes"));
+        assert!(progress.contains("\r\x1b[2Kresume test: 6/19 bytes"));
+        assert!(progress.contains("\r\x1b[2Kresume test: 19/19 bytes"));
+        assert!(!progress.contains("\r\x1b[2Kresume test: 0/19 bytes"));
         assert!(progress.ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn explicit_progress_uses_newlines_when_not_interactive() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        let source_path = dir.path().join("source.txt");
+        let destination_path = dir.path().join("destination.txt");
+
+        std::fs::write(&source_path, "hello-resume-upload").expect("source should be written");
+        std::fs::write(&destination_path, "").expect("destination should exist");
+
+        let mut source = File::open(&source_path).await.expect("source should open");
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .open(&destination_path)
+            .await
+            .expect("destination should open");
+
+        let (mut progress_reader, mut progress_writer) = duplex(1024);
+        let bytes_copied = copy_stream_with_progress(
+            &mut source,
+            &mut destination,
+            &mut progress_writer,
+            "upload test".into(),
+            Some(std::fs::metadata(&source_path).unwrap().len()),
+            ProgressMode::LogLines,
+            0,
+        )
+        .await
+        .expect("copy should succeed");
+        drop(progress_writer);
+
+        let mut progress = String::new();
+        progress_reader
+            .read_to_string(&mut progress)
+            .await
+            .expect("progress should be readable");
+
+        assert_eq!(bytes_copied, 19);
+        assert!(progress.contains("upload test: 0/19 bytes\n"));
+        assert!(progress.contains("upload test: 19/19 bytes\n"));
+        assert!(!progress.contains('\r'));
     }
 }
 
@@ -823,13 +865,32 @@ fn progress_label(direction: &str, local_path: &Path, remote_path: &str) -> Stri
     format!("{direction} {} <-> {remote_path}", local_path.display())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressMode {
+    Hidden,
+    Interactive,
+    LogLines,
+}
+
+impl ProgressMode {
+    fn from_stderr(show_progress_override: bool) -> Self {
+        if std::io::stderr().is_terminal() {
+            Self::Interactive
+        } else if show_progress_override {
+            Self::LogLines
+        } else {
+            Self::Hidden
+        }
+    }
+}
+
 async fn copy_stream_with_progress<R, W, P>(
     reader: &mut R,
     writer: &mut W,
     progress: &mut P,
     label: String,
     total_bytes: Option<u64>,
-    show_progress_override: bool,
+    progress_mode: ProgressMode,
     initial_copied: u64,
 ) -> Result<u64>
 where
@@ -837,9 +898,8 @@ where
     W: AsyncWrite + Unpin,
     P: AsyncWrite + Unpin,
 {
-    let show_progress = show_progress_override || std::io::stderr().is_terminal();
-    if show_progress {
-        print_progress(progress, &label, initial_copied, total_bytes).await?;
+    if progress_mode != ProgressMode::Hidden {
+        print_progress(progress, &label, initial_copied, total_bytes, progress_mode).await?;
     }
 
     let mut copied = initial_copied;
@@ -851,12 +911,12 @@ where
         }
         writer.write_all(&buffer[..read]).await?;
         copied += u64::try_from(read).unwrap_or(u64::MAX);
-        if show_progress {
-            print_progress(progress, &label, copied, total_bytes).await?;
+        if progress_mode != ProgressMode::Hidden {
+            print_progress(progress, &label, copied, total_bytes, progress_mode).await?;
         }
     }
     writer.flush().await?;
-    if show_progress {
+    if progress_mode == ProgressMode::Interactive {
         progress.write_all(b"\n").await?;
         progress.flush().await?;
     }
@@ -876,6 +936,7 @@ where
     W: AsyncWrite + tokio::io::AsyncSeek + Unpin,
 {
     let mut progress = tokio::io::stderr();
+    let progress_mode = ProgressMode::from_stderr(show_progress);
     if resume_offset > 0 {
         reader.seek(std::io::SeekFrom::Start(resume_offset)).await?;
         writer.seek(std::io::SeekFrom::Start(resume_offset)).await?;
@@ -887,7 +948,7 @@ where
         &mut progress,
         label,
         total_bytes,
-        show_progress,
+        progress_mode,
         resume_offset,
     )
     .await
@@ -898,15 +959,26 @@ async fn print_progress<W>(
     label: &str,
     copied: u64,
     total_bytes: Option<u64>,
+    progress_mode: ProgressMode,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let line = match total_bytes {
-        Some(total) if total > 0 => format!("\r{label}: {copied}/{total} bytes"),
-        _ => format!("\r{label}: {copied} bytes"),
+        Some(total) if total > 0 => format!("{label}: {copied}/{total} bytes"),
+        _ => format!("{label}: {copied} bytes"),
     };
-    stderr.write_all(line.as_bytes()).await?;
+    match progress_mode {
+        ProgressMode::Hidden => {}
+        ProgressMode::Interactive => {
+            stderr.write_all(b"\r\x1b[2K").await?;
+            stderr.write_all(line.as_bytes()).await?;
+        }
+        ProgressMode::LogLines => {
+            stderr.write_all(line.as_bytes()).await?;
+            stderr.write_all(b"\n").await?;
+        }
+    }
     stderr.flush().await?;
     Ok(())
 }
