@@ -14,8 +14,14 @@ fn connect_test_bin() -> Command {
 #[test]
 fn parse_copy_spec_accepts_upload_from_local_to_remote() {
     let file = temp_file("connect-copy-file", "artifact.txt", "hello");
-    let spec =
-        parse_copy_spec(file.to_string_lossy().as_ref(), "prod:/tmp/file.txt", false).unwrap();
+    let spec = parse_copy_spec(
+        file.to_string_lossy().as_ref(),
+        "prod:/tmp/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
     match &spec.source {
         CopyEndpoint::Local(path) => assert_eq!(path, &file),
@@ -33,7 +39,14 @@ fn parse_copy_spec_accepts_upload_from_local_to_remote() {
 
 #[test]
 fn parse_copy_spec_accepts_download_from_remote_to_local() {
-    let spec = parse_copy_spec("prod:/tmp/file.txt", "./downloads/file.txt", false).unwrap();
+    let spec = parse_copy_spec(
+        "prod:/tmp/file.txt",
+        "./downloads/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
     match &spec.source {
         CopyEndpoint::Remote(remote) => {
@@ -51,7 +64,14 @@ fn parse_copy_spec_accepts_download_from_remote_to_local() {
 
 #[test]
 fn parse_copy_spec_treats_windows_drive_paths_as_local_destination() {
-    let spec = parse_copy_spec("prod:/tmp/file.txt", "C:/Users/alice/file.txt", false).unwrap();
+    let spec = parse_copy_spec(
+        "prod:/tmp/file.txt",
+        "C:/Users/alice/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
     match &spec.source {
         CopyEndpoint::Remote(remote) => {
@@ -69,7 +89,14 @@ fn parse_copy_spec_treats_windows_drive_paths_as_local_destination() {
 
 #[test]
 fn parse_copy_spec_accepts_explicit_remote_prefix_for_single_letter_profile() {
-    let spec = parse_copy_spec("@p:/tmp/file.txt", "./downloads/file.txt", false).unwrap();
+    let spec = parse_copy_spec(
+        "@p:/tmp/file.txt",
+        "./downloads/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
     match &spec.source {
         CopyEndpoint::Remote(remote) => {
@@ -87,7 +114,14 @@ fn parse_copy_spec_accepts_explicit_remote_prefix_for_single_letter_profile() {
 
 #[test]
 fn parse_copy_spec_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
-    let spec = parse_copy_spec("@@prod:/tmp/file.txt", "./downloads/file.txt", false).unwrap();
+    let spec = parse_copy_spec(
+        "@@prod:/tmp/file.txt",
+        "./downloads/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
     match &spec.source {
         CopyEndpoint::Remote(remote) => {
@@ -105,7 +139,14 @@ fn parse_copy_spec_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
 
 #[test]
 fn parse_copy_spec_rejects_local_to_local_invocations() {
-    let error = parse_copy_spec("fixtures/file.txt", "./downloads/file.txt", false).unwrap_err();
+    let error = parse_copy_spec(
+        "fixtures/file.txt",
+        "./downloads/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(
         error.to_string(),
         "copy requires exactly one remote path in profile:/path format"
@@ -114,11 +155,41 @@ fn parse_copy_spec_rejects_local_to_local_invocations() {
 
 #[test]
 fn parse_copy_spec_rejects_remote_to_remote_invocations() {
-    let error = parse_copy_spec("prod:/tmp/file.txt", "stage:/tmp/file.txt", false).unwrap_err();
+    let error = parse_copy_spec(
+        "prod:/tmp/file.txt",
+        "stage:/tmp/file.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap_err();
     assert_eq!(
         error.to_string(),
         "copy requires exactly one remote path in profile:/path format"
     );
+}
+
+#[test]
+fn parse_copy_spec_rejects_resume_for_recursive_copy() {
+    let tree = temp_dir("connect-copy-resume-tree");
+    std::fs::create_dir(tree.join("nested")).unwrap();
+    std::fs::write(tree.join("nested/file.txt"), "hello").unwrap();
+
+    let error = parse_copy_spec(
+        tree.to_string_lossy().as_ref(),
+        "prod:/tmp/tree",
+        true,
+        true,
+        false,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "--resume is only supported for single-file copy operations"
+    );
+
+    let _ = std::fs::remove_dir_all(tree);
 }
 
 #[test]

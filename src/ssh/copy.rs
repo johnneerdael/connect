@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -48,6 +48,8 @@ pub struct CopySpec {
     pub source: CopyEndpoint,
     pub destination: CopyEndpoint,
     pub recursive: bool,
+    pub resume: bool,
+    pub progress: bool,
 }
 
 impl CopySpec {
@@ -69,7 +71,53 @@ impl CopySpec {
     }
 }
 
-pub fn parse_copy_spec(source: &str, destination: &str, recursive: bool) -> Result<CopySpec> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CopyTransferOptions {
+    pub resume_offset: u64,
+    pub show_progress: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CopyTransferResult {
+    pub bytes_copied: u64,
+    pub resumed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopySummary {
+    pub direction: CopyDirection,
+    pub bytes_copied: u64,
+    pub resumed_bytes: u64,
+    pub destination: String,
+}
+
+impl fmt::Display for CopySummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "copy {} complete: {} bytes copied ({} resumed) to {}",
+            self.direction, self.bytes_copied, self.resumed_bytes, self.destination
+        )
+    }
+}
+
+impl fmt::Display for CopyDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            CopyDirection::Upload => "upload",
+            CopyDirection::Download => "download",
+        };
+        f.write_str(label)
+    }
+}
+
+pub fn parse_copy_spec(
+    source: &str,
+    destination: &str,
+    recursive: bool,
+    resume: bool,
+    progress: bool,
+) -> Result<CopySpec> {
     let source = parse_endpoint("source", source)?;
     let destination = parse_endpoint("destination", destination)?;
 
@@ -85,10 +133,18 @@ pub fn parse_copy_spec(source: &str, destination: &str, recursive: bool) -> Resu
         }
     }
 
+    if recursive && resume {
+        return Err(Error::new(
+            "--resume is only supported for single-file copy operations",
+        ));
+    }
+
     Ok(CopySpec {
         source,
         destination,
         recursive,
+        resume,
+        progress,
     })
 }
 
@@ -100,16 +156,18 @@ pub async fn copy_profile(
     prompt: &dyn Prompt,
 ) -> Result<()> {
     let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
-    execute_copy(&mut *session, spec).await
+    let summary = execute_copy(&mut *session, spec).await?;
+    eprintln!("{summary}");
+    Ok(())
 }
 
-async fn execute_copy(session: &mut dyn SshSession, spec: &CopySpec) -> Result<()> {
+async fn execute_copy(session: &mut dyn SshSession, spec: &CopySpec) -> Result<CopySummary> {
     match (&spec.source, &spec.destination) {
         (CopyEndpoint::Local(source), CopyEndpoint::Remote(destination)) => {
-            upload(session, source, &destination.path, spec.recursive).await
+            upload(session, source, &destination.path, spec).await
         }
         (CopyEndpoint::Remote(source), CopyEndpoint::Local(destination)) => {
-            download(session, &source.path, destination, spec.recursive).await
+            download(session, &source.path, destination, spec).await
         }
         _ => Err(Error::new(
             "copy requires exactly one remote path in profile:/path format",
@@ -121,22 +179,54 @@ async fn upload(
     session: &mut dyn SshSession,
     source: &Path,
     destination: &str,
-    recursive: bool,
-) -> Result<()> {
+    spec: &CopySpec,
+) -> Result<CopySummary> {
     let metadata = fs::metadata(source)?;
     if metadata.is_dir() {
-        if !recursive {
+        if !spec.recursive {
             return Err(Error::new("copying directories requires --recursive"));
         }
 
         let root = resolve_remote_directory_target(session, source, destination).await?;
-        upload_dir_recursive(session, source, &root).await
+        let result = upload_dir_recursive(
+            session,
+            source,
+            &root,
+            CopyTransferOptions {
+                resume_offset: 0,
+                show_progress: spec.progress,
+            },
+        )
+        .await?;
+        Ok(CopySummary {
+            direction: CopyDirection::Upload,
+            bytes_copied: result.bytes_copied,
+            resumed_bytes: result.resumed_bytes,
+            destination: root,
+        })
     } else if metadata.is_file() {
         let target = resolve_remote_file_target(session, source, destination).await?;
+        let resume_offset =
+            resolve_upload_resume_offset(session, source, &target, spec.resume).await?;
         if let Some(parent) = remote_parent(&target) {
             session.create_remote_dir_all(&parent).await?;
         }
-        session.upload_file(source, &target).await
+        let result = session
+            .upload_file(
+                source,
+                &target,
+                CopyTransferOptions {
+                    resume_offset,
+                    show_progress: spec.progress,
+                },
+            )
+            .await?;
+        Ok(CopySummary {
+            direction: CopyDirection::Upload,
+            bytes_copied: result.bytes_copied,
+            resumed_bytes: result.resumed_bytes,
+            destination: target,
+        })
     } else {
         Err(Error::new(format!(
             "unsupported local file type: {}",
@@ -149,23 +239,55 @@ async fn download(
     session: &mut dyn SshSession,
     source: &str,
     destination: &Path,
-    recursive: bool,
-) -> Result<()> {
+    spec: &CopySpec,
+) -> Result<CopySummary> {
     match session.remote_file_type(source).await? {
         Some(RemoteFileType::Directory) => {
-            if !recursive {
+            if !spec.recursive {
                 return Err(Error::new("copying directories requires --recursive"));
             }
 
             let root = resolve_local_directory_target(source, destination)?;
-            download_dir_recursive(session, source, &root).await
+            let result = download_dir_recursive(
+                session,
+                source,
+                &root,
+                CopyTransferOptions {
+                    resume_offset: 0,
+                    show_progress: spec.progress,
+                },
+            )
+            .await?;
+            Ok(CopySummary {
+                direction: CopyDirection::Download,
+                bytes_copied: result.bytes_copied,
+                resumed_bytes: result.resumed_bytes,
+                destination: root.display().to_string(),
+            })
         }
         Some(RemoteFileType::File) | Some(RemoteFileType::Symlink) => {
             let target = resolve_local_file_target(source, destination)?;
+            let resume_offset =
+                resolve_download_resume_offset(session, source, &target, spec.resume).await?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            session.download_file(source, &target).await
+            let result = session
+                .download_file(
+                    source,
+                    &target,
+                    CopyTransferOptions {
+                        resume_offset,
+                        show_progress: spec.progress,
+                    },
+                )
+                .await?;
+            Ok(CopySummary {
+                direction: CopyDirection::Download,
+                bytes_copied: result.bytes_copied,
+                resumed_bytes: result.resumed_bytes,
+                destination: target.display().to_string(),
+            })
         }
         Some(RemoteFileType::Other) => Err(Error::new(format!(
             "unsupported remote file type: {source}"
@@ -178,8 +300,10 @@ async fn upload_dir_recursive(
     session: &mut dyn SshSession,
     local_dir: &Path,
     remote_dir: &str,
-) -> Result<()> {
+    options: CopyTransferOptions,
+) -> Result<CopyTransferResult> {
     let mut stack = vec![(local_dir.to_path_buf(), remote_dir.to_string())];
+    let mut bytes_copied = 0_u64;
 
     while let Some((local_dir, remote_dir)) = stack.pop() {
         session.create_remote_dir_all(&remote_dir).await?;
@@ -195,7 +319,10 @@ async fn upload_dir_recursive(
             if file_type.is_dir() {
                 stack.push((local_path, remote_path));
             } else if file_type.is_file() {
-                session.upload_file(&local_path, &remote_path).await?;
+                let result = session
+                    .upload_file(&local_path, &remote_path, options)
+                    .await?;
+                bytes_copied = bytes_copied.saturating_add(result.bytes_copied);
             } else {
                 return Err(Error::new(format!(
                     "unsupported local file type: {}",
@@ -205,15 +332,20 @@ async fn upload_dir_recursive(
         }
     }
 
-    Ok(())
+    Ok(CopyTransferResult {
+        bytes_copied,
+        resumed_bytes: 0,
+    })
 }
 
 async fn download_dir_recursive(
     session: &mut dyn SshSession,
     remote_dir: &str,
     local_dir: &Path,
-) -> Result<()> {
+    options: CopyTransferOptions,
+) -> Result<CopyTransferResult> {
     let mut stack = vec![(remote_dir.to_string(), local_dir.to_path_buf())];
+    let mut bytes_copied = 0_u64;
 
     while let Some((remote_dir, local_dir)) = stack.pop() {
         fs::create_dir_all(&local_dir)?;
@@ -227,7 +359,10 @@ async fn download_dir_recursive(
                     stack.push((remote_path, local_path));
                 }
                 RemoteFileType::File | RemoteFileType::Symlink => {
-                    session.download_file(&remote_path, &local_path).await?;
+                    let result = session
+                        .download_file(&remote_path, &local_path, options)
+                        .await?;
+                    bytes_copied = bytes_copied.saturating_add(result.bytes_copied);
                 }
                 RemoteFileType::Other => {
                     return Err(Error::new(format!(
@@ -238,7 +373,64 @@ async fn download_dir_recursive(
         }
     }
 
-    Ok(())
+    Ok(CopyTransferResult {
+        bytes_copied,
+        resumed_bytes: 0,
+    })
+}
+
+async fn resolve_upload_resume_offset(
+    session: &mut dyn SshSession,
+    source: &Path,
+    destination: &str,
+    resume: bool,
+) -> Result<u64> {
+    if !resume {
+        return Ok(0);
+    }
+
+    let source_size = fs::metadata(source)?.len();
+    let destination_size = match session.remote_file_size(destination).await? {
+        Some(size) => size,
+        None => return Ok(0),
+    };
+
+    if destination_size > source_size {
+        return Err(Error::new(
+            "cannot resume copy: destination is larger than the source",
+        ));
+    }
+
+    Ok(destination_size)
+}
+
+async fn resolve_download_resume_offset(
+    session: &mut dyn SshSession,
+    source: &str,
+    destination: &Path,
+    resume: bool,
+) -> Result<u64> {
+    if !resume {
+        return Ok(0);
+    }
+
+    let source_size = session
+        .remote_file_size(source)
+        .await?
+        .ok_or_else(|| Error::new(format!("remote path was not found: {source}")))?;
+    let destination_size = match fs::metadata(destination) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(Error::from(error)),
+    };
+
+    if destination_size > source_size {
+        return Err(Error::new(
+            "cannot resume copy: destination is larger than the source",
+        ));
+    }
+
+    Ok(destination_size)
 }
 
 async fn resolve_remote_file_target(

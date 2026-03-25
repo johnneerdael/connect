@@ -7,7 +7,13 @@ use crate::{
 };
 
 pub fn run(app: &App, prompt: &dyn Prompt, args: &CopyArgs) -> Result<()> {
-    let spec = parse_copy_spec(&args.source, &args.destination, args.recursive)?;
+    let spec = parse_copy_spec(
+        &args.source,
+        &args.destination,
+        args.recursive,
+        args.resume,
+        args.progress,
+    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

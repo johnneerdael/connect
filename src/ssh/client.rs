@@ -20,8 +20,8 @@ use russh_sftp::{
     protocol::{FileAttributes, OpenFlags, StatusCode},
 };
 use tokio::{
-    fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    fs::{File, OpenOptions},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::{
@@ -31,7 +31,8 @@ use crate::{
 };
 
 use super::{
-    verify_observed_host_key, ExecSpec, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
+    verify_observed_host_key, CopyTransferOptions, CopyTransferResult, ExecSpec, ObservedHostKey,
+    RemoteDirectoryEntry, RemoteFileType,
 };
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
@@ -98,6 +99,13 @@ pub trait SshSession: Send {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
     }
 
+    fn remote_file_size<'a>(
+        &'a mut self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
     fn read_remote_dir<'a>(
         &'a mut self,
         _path: &'a str,
@@ -116,7 +124,8 @@ pub trait SshSession: Send {
         &'a mut self,
         _local_path: &'a Path,
         _remote_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        _options: CopyTransferOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<CopyTransferResult>> + Send + 'a>> {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
     }
 
@@ -124,7 +133,8 @@ pub trait SshSession: Send {
         &'a mut self,
         _remote_path: &'a str,
         _local_path: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        _options: CopyTransferOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<CopyTransferResult>> + Send + 'a>> {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
     }
 }
@@ -413,6 +423,22 @@ impl SshSession for RusshSession {
         })
     }
 
+    fn remote_file_size<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            match sftp.metadata(path).await {
+                Ok(metadata) => Ok(metadata.size),
+                Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                    Ok(None)
+                }
+                Err(error) => Err(map_sftp_error(error)),
+            }
+        })
+    }
+
     fn read_remote_dir<'a>(
         &'a mut self,
         path: &'a str,
@@ -455,25 +481,34 @@ impl SshSession for RusshSession {
         &'a mut self,
         local_path: &'a Path,
         remote_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        options: CopyTransferOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<CopyTransferResult>> + Send + 'a>> {
         Box::pin(async move {
             let sftp = self.sftp().await?;
             let mut local = File::open(local_path).await?;
+            let total_bytes = std::fs::metadata(local_path).map(|metadata| metadata.len())?;
             let mut remote = sftp
                 .open_with_flags(
                     remote_path,
-                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    if options.resume_offset > 0 {
+                        OpenFlags::CREATE | OpenFlags::WRITE
+                    } else {
+                        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
+                    },
                 )
                 .await
                 .map_err(map_sftp_error)?;
-            let total_bytes = std::fs::metadata(local_path)
-                .ok()
-                .map(|metadata| metadata.len());
-            copy_stream_with_progress(
+            if options.resume_offset > 0 {
+                remote
+                    .seek(std::io::SeekFrom::Start(options.resume_offset))
+                    .await?;
+            }
+            let bytes_copied = copy_stream_with_progress(
                 &mut local,
                 &mut remote,
                 progress_label("upload", local_path, remote_path),
-                total_bytes,
+                Some(total_bytes),
+                options.show_progress,
             )
             .await?;
             remote.shutdown().await?;
@@ -481,7 +516,10 @@ impl SshSession for RusshSession {
                 let attrs = FileAttributes::from(&metadata);
                 let _ = sftp.set_metadata(remote_path, attrs).await;
             }
-            Ok(())
+            Ok(CopyTransferResult {
+                bytes_copied,
+                resumed_bytes: options.resume_offset,
+            })
         })
     }
 
@@ -489,22 +527,41 @@ impl SshSession for RusshSession {
         &'a mut self,
         remote_path: &'a str,
         local_path: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        options: CopyTransferOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<CopyTransferResult>> + Send + 'a>> {
         Box::pin(async move {
             let sftp = self.sftp().await?;
             let mut remote = sftp.open(remote_path).await.map_err(map_sftp_error)?;
             let remote_metadata = remote.metadata().await.map_err(map_sftp_error)?;
-            let mut local = File::create(local_path).await?;
-            copy_stream_with_progress(
+            let total_bytes = remote_metadata.size;
+            let mut local = if options.resume_offset > 0 {
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(local_path)
+                    .await?
+            } else {
+                File::create(local_path).await?
+            };
+            if options.resume_offset > 0 {
+                local
+                    .seek(std::io::SeekFrom::Start(options.resume_offset))
+                    .await?;
+            }
+            let bytes_copied = copy_stream_with_progress(
                 &mut remote,
                 &mut local,
                 progress_label("download", local_path, remote_path),
-                remote_metadata.size,
+                total_bytes,
+                options.show_progress,
             )
             .await?;
             local.flush().await?;
             apply_local_metadata(local_path, &remote_metadata)?;
-            Ok(())
+            Ok(CopyTransferResult {
+                bytes_copied,
+                resumed_bytes: options.resume_offset,
+            })
         })
     }
 }
@@ -629,13 +686,14 @@ async fn copy_stream_with_progress<R, W>(
     writer: &mut W,
     label: String,
     total_bytes: Option<u64>,
-) -> Result<()>
+    show_progress_override: bool,
+) -> Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut stderr = tokio::io::stderr();
-    let show_progress = std::io::stderr().is_terminal();
+    let show_progress = show_progress_override || std::io::stderr().is_terminal();
     if show_progress {
         print_progress(&mut stderr, &label, 0, total_bytes).await?;
     }
@@ -658,7 +716,7 @@ where
         stderr.write_all(b"\n").await?;
         stderr.flush().await?;
     }
-    Ok(())
+    Ok(copied)
 }
 
 async fn print_progress(

@@ -96,6 +96,8 @@ async fn openssh_end_to_end_supports_tofu_exec_agent_auth_and_recursive_copy() {
         local_tree.to_str().expect("local path should be utf-8"),
         &format!("stored:{}", remote_tree.display()),
         true,
+        false,
+        false,
     )
     .expect("upload spec should parse");
     stored_app
@@ -110,6 +112,8 @@ async fn openssh_end_to_end_supports_tofu_exec_agent_auth_and_recursive_copy() {
             .to_str()
             .expect("download path should be utf-8"),
         true,
+        false,
+        false,
     )
     .expect("download spec should parse");
     stored_app
@@ -149,6 +153,76 @@ async fn openssh_end_to_end_supports_tofu_exec_agent_auth_and_recursive_copy() {
     drop(agent);
 }
 
+#[tokio::test]
+async fn openssh_end_to_end_supports_resumable_upload_and_download() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let ssh = RusshClient::new();
+    let app = harness.app_with_profile("resume", AuthMode::StoredOnly, true);
+
+    let upload_source = harness.root().join("resume-upload.txt");
+    fs::write(&upload_source, "hello-resume-upload").expect("upload source should exist");
+    let upload_remote = harness.root().join("remote-resume-upload.txt");
+    run_remote_command(
+        harness.port(),
+        harness.user_key_path(),
+        &format!(
+            "printf %s {} > {}",
+            shell_single_quote("hello-"),
+            shell_single_quote(&upload_remote.display().to_string())
+        ),
+    )
+    .expect("remote partial upload file should be created");
+
+    let upload_spec = parse_copy_spec(
+        upload_source.to_str().expect("upload path should be utf-8"),
+        &format!("resume:{}", upload_remote.display()),
+        false,
+        true,
+        false,
+    )
+    .expect("resumable upload spec should parse");
+    app.copy(&upload_spec, &ssh, &prompt)
+        .await
+        .expect("resumable upload should succeed");
+    assert_eq!(
+        fs::read_to_string(&upload_remote).expect("remote upload file should be readable"),
+        "hello-resume-upload"
+    );
+
+    let download_remote = harness.root().join("remote-resume-download.txt");
+    run_remote_command(
+        harness.port(),
+        harness.user_key_path(),
+        &format!(
+            "printf %s {} > {}",
+            shell_single_quote("download-resume"),
+            shell_single_quote(&download_remote.display().to_string())
+        ),
+    )
+    .expect("remote download source should be created");
+    let download_local = harness.root().join("resume-download.txt");
+    fs::write(&download_local, "download-").expect("local partial download should exist");
+
+    let download_spec = parse_copy_spec(
+        &format!("resume:{}", download_remote.display()),
+        download_local
+            .to_str()
+            .expect("download path should be utf-8"),
+        false,
+        true,
+        false,
+    )
+    .expect("resumable download spec should parse");
+    app.copy(&download_spec, &ssh, &prompt)
+        .await
+        .expect("resumable download should succeed");
+    assert_eq!(
+        fs::read_to_string(&download_local).expect("downloaded file should exist"),
+        "download-resume"
+    );
+}
+
 struct PassingDoctorEnvironment;
 
 impl DoctorEnvironment for PassingDoctorEnvironment {
@@ -186,15 +260,20 @@ async fn doctor_profile_succeeds_for_a_live_ssh_profile() {
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "hostname resolution" && check.status == LocalDoctorCheckStatus::Pass));
+        .any(|check| check.name == "hostname resolution"
+            && check.status == LocalDoctorCheckStatus::Pass));
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "TCP reachability" && check.status == LocalDoctorCheckStatus::Pass));
-    assert!(report
-        .checks
-        .iter()
-        .any(|check| check.name == "SSH handshake" && check.status == LocalDoctorCheckStatus::Pass));
+        .any(|check| check.name == "TCP reachability"
+            && check.status == LocalDoctorCheckStatus::Pass));
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "SSH handshake"
+                && check.status == LocalDoctorCheckStatus::Pass)
+    );
 }
 
 #[tokio::test]
@@ -218,7 +297,8 @@ async fn doctor_profile_rejects_saved_host_key_mismatch() {
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "host key verification" && check.status == LocalDoctorCheckStatus::Fail));
+        .any(|check| check.name == "host key verification"
+            && check.status == LocalDoctorCheckStatus::Fail));
 }
 
 #[tokio::test]
@@ -235,7 +315,8 @@ async fn doctor_profile_rejects_an_unusable_auth_mode() {
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "SSH auth usability" && check.status == LocalDoctorCheckStatus::Fail));
+        .any(|check| check.name == "SSH auth usability"
+            && check.status == LocalDoctorCheckStatus::Fail));
 }
 
 struct OpenSshHarness {
@@ -540,6 +621,26 @@ fn run_command(command: &mut Command) -> io::Result<Output> {
             ),
         ))
     }
+}
+
+fn run_remote_command(port: u16, key_path: &Path, script: &str) -> io::Result<Output> {
+    run_command(
+        Command::new("ssh")
+            .arg("-i")
+            .arg(key_path)
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("127.0.0.1")
+            .arg(script),
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 fn parse_agent_value(output: &str, key: &str) -> String {

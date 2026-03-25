@@ -20,8 +20,8 @@ use connect::{
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
     ssh::{
-        parse_copy_spec, CopyDirection, ExecSpec, ObservedHostKey, RemoteDirectoryEntry,
-        RemoteFileType, SshClient, SshSession,
+        parse_copy_spec, CopyDirection, CopySummary, ExecSpec, ObservedHostKey,
+        RemoteDirectoryEntry, RemoteFileType, SshClient, SshSession,
     },
     store::{ForwardDefinition, ForwardKind, ProfileInput},
     terminal::prompt::Prompt,
@@ -1210,6 +1210,8 @@ async fn copy_uses_profile_and_rejects_host_key_mismatch() {
         source.path().to_string_lossy().as_ref(),
         "prod:/tmp/artifact.txt",
         false,
+        false,
+        false,
     )
     .unwrap();
 
@@ -1256,6 +1258,8 @@ async fn copy_tries_private_key_before_password() {
         source.path().to_string_lossy().as_ref(),
         "prod:/tmp/artifact.txt",
         false,
+        false,
+        false,
     )
     .unwrap();
     let ssh = FakeCopySshClient::key_rejected_then_password_succeeds();
@@ -1291,7 +1295,14 @@ async fn copy_rejects_remote_directory_without_recursive_flag() {
         .unwrap();
 
     let destination = unique_temp_path("connect-copy-download");
-    let spec = parse_copy_spec("prod:/var/log", &destination.to_string_lossy(), false).unwrap();
+    let spec = parse_copy_spec(
+        "prod:/var/log",
+        &destination.to_string_lossy(),
+        false,
+        false,
+        false,
+    )
+    .unwrap();
     let ssh = FakeCopySshClient::with_remote_directory("/var/log");
 
     let error = harness
@@ -1303,6 +1314,95 @@ async fn copy_rejects_remote_directory_without_recursive_flag() {
     assert!(error.to_string().contains("--recursive"));
 
     let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn copy_rejects_resume_when_destination_is_larger_than_source() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("resume-source.txt", "hello");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/resume-source.txt",
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123").with_remote_file(
+        "/tmp/resume-source.txt",
+        RemoteFileType::File,
+        10,
+    );
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("destination is larger than the source"));
+}
+
+#[test]
+fn copy_summary_formats_direction_bytes_and_destination() {
+    let summary = CopySummary {
+        direction: CopyDirection::Upload,
+        bytes_copied: 12,
+        resumed_bytes: 4,
+        destination: "prod:/tmp/artifact.txt".into(),
+    };
+
+    assert_eq!(
+        summary.to_string(),
+        "copy upload complete: 12 bytes copied (4 resumed) to prod:/tmp/artifact.txt"
+    );
+}
+
+#[tokio::test]
+async fn copy_records_explicit_progress_override() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("progress-source.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/progress-source.txt",
+        false,
+        false,
+        true,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    let transfer_options = ssh.transfer_options();
+    assert!(!transfer_options.is_empty());
+    assert!(transfer_options.iter().all(|options| options.show_progress));
 }
 
 #[tokio::test]
@@ -1323,6 +1423,8 @@ async fn copy_accepts_explicit_remote_prefix_for_single_letter_profile() {
     let spec = parse_copy_spec(
         "@p:/tmp/artifact.txt",
         &destination.to_string_lossy(),
+        false,
+        false,
         false,
     )
     .unwrap();
@@ -1372,6 +1474,8 @@ async fn copy_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
     let spec = parse_copy_spec(
         "@@prod:/tmp/artifact.txt",
         &destination.to_string_lossy(),
+        false,
+        false,
         false,
     )
     .unwrap();
@@ -1617,8 +1721,10 @@ struct FakeCopyState {
     key_result: bool,
     password_result: bool,
     remote_paths: HashMap<String, RemoteFileType>,
+    remote_sizes: HashMap<String, u64>,
     remote_directories: HashMap<String, Vec<RemoteDirectoryEntry>>,
     transfers: Vec<(CopyDirection, PathBuf, String)>,
+    transfer_options: Vec<connect::ssh::CopyTransferOptions>,
 }
 
 impl FakeCopySshClient {
@@ -1637,8 +1743,10 @@ impl FakeCopySshClient {
                 key_result: true,
                 password_result: true,
                 remote_paths: HashMap::new(),
+                remote_sizes: HashMap::new(),
                 remote_directories: HashMap::new(),
                 transfers: Vec::new(),
+                transfer_options: Vec::new(),
             })),
         }
     }
@@ -1666,6 +1774,20 @@ impl FakeCopySshClient {
 
     fn transfers(&self) -> Vec<(CopyDirection, PathBuf, String)> {
         self.state.lock().unwrap().transfers.clone()
+    }
+
+    fn transfer_options(&self) -> Vec<connect::ssh::CopyTransferOptions> {
+        self.state.lock().unwrap().transfer_options.clone()
+    }
+
+    fn with_remote_file(self, path: &str, file_type: RemoteFileType, size: u64) -> Self {
+        let client = self;
+        {
+            let mut state = client.state.lock().unwrap();
+            state.remote_paths.insert(path.into(), file_type);
+            state.remote_sizes.insert(path.into(), size);
+        }
+        client
     }
 }
 
@@ -1754,6 +1876,14 @@ impl SshSession for FakeCopySession {
         Box::pin(async move { Ok(file_type) })
     }
 
+    fn remote_file_size<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<u64>>> + Send + 'a>> {
+        let size = self.state.lock().unwrap().remote_sizes.get(path).copied();
+        Box::pin(async move { Ok(size) })
+    }
+
     fn read_remote_dir<'a>(
         &'a mut self,
         path: &'a str,
@@ -1781,28 +1911,58 @@ impl SshSession for FakeCopySession {
         &'a mut self,
         local_path: &'a Path,
         remote_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        options: connect::ssh::CopyTransferOptions,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>>
+                + Send
+                + 'a,
+        >,
+    > {
         let mut state = self.state.lock().unwrap();
         state.transfers.push((
             CopyDirection::Upload,
             local_path.to_path_buf(),
             remote_path.into(),
         ));
-        Box::pin(async move { Ok(()) })
+        state.transfer_options.push(options);
+        let bytes_copied = std::fs::metadata(local_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Box::pin(async move {
+            Ok(connect::ssh::CopyTransferResult {
+                bytes_copied: bytes_copied.saturating_sub(options.resume_offset),
+                resumed_bytes: options.resume_offset,
+            })
+        })
     }
 
     fn download_file<'a>(
         &'a mut self,
         remote_path: &'a str,
         local_path: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        options: connect::ssh::CopyTransferOptions,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>>
+                + Send
+                + 'a,
+        >,
+    > {
         let mut state = self.state.lock().unwrap();
         state.transfers.push((
             CopyDirection::Download,
             local_path.to_path_buf(),
             remote_path.into(),
         ));
-        Box::pin(async move { Ok(()) })
+        state.transfer_options.push(options);
+        let bytes_copied = state.remote_sizes.get(remote_path).copied().unwrap_or(0);
+        Box::pin(async move {
+            Ok(connect::ssh::CopyTransferResult {
+                bytes_copied: bytes_copied.saturating_sub(options.resume_offset),
+                resumed_bytes: options.resume_offset,
+            })
+        })
     }
 }
 

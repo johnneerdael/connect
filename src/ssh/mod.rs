@@ -10,8 +10,8 @@ pub use client::{
     agent_auth_available, agent_connection_available, RusshClient, SshClient, SshSession,
 };
 pub use copy::{
-    copy_profile, parse_copy_spec, CopyDirection, CopyEndpoint, CopySpec, RemoteDirectoryEntry,
-    RemoteFileType, RemotePath,
+    copy_profile, parse_copy_spec, CopyDirection, CopyEndpoint, CopySpec, CopySummary,
+    CopyTransferOptions, CopyTransferResult, RemoteDirectoryEntry, RemoteFileType, RemotePath,
 };
 pub use hostkeys::{
     verify_observed_host_key, HostKeyVerification, ObservedHostKey, ObservedHostKeySource,
