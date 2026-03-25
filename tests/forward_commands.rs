@@ -488,6 +488,117 @@ async fn forward_run_rejects_unsupported_socks_commands_without_killing_the_list
 }
 
 #[tokio::test]
+async fn forward_run_does_not_let_a_stalled_socks_client_block_new_connections() {
+    let harness = TestHarness::with_profile("prod");
+    let ssh = FakeForwardSshClient::always_alive();
+    let socks_port = allocate_port();
+
+    forward::run(
+        harness.app(),
+        &AcceptPrompt,
+        &ForwardArgs {
+            command: ForwardCommand::Add(ForwardAddArgs {
+                profile: "prod".into(),
+                name: "proxy".into(),
+                local: None,
+                socks: Some(format!("127.0.0.1:{socks_port}")),
+                description: None,
+            }),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    run_forward_until(
+        harness.app(),
+        ssh.clone(),
+        ForwardRunArgs {
+            profile: "prod".into(),
+            name: Some("proxy".into()),
+            all: false,
+        },
+        async move {
+            wait_for_port(socks_port).await;
+
+            let stalled = TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("first SOCKS client should connect");
+
+            let mut active = TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("second SOCKS client should connect");
+            tokio::time::timeout(Duration::from_secs(2), socks5_greet(&mut active))
+                .await
+                .expect("second SOCKS client should complete the greeting");
+            socks5_connect_domain(&mut active, "db.internal", 5432).await;
+            wait_for_open_count(&ssh, 1).await;
+            assert_eq!(ssh.last_target(), Some(("db.internal".into(), 5432)));
+
+            drop(stalled);
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn forward_run_does_not_block_new_socks_greetings_while_a_tunnel_is_opening() {
+    let harness = TestHarness::with_profile("prod");
+    let ssh = FakeForwardSshClient::with_open_delay(Duration::from_secs(2));
+    let socks_port = allocate_port();
+
+    forward::run(
+        harness.app(),
+        &AcceptPrompt,
+        &ForwardArgs {
+            command: ForwardCommand::Add(ForwardAddArgs {
+                profile: "prod".into(),
+                name: "proxy".into(),
+                local: None,
+                socks: Some(format!("127.0.0.1:{socks_port}")),
+                description: None,
+            }),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    run_forward_until(
+        harness.app(),
+        ssh.clone(),
+        ForwardRunArgs {
+            profile: "prod".into(),
+            name: Some("proxy".into()),
+            all: false,
+        },
+        async move {
+            wait_for_port(socks_port).await;
+
+            let first = tokio::spawn(async move {
+                let mut client = TcpStream::connect(("127.0.0.1", socks_port))
+                    .await
+                    .expect("first SOCKS client should connect");
+                socks5_greet(&mut client).await;
+                socks5_connect_domain(&mut client, "db.internal", 5432).await;
+            });
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let mut second = TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("second SOCKS client should connect");
+            tokio::time::timeout(Duration::from_millis(500), socks5_greet(&mut second))
+                .await
+                .expect("second SOCKS greeting should not wait on the first tunnel setup");
+
+            first.await.expect("first SOCKS client task should finish");
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn forward_run_fails_startup_without_leaving_partial_listeners() {
     let harness = TestHarness::with_profile("prod");
     let first_port = allocate_port();
@@ -786,6 +897,7 @@ struct FakeForwardState {
     open_count: AtomicUsize,
     alive_polls_remaining: AtomicUsize,
     open_failures_remaining: AtomicUsize,
+    open_delay: Option<Duration>,
     last_target: std::sync::Mutex<Option<(String, u16)>>,
 }
 
@@ -802,12 +914,25 @@ impl FakeForwardSshClient {
         Self::with_session_behavior(usize::MAX, open_failures)
     }
 
+    fn with_open_delay(open_delay: Duration) -> Self {
+        Self::with_session_behavior_and_delay(usize::MAX, 0, Some(open_delay))
+    }
+
     fn with_session_behavior(alive_polls: usize, open_failures: usize) -> Self {
+        Self::with_session_behavior_and_delay(alive_polls, open_failures, None)
+    }
+
+    fn with_session_behavior_and_delay(
+        alive_polls: usize,
+        open_failures: usize,
+        open_delay: Option<Duration>,
+    ) -> Self {
         Self {
             state: Arc::new(FakeForwardState {
                 open_count: AtomicUsize::new(0),
                 alive_polls_remaining: AtomicUsize::new(alive_polls),
                 open_failures_remaining: AtomicUsize::new(open_failures),
+                open_delay,
                 last_target: std::sync::Mutex::new(None),
             }),
         }
@@ -902,6 +1027,7 @@ impl SshSession for FakeForwardSession {
     > {
         self.state.open_count.fetch_add(1, Ordering::SeqCst);
         *self.state.last_target.lock().unwrap() = Some((target_host.to_string(), target_port));
+        let open_delay = self.state.open_delay;
         let should_fail = self
             .state
             .open_failures_remaining
@@ -918,6 +1044,9 @@ impl SshSession for FakeForwardSession {
                 return Err(connect::error::Error::new(
                     "synthetic direct-tcpip open failure",
                 ));
+            }
+            if let Some(open_delay) = open_delay {
+                tokio::time::sleep(open_delay).await;
             }
             let (client, mut remote) = duplex(1024);
             tokio::spawn(async move {

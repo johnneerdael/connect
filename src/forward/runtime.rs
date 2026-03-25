@@ -11,6 +11,7 @@ use tokio::{
     io::copy_bidirectional,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     task::JoinSet,
     time::{self, MissedTickBehavior},
 };
@@ -48,6 +49,20 @@ struct OpenTunnelRequest<'a> {
     origin_host: &'a str,
     origin_port: u16,
     send_socks_success: bool,
+}
+
+struct PendingSocksTunnel {
+    local_stream: TcpStream,
+    target_host: String,
+    target_port: u16,
+    origin_host: String,
+    origin_port: u16,
+}
+
+struct AcceptedConnection {
+    local_stream: TcpStream,
+    origin_host: String,
+    origin_port: u16,
 }
 
 pub async fn run_saved_forwards<F>(
@@ -166,6 +181,21 @@ async fn run_listener(
         ForwardKind::Socks => ForwardRoute::Socks,
     };
     let mut proxy_tasks = JoinSet::new();
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<AcceptedConnection>();
+    let (prepared_socks_tx, mut prepared_socks_rx) =
+        mpsc::unbounded_channel::<PendingSocksTunnel>();
+    let mut accept_tasks = JoinSet::new();
+    match route {
+        ForwardRoute::Local { .. } => {
+            accept_tasks.spawn(accept_connections(bound_forward.listener, accepted_tx));
+        }
+        ForwardRoute::Socks => {
+            accept_tasks.spawn(accept_socks_connections(
+                bound_forward.listener,
+                prepared_socks_tx,
+            ));
+        }
+    }
     let mut health_check = time::interval(Duration::from_millis(200));
     health_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -194,10 +224,26 @@ async fn run_listener(
                     )));
                 }
             }
-            accepted = bound_forward.listener.accept() => {
-                let (local_stream, peer_addr) = accepted?;
-                let origin_host = peer_addr.ip().to_string();
-                let origin_port = peer_addr.port();
+            joined = accept_tasks.join_next(), if !accept_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => {
+                        return Err(Error::new(format!(
+                            "forward accept task for '{forward_name}' failed: {error}"
+                        )));
+                    }
+                    None => {}
+                }
+            }
+            accepted = accepted_rx.recv(), if matches!(route, ForwardRoute::Local { .. }) => {
+                let Some(AcceptedConnection {
+                    local_stream,
+                    origin_host,
+                    origin_port,
+                }) = accepted else {
+                    break;
+                };
                 match route {
                     ForwardRoute::Local {
                         ref target_host,
@@ -218,26 +264,93 @@ async fn run_listener(
                         )
                         .await?;
                     }
-                    ForwardRoute::Socks => {
-                        handle_socks_connection(
-                            &mut session,
-                            &forward_name,
-                            local_stream,
-                            &origin_host,
-                            origin_port,
-                            &mut proxy_tasks,
-                        )
-                        .await?;
-                    }
+                    ForwardRoute::Socks => unreachable!("socks listeners use the prepared tunnel queue"),
                 }
+            }
+            prepared = prepared_socks_rx.recv(), if matches!(route, ForwardRoute::Socks) => {
+                let Some(pending) = prepared else {
+                    break;
+                };
+                open_tunnel_or_continue(
+                    &mut session,
+                    pending.local_stream,
+                    OpenTunnelRequest {
+                        forward_name: &forward_name,
+                        target_host: &pending.target_host,
+                        target_port: pending.target_port,
+                        origin_host: &pending.origin_host,
+                        origin_port: pending.origin_port,
+                        send_socks_success: true,
+                    },
+                    &mut proxy_tasks,
+                )
+                .await?;
             }
         }
     }
 
+    accept_tasks.abort_all();
+    while accept_tasks.join_next().await.is_some() {}
     proxy_tasks.abort_all();
     while proxy_tasks.join_next().await.is_some() {}
     let _ = session.disconnect().await;
     Ok(())
+}
+
+async fn accept_connections(
+    listener: TcpListener,
+    accepted_tx: mpsc::UnboundedSender<AcceptedConnection>,
+) -> Result<()> {
+    loop {
+        let (local_stream, peer_addr) = listener.accept().await?;
+        if accepted_tx
+            .send(AcceptedConnection {
+                local_stream,
+                origin_host: peer_addr.ip().to_string(),
+                origin_port: peer_addr.port(),
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
+}
+
+async fn accept_socks_connections(
+    listener: TcpListener,
+    prepared_tx: mpsc::UnboundedSender<PendingSocksTunnel>,
+) -> Result<()> {
+    let mut handshakes: JoinSet<Result<Option<PendingSocksTunnel>>> = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            joined = handshakes.join_next(), if !handshakes.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(Some(pending)))) => {
+                        if prepared_tx.send(pending).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Some(Ok(Ok(None))) => {}
+                    Some(Ok(Err(_))) => {}
+                    Some(Err(error)) => {
+                        return Err(Error::new(format!(
+                            "socks handshake task failed: {error}"
+                        )));
+                    }
+                    None => {}
+                }
+            }
+            accepted = listener.accept() => {
+                let (local_stream, peer_addr) = accepted?;
+                handshakes.spawn(handle_socks_connection(
+                    local_stream,
+                    peer_addr.ip().to_string(),
+                    peer_addr.port(),
+                ));
+            }
+        }
+    }
 }
 
 async fn proxy_connection(
@@ -249,52 +362,40 @@ async fn proxy_connection(
 }
 
 async fn handle_socks_connection(
-    session: &mut Box<dyn crate::ssh::SshSession + Send + 'static>,
-    forward_name: &str,
     mut local_stream: TcpStream,
-    origin_host: &str,
+    origin_host: String,
     origin_port: u16,
-    proxy_tasks: &mut JoinSet<Result<()>>,
-) -> Result<()> {
+) -> Result<Option<PendingSocksTunnel>> {
     let handshake_accepted = match perform_socks_handshake(&mut local_stream).await {
         Ok(accepted) => accepted,
         Err(_) => {
             let _ = local_stream.shutdown().await;
-            return Ok(());
+            return Ok(None);
         }
     };
     if !handshake_accepted {
-        return Ok(());
+        return Ok(None);
     }
 
     let request = match read_socks_request(&mut local_stream).await {
         Ok(request) => request,
         Err(_) => {
             let _ = local_stream.shutdown().await;
-            return Ok(());
+            return Ok(None);
         }
     };
 
     match request.command {
-        SocksCommand::Connect => {
-            open_tunnel_or_continue(
-                session,
-                local_stream,
-                OpenTunnelRequest {
-                    forward_name,
-                    target_host: &request.target_host,
-                    target_port: request.target_port,
-                    origin_host,
-                    origin_port,
-                    send_socks_success: true,
-                },
-                proxy_tasks,
-            )
-            .await
-        }
+        SocksCommand::Connect => Ok(Some(PendingSocksTunnel {
+            local_stream,
+            target_host: request.target_host,
+            target_port: request.target_port,
+            origin_host,
+            origin_port,
+        })),
         SocksCommand::Unsupported => {
-            write_socks_reply(&mut local_stream, SocksReply::CommandNotSupported).await?;
-            Ok(())
+            let _ = write_socks_reply(&mut local_stream, SocksReply::CommandNotSupported).await;
+            Ok(None)
         }
     }
 }
@@ -315,8 +416,12 @@ async fn open_tunnel_or_continue(
         .await
     {
         Ok(remote_stream) => {
-            if request.send_socks_success {
-                write_socks_reply(&mut local_stream, SocksReply::Succeeded).await?;
+            if request.send_socks_success
+                && write_socks_reply(&mut local_stream, SocksReply::Succeeded)
+                    .await
+                    .is_err()
+            {
+                return Ok(());
             }
             proxy_tasks.spawn(proxy_connection(local_stream, remote_stream));
             Ok(())
