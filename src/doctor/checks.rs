@@ -155,6 +155,18 @@ pub async fn collect_profile_checks(
     ssh_client: &dyn SshClient,
 ) -> LocalDoctorReport {
     let mut report = collect_local_checks(env);
+    report
+        .checks
+        .extend(collect_profile_specific_checks(app, profile_name, ssh_client).await.checks);
+    report
+}
+
+pub async fn collect_profile_specific_checks(
+    app: &crate::app::App,
+    profile_name: &str,
+    ssh_client: &dyn SshClient,
+) -> LocalDoctorReport {
+    let mut report = LocalDoctorReport { checks: Vec::new() };
     let profile = match app.get_profile(profile_name) {
         Ok(profile) => profile,
         Err(error) => {
@@ -255,6 +267,7 @@ pub async fn collect_profile_checks(
     let observed = match session.observe_host_key().await {
         Ok(observed) => observed,
         Err(error) => {
+            disconnect_session(&mut *session).await;
             report.checks.push(LocalDoctorCheckResult {
                 name: "host key verification".into(),
                 status: LocalDoctorCheckStatus::Fail,
@@ -280,6 +293,7 @@ pub async fn collect_profile_checks(
             });
         }
         Err(error) => {
+            disconnect_session(&mut *session).await;
             report.checks.push(LocalDoctorCheckResult {
                 name: "host key verification".into(),
                 status: LocalDoctorCheckStatus::Fail,
@@ -308,6 +322,8 @@ pub async fn collect_profile_checks(
             detail: error.to_string(),
         }),
     }
+
+    disconnect_session(&mut *session).await;
 
     report
 }
@@ -418,6 +434,10 @@ fn saved_host_key_check(
             detail: error.to_string(),
         },
     }
+}
+
+async fn disconnect_session(session: &mut dyn crate::ssh::SshSession) {
+    let _ = session.disconnect().await;
 }
 
 async fn resolve_profile_host(profile: &crate::store::Profile) -> Result<Vec<SocketAddr>> {

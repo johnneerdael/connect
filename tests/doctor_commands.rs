@@ -240,6 +240,25 @@ fn doctor_command_routes_through_binary_for_failure() {
 }
 
 #[test]
+fn doctor_command_routes_profile_through_binary_even_when_app_load_fails() {
+    let root = TempRoot::new("connect-doctor-profile-router");
+    let blocked_root = root.path.join("blocked-root");
+    fs::write(&blocked_root, "nope").expect("blocked root file should be writable");
+
+    connect_test_bin()
+        .env("CONNECT_APP_ROOT", &blocked_root)
+        .args(["doctor", "prod"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains(
+            "FAIL database open/read/write sanity",
+        ))
+        .stdout(predicates::str::contains(
+            "FAIL profile app initialization",
+        ));
+}
+
+#[test]
 fn doctor_command_parses_an_optional_profile_argument() {
     let parsed = Cli::try_parse_from(["connect", "doctor", "prod"]).expect("CLI should parse");
 
