@@ -61,7 +61,7 @@ pub async fn open_profile(
 ) -> Result<()> {
     let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
     let exit_status = session.open_shell().await?;
-    disconnect_session_best_effort(session);
+    drop(session);
     if exit_status == 0 {
         Ok(())
     } else {
@@ -78,19 +78,12 @@ pub async fn exec_profile(
 ) -> Result<()> {
     let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
     let exit_status = session.execute_command(spec).await?;
-    disconnect_session_best_effort(session);
+    drop(session);
     if exit_status == 0 {
         Ok(())
     } else {
         Err(Error::RemoteExitStatus(exit_status))
     }
-}
-
-fn disconnect_session_best_effort(session: Box<dyn SshSession + Send + 'static>) {
-    tokio::spawn(async move {
-        let mut session = session;
-        let _ = session.disconnect().await;
-    });
 }
 
 pub(crate) async fn connect_authenticated_session(
@@ -254,5 +247,206 @@ fn shell_quote(value: &str) -> String {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, pin::Pin, sync::mpsc, thread, time::Duration};
+
+    use crate::{
+        ssh::ObservedHostKey,
+        store::{AuthMode, HostKeyRecord, Profile},
+        terminal::prompt::Prompt,
+    };
+
+    use super::*;
+
+    #[test]
+    fn open_profile_allows_runtime_to_shutdown_after_remote_exit() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            let ssh = TestSshClient::with_pending_disconnect();
+            let profile = test_profile();
+            let context = TestConnectionContext;
+            let prompt = AcceptPrompt;
+
+            let result = runtime.block_on(open_profile(&ssh, &profile, &context, &prompt));
+            tx.send(result).expect("result should be sent");
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("open_profile should not block runtime shutdown");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn exec_profile_allows_runtime_to_shutdown_after_remote_exit() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            let ssh = TestSshClient::with_pending_disconnect();
+            let profile = test_profile();
+            let context = TestConnectionContext;
+            let prompt = AcceptPrompt;
+            let spec = ExecSpec::new(vec!["true".into()], false);
+
+            let result = runtime.block_on(exec_profile(&ssh, &spec, &profile, &context, &prompt));
+            tx.send(result).expect("result should be sent");
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("exec_profile should not block runtime shutdown");
+        assert!(result.is_ok());
+    }
+
+    fn test_profile() -> Profile {
+        Profile {
+            name: "prod".into(),
+            host: "prod.example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_mode: AuthMode::PasswordOnly,
+            has_password: true,
+            has_private_key: false,
+            has_key_passphrase: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    struct TestConnectionContext;
+
+    impl SshConnectionContext for TestConnectionContext {
+        fn load_profile_auth(&self, _profile: &Profile) -> Result<ProfileAuth> {
+            Ok(ProfileAuth {
+                auth_mode: AuthMode::PasswordOnly,
+                password: Some("secret".into()),
+                private_key: None,
+                key_passphrase: None,
+            })
+        }
+
+        fn load_host_key(&self, _profile: &Profile) -> Result<Option<HostKeyRecord>> {
+            Ok(None)
+        }
+
+        fn save_host_key(&self, _observed: &ObservedHostKey) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct AcceptPrompt;
+
+    impl Prompt for AcceptPrompt {
+        fn prompt(&self, _key: &str, _message: &str, _default: Option<&str>) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn prompt_secret(&self, _key: &str, _message: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn confirm(&self, _key: &str, _message: &str, _default: bool) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestSshClient {
+        pending_disconnect: bool,
+    }
+
+    impl TestSshClient {
+        fn with_pending_disconnect() -> Self {
+            Self {
+                pending_disconnect: true,
+            }
+        }
+    }
+
+    impl SshClient for TestSshClient {
+        fn connect<'a>(
+            &'a self,
+            profile: &'a Profile,
+            _expected_host_key: Option<&'a HostKeyRecord>,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn SshSession + Send + 'static>>> + Send + 'a>>
+        {
+            let profile = profile.clone();
+            let pending_disconnect = self.pending_disconnect;
+            Box::pin(async move {
+                Ok(Box::new(TestSession {
+                    observed: ObservedHostKey {
+                        host: profile.host.clone(),
+                        port: profile.port,
+                        algorithm: "ssh-ed25519".into(),
+                        fingerprint: "fp-123".into(),
+                        public_key: "pub-123".into(),
+                    },
+                    pending_disconnect,
+                }) as Box<dyn SshSession + Send>)
+            })
+        }
+    }
+
+    struct TestSession {
+        observed: ObservedHostKey,
+        pending_disconnect: bool,
+    }
+
+    impl SshSession for TestSession {
+        fn observe_host_key<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<ObservedHostKey>> + Send + 'a>> {
+            let observed = self.observed.clone();
+            Box::pin(async move { Ok(observed) })
+        }
+
+        fn authenticate_public_key<'a>(
+            &'a mut self,
+            _username: &'a str,
+            _private_key: &'a str,
+            _passphrase: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn authenticate_password<'a>(
+            &'a mut self,
+            _username: &'a str,
+            _password: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+            Box::pin(async move { Ok(true) })
+        }
+
+        fn open_shell<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn execute_command<'a>(
+            &'a mut self,
+            _spec: &'a ExecSpec,
+        ) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn disconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            let pending_disconnect = self.pending_disconnect;
+            Box::pin(async move {
+                if pending_disconnect {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
     }
 }

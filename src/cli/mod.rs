@@ -14,6 +14,7 @@ pub mod commands {
     pub mod version;
 }
 
+mod runtime;
 pub mod types;
 
 pub use types::{
