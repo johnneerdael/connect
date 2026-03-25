@@ -22,7 +22,7 @@ use connect::{
         },
     },
     error::Error,
-    secrets::MemorySecretStore,
+    secrets::{MemorySecretStore, SecretStore},
     ssh::{ObservedHostKey, SshClient, SshSession},
     store::{AuthMode, ProfileInput},
 };
@@ -276,6 +276,145 @@ async fn doctor_profile_reports_missing_profile_as_a_failed_check() {
 }
 
 #[tokio::test]
+async fn doctor_profile_reports_saved_host_key_presence_even_when_secret_lookup_fails() {
+    let harness = DoctorProfileHarness::with_secret_store(
+        "connect-doctor-profile-hostkey-present",
+        Arc::new(FailingSecretStore),
+    );
+    harness
+        .app
+        .save_profile(ProfileInput::new("prod", "127.0.0.1", "deploy").with_port(harness.port))
+        .unwrap();
+    harness
+        .app
+        .save_host_key(
+            "127.0.0.1",
+            harness.port,
+            "ssh-ed25519",
+            "fp-present",
+            "public-key-fp-present",
+        )
+        .unwrap();
+
+    let env = FakeDoctorEnvironment {
+        app_path_resolution: Ok(()),
+        database_sanity: Ok(()),
+        secret_backend: Ok(()),
+        ssh_agent_available: true,
+    };
+    let report = collect_profile_checks(
+        &env,
+        &harness.app,
+        "prod",
+        &FakeDoctorSshClient::matched("127.0.0.1", harness.port),
+    )
+    .await;
+
+    assert!(check_status(&report, "saved host key") == Some(LocalDoctorCheckStatus::Pass));
+    assert!(check_detail(&report, "saved host key").unwrap().contains("present"));
+    assert!(check_status(&report, "auth mode vs stored secrets") == Some(LocalDoctorCheckStatus::Fail));
+}
+
+#[tokio::test]
+async fn doctor_profile_reports_saved_host_key_absence_even_when_secret_lookup_fails() {
+    let harness = DoctorProfileHarness::with_secret_store(
+        "connect-doctor-profile-hostkey-absent",
+        Arc::new(FailingSecretStore),
+    );
+    harness
+        .app
+        .save_profile(ProfileInput::new("prod", "127.0.0.1", "deploy").with_port(harness.port))
+        .unwrap();
+
+    let env = FakeDoctorEnvironment {
+        app_path_resolution: Ok(()),
+        database_sanity: Ok(()),
+        secret_backend: Ok(()),
+        ssh_agent_available: true,
+    };
+    let report = collect_profile_checks(
+        &env,
+        &harness.app,
+        "prod",
+        &FakeDoctorSshClient::matched("127.0.0.1", harness.port),
+    )
+    .await;
+
+    assert!(check_status(&report, "saved host key") == Some(LocalDoctorCheckStatus::Pass));
+    assert_eq!(check_detail(&report, "saved host key").as_deref(), Some("absent"));
+}
+
+#[tokio::test]
+async fn doctor_profile_requires_password_for_password_only_auth_even_with_private_key_material() {
+    let harness = DoctorProfileHarness::new("connect-doctor-profile-password-only");
+    harness
+        .app
+        .save_profile_with_secrets(
+            ProfileInput::new("prod", "127.0.0.1", "deploy")
+                .with_port(harness.port)
+                .with_auth_mode(AuthMode::PasswordOnly),
+            ProfileSecretsInput {
+                private_key: Some("private-key".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let env = FakeDoctorEnvironment {
+        app_path_resolution: Ok(()),
+        database_sanity: Ok(()),
+        secret_backend: Ok(()),
+        ssh_agent_available: true,
+    };
+    let report = collect_profile_checks(
+        &env,
+        &harness.app,
+        "prod",
+        &FakeDoctorSshClient::matched("127.0.0.1", harness.port),
+    )
+    .await;
+
+    let auth_check = check_result(&report, "auth mode vs stored secrets").unwrap();
+    assert_eq!(auth_check.status, LocalDoctorCheckStatus::Fail);
+    assert!(auth_check.detail.contains("password-only profiles require a stored password"));
+}
+
+#[tokio::test]
+async fn doctor_profile_accepts_private_key_material_for_stored_only_auth() {
+    let harness = DoctorProfileHarness::new("connect-doctor-profile-stored-only");
+    harness
+        .app
+        .save_profile_with_secrets(
+            ProfileInput::new("prod", "127.0.0.1", "deploy")
+                .with_port(harness.port)
+                .with_auth_mode(AuthMode::StoredOnly),
+            ProfileSecretsInput {
+                private_key: Some("private-key".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let env = FakeDoctorEnvironment {
+        app_path_resolution: Ok(()),
+        database_sanity: Ok(()),
+        secret_backend: Ok(()),
+        ssh_agent_available: true,
+    };
+    let report = collect_profile_checks(
+        &env,
+        &harness.app,
+        "prod",
+        &FakeDoctorSshClient::matched("127.0.0.1", harness.port),
+    )
+    .await;
+
+    let auth_check = check_result(&report, "auth mode vs stored secrets").unwrap();
+    assert_eq!(auth_check.status, LocalDoctorCheckStatus::Pass);
+    assert!(auth_check.detail.contains("stored-only has a stored private key"));
+}
+
+#[tokio::test]
 async fn doctor_profile_reports_successful_live_checks_for_a_valid_profile() {
     let harness = DoctorProfileHarness::new("connect-doctor-profile-success");
     let env = FakeDoctorEnvironment {
@@ -425,11 +564,14 @@ struct DoctorProfileHarness {
 
 impl DoctorProfileHarness {
     fn new(prefix: &str) -> Self {
+        Self::with_secret_store(prefix, Arc::new(MemorySecretStore::default()))
+    }
+
+    fn with_secret_store(prefix: &str, secrets: Arc<dyn SecretStore>) -> Self {
         let root = TempRoot::new(prefix);
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
         let port = listener.local_addr().expect("listener addr should resolve").port();
-        let app = App::new(AppPaths::from_root(&root.path), Arc::new(MemorySecretStore::default()))
-            .expect("app should initialize");
+        let app = App::new(AppPaths::from_root(&root.path), secrets).expect("app should initialize");
         Self {
             _root: root,
             _listener: listener,
@@ -437,6 +579,58 @@ impl DoctorProfileHarness {
             port,
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct FailingSecretStore;
+
+impl SecretStore for FailingSecretStore {
+    fn set_password(&self, _profile_name: &str, _password: &str) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_password(&self, _profile_name: &str) -> connect::error::Result<Option<String>> {
+        Err(Error::new("password lookup failed"))
+    }
+
+    fn set_private_key(&self, _profile_name: &str, _pem: &str) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_private_key(&self, _profile_name: &str) -> connect::error::Result<Option<String>> {
+        Err(Error::new("private key lookup failed"))
+    }
+
+    fn set_key_passphrase(
+        &self,
+        _profile_name: &str,
+        _passphrase: &str,
+    ) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_key_passphrase(&self, _profile_name: &str) -> connect::error::Result<Option<String>> {
+        Err(Error::new("key passphrase lookup failed"))
+    }
+
+    fn delete_profile_secrets(&self, _profile_name: &str) -> connect::error::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_result<'a>(
+    report: &'a LocalDoctorReport,
+    name: &str,
+) -> Option<&'a LocalDoctorCheckResult> {
+    report.checks.iter().find(|check| check.name == name)
+}
+
+fn check_status(report: &LocalDoctorReport, name: &str) -> Option<LocalDoctorCheckStatus> {
+    check_result(report, name).map(|check| check.status)
+}
+
+fn check_detail(report: &LocalDoctorReport, name: &str) -> Option<String> {
+    check_result(report, name).map(|check| check.detail.clone())
 }
 
 #[derive(Clone)]

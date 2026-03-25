@@ -176,24 +176,11 @@ pub async fn collect_profile_checks(
         ),
     });
 
-    let auth = match <crate::app::App as SshConnectionContext>::load_profile_auth(app, &profile) {
-        Ok(auth) => auth,
-        Err(error) => {
-            report.checks.push(LocalDoctorCheckResult {
-                name: "stored secrets consistency".into(),
-                status: LocalDoctorCheckStatus::Fail,
-                detail: error.to_string(),
-            });
-            return report;
-        }
-    };
+    report.checks.push(saved_host_key_check(app, &profile));
 
-    report
-        .checks
-        .push(secret_consistency_check(&profile, &auth));
-    report
-        .checks
-        .push(saved_host_key_check(app, &profile));
+    let auth_result = <crate::app::App as SshConnectionContext>::load_profile_auth(app, &profile);
+    let auth_check = auth_mode_consistency_check(&profile, auth_result.as_ref());
+    report.checks.push(auth_check);
 
     let resolved = match resolve_profile_host(&profile).await {
         Ok(resolved) => {
@@ -246,7 +233,7 @@ pub async fn collect_profile_checks(
         }
     };
 
-    let mut session = match ssh_client.connect(&profile, None).await {
+    let mut session = match ssh_client.connect(&profile, stored_host_key.as_ref()).await {
         Ok(session) => {
             report.checks.push(LocalDoctorCheckResult {
                 name: "SSH handshake".into(),
@@ -302,12 +289,19 @@ pub async fn collect_profile_checks(
         }
     }
 
-    match authenticate_session(&mut *session, &profile, &auth).await {
-        Ok(()) => report.checks.push(LocalDoctorCheckResult {
-            name: "SSH auth usability".into(),
-            status: LocalDoctorCheckStatus::Pass,
-            detail: format!("usable under {}", profile.auth_mode),
-        }),
+    match auth_result {
+        Ok(auth) => match authenticate_session(&mut *session, &profile, &auth).await {
+            Ok(()) => report.checks.push(LocalDoctorCheckResult {
+                name: "SSH auth usability".into(),
+                status: LocalDoctorCheckStatus::Pass,
+                detail: format!("usable under {}", profile.auth_mode),
+            }),
+            Err(error) => report.checks.push(LocalDoctorCheckResult {
+                name: "SSH auth usability".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            }),
+        },
         Err(error) => report.checks.push(LocalDoctorCheckResult {
             name: "SSH auth usability".into(),
             status: LocalDoctorCheckStatus::Fail,
@@ -318,44 +312,84 @@ pub async fn collect_profile_checks(
     report
 }
 
-fn secret_consistency_check(
+fn auth_mode_consistency_check(
     profile: &crate::store::Profile,
-    auth: &crate::ssh::ProfileAuth,
+    auth_result: std::result::Result<&crate::ssh::ProfileAuth, &Error>,
 ) -> LocalDoctorCheckResult {
-    let mismatches = [
-        (
-            "password",
-            profile.has_password,
-            auth.password.is_some(),
-        ),
-        (
-            "private key",
-            profile.has_private_key,
-            auth.private_key.is_some(),
-        ),
-        (
-            "key passphrase",
-            profile.has_key_passphrase,
-            auth.key_passphrase.is_some(),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(label, flag, actual)| {
-        (flag != actual).then_some(format!("{label} flag={flag} secret={actual}"))
-    })
-    .collect::<Vec<_>>();
-
-    if mismatches.is_empty() {
-        LocalDoctorCheckResult {
-            name: "stored secrets consistency".into(),
-            status: LocalDoctorCheckStatus::Pass,
-            detail: format!("consistent for {}", profile.auth_mode),
-        }
-    } else {
-        LocalDoctorCheckResult {
-            name: "stored secrets consistency".into(),
+    match auth_result {
+        Err(error) => LocalDoctorCheckResult {
+            name: "auth mode vs stored secrets".into(),
             status: LocalDoctorCheckStatus::Fail,
-            detail: mismatches.join(", "),
+            detail: error.to_string(),
+        },
+        Ok(auth) => {
+            let has_password = auth.password.is_some();
+            let has_private_key = auth.private_key.is_some();
+            let has_key_passphrase = auth.key_passphrase.is_some();
+            let has_stored_material = has_password || has_private_key;
+
+            match profile.auth_mode {
+                crate::store::AuthMode::AgentOnly => LocalDoctorCheckResult {
+                    name: "auth mode vs stored secrets".into(),
+                    status: LocalDoctorCheckStatus::Pass,
+                    detail: if has_stored_material || has_key_passphrase {
+                        "agent-only ignores stored secrets".into()
+                    } else {
+                        "agent-only requires only SSH agent availability".into()
+                    },
+                },
+                crate::store::AuthMode::PasswordOnly => {
+                    if has_password {
+                        LocalDoctorCheckResult {
+                            name: "auth mode vs stored secrets".into(),
+                            status: LocalDoctorCheckStatus::Pass,
+                            detail: if has_private_key {
+                                "password-only uses the stored password; private key material is ignored"
+                                    .into()
+                            } else {
+                                "password-only has a stored password".into()
+                            },
+                        }
+                    } else {
+                        LocalDoctorCheckResult {
+                            name: "auth mode vs stored secrets".into(),
+                            status: LocalDoctorCheckStatus::Fail,
+                            detail: "password-only profiles require a stored password".into(),
+                        }
+                    }
+                }
+                crate::store::AuthMode::StoredOnly => {
+                    if has_stored_material {
+                        LocalDoctorCheckResult {
+                            name: "auth mode vs stored secrets".into(),
+                            status: LocalDoctorCheckStatus::Pass,
+                            detail: if has_password && has_private_key {
+                                "stored-only has both password and private key material".into()
+                            } else if has_password {
+                                "stored-only has a stored password".into()
+                            } else {
+                                "stored-only has a stored private key".into()
+                            },
+                        }
+                    } else {
+                        LocalDoctorCheckResult {
+                            name: "auth mode vs stored secrets".into(),
+                            status: LocalDoctorCheckStatus::Fail,
+                            detail: "stored-only profiles require stored password or private key material"
+                                .into(),
+                        }
+                    }
+                }
+                crate::store::AuthMode::Auto => LocalDoctorCheckResult {
+                    name: "auth mode vs stored secrets".into(),
+                    status: LocalDoctorCheckStatus::Pass,
+                    detail: if has_stored_material {
+                        "auto can use stored password or private key material".into()
+                    } else {
+                        "auto can fall back to SSH agent when no stored material is present".into()
+                    },
+                },
+            }
         }
     }
 }
