@@ -176,21 +176,24 @@ async fn run_listener(
                 let (local_stream, peer_addr) = accepted?;
                 let origin_host = peer_addr.ip().to_string();
                 let origin_port = peer_addr.port();
-                let remote_stream = session
+                match session
                     .open_direct_tcpip(&target_host, target_port, &origin_host, origin_port)
                     .await
-                    .map_err(|error| {
-                        if session.is_alive() {
-                            Error::new(format!(
-                                "failed to open SSH tunnel for forward '{forward_name}' to {target_host}:{target_port}: {error}"
-                            ))
-                        } else {
-                            Error::new(format!(
+                {
+                    Ok(remote_stream) => {
+                        proxy_tasks.spawn(proxy_connection(local_stream, remote_stream));
+                    }
+                    Err(error) => {
+                        if !session.is_alive() {
+                            return Err(Error::new(format!(
                                 "ssh session for forward '{forward_name}' disconnected"
-                            ))
+                            )));
                         }
-                    })?;
-                proxy_tasks.spawn(proxy_connection(local_stream, remote_stream));
+
+                        drop(local_stream);
+                        let _ = error;
+                    }
+                }
             }
         }
     }

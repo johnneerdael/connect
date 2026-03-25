@@ -479,6 +479,54 @@ async fn forward_run_returns_a_useful_error_when_the_ssh_session_dies() {
     );
 }
 
+#[tokio::test]
+async fn forward_run_keeps_listening_after_a_single_direct_tcpip_open_failure() {
+    let harness = TestHarness::with_profile("prod");
+    let port = allocate_port();
+    let ssh = FakeForwardSshClient::with_open_failures(1);
+
+    forward::run(
+        harness.app(),
+        &AcceptPrompt,
+        &ForwardArgs {
+            command: ForwardCommand::Add(ForwardAddArgs {
+                profile: "prod".into(),
+                name: "db".into(),
+                local: Some(format!("127.0.0.1:{port}:db.internal:5432")),
+                socks: None,
+                description: None,
+            }),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    run_forward_until(
+        harness.app(),
+        ssh.clone(),
+        ForwardRunArgs {
+            profile: "prod".into(),
+            name: Some("db".into()),
+            all: false,
+        },
+        async move {
+            wait_for_port(port).await;
+
+            let _ = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("first local connection should reach the listener");
+            wait_for_open_count(&ssh, 1).await;
+
+            let _ = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("listener should stay available after a failed direct-tcpip open");
+            wait_for_open_count(&ssh, 2).await;
+        },
+    )
+    .await
+    .unwrap();
+}
+
 async fn run_forward_until<F>(
     app: &App,
     ssh: FakeForwardSshClient,
@@ -518,6 +566,17 @@ async fn wait_for_port(port: u16) {
     }
 
     panic!("port {port} did not start listening in time");
+}
+
+async fn wait_for_open_count(ssh: &FakeForwardSshClient, expected: usize) {
+    for _ in 0..80 {
+        if ssh.open_count() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("open count did not reach {expected} in time");
 }
 
 #[derive(Default)]
@@ -582,19 +641,29 @@ struct FakeForwardSshClient {
 struct FakeForwardState {
     open_count: AtomicUsize,
     alive_polls_remaining: AtomicUsize,
+    open_failures_remaining: AtomicUsize,
     last_target: std::sync::Mutex<Option<(String, u16)>>,
 }
 
 impl FakeForwardSshClient {
     fn always_alive() -> Self {
-        Self::with_session_lifecycle(usize::MAX)
+        Self::with_session_behavior(usize::MAX, 0)
     }
 
     fn with_session_lifecycle(alive_polls: usize) -> Self {
+        Self::with_session_behavior(alive_polls, 0)
+    }
+
+    fn with_open_failures(open_failures: usize) -> Self {
+        Self::with_session_behavior(usize::MAX, open_failures)
+    }
+
+    fn with_session_behavior(alive_polls: usize, open_failures: usize) -> Self {
         Self {
             state: Arc::new(FakeForwardState {
                 open_count: AtomicUsize::new(0),
                 alive_polls_remaining: AtomicUsize::new(alive_polls),
+                open_failures_remaining: AtomicUsize::new(open_failures),
                 last_target: std::sync::Mutex::new(None),
             }),
         }
@@ -689,7 +758,23 @@ impl SshSession for FakeForwardSession {
     > {
         self.state.open_count.fetch_add(1, Ordering::SeqCst);
         *self.state.last_target.lock().unwrap() = Some((target_host.to_string(), target_port));
+        let should_fail = self
+            .state
+            .open_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok();
         Box::pin(async move {
+            if should_fail {
+                return Err(connect::error::Error::new(
+                    "synthetic direct-tcpip open failure",
+                ));
+            }
             let (client, mut remote) = duplex(1024);
             tokio::spawn(async move {
                 let _ = remote.shutdown().await;
