@@ -19,6 +19,16 @@ fn root_help_lists_core_commands() {
 }
 
 #[test]
+fn root_help_lists_doctor_and_forward_commands() {
+    let mut cmd = connect_test_bin();
+    cmd.arg("--help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("doctor"))
+        .stdout(predicates::str::contains("forward"));
+}
+
+#[test]
 fn version_command_prints_binary_version() {
     let mut cmd = connect_test_bin();
     cmd.arg("version")
@@ -56,6 +66,27 @@ fn completion_command_accepts_shell_argument() {
 }
 
 #[test]
+fn doctor_help_lists_optional_profile_argument() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("PROFILE"));
+}
+
+#[test]
+fn forward_help_lists_subcommands() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["forward", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("add"))
+        .stdout(predicates::str::contains("list"))
+        .stdout(predicates::str::contains("remove"))
+        .stdout(predicates::str::contains("run"));
+}
+
+#[test]
 fn add_help_lists_secure_secret_input_flags() {
     let mut cmd = connect_test_bin();
     cmd.args(["add", "--help"])
@@ -74,6 +105,16 @@ fn open_help_lists_profile_argument() {
         .assert()
         .success()
         .stdout(predicates::str::contains("PROFILE"));
+}
+
+#[test]
+fn copy_help_lists_resume_and_progress_flags() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["copy", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--resume"))
+        .stdout(predicates::str::contains("--progress"));
 }
 
 #[test]

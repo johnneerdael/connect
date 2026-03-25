@@ -107,3 +107,48 @@ pub struct HostKeyRecord {
     pub public_key: String,
     pub accepted_at: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardKind {
+    Local,
+    Socks,
+}
+
+impl ForwardKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Socks => "socks",
+        }
+    }
+}
+
+impl fmt::Display for ForwardKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ForwardKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "local" => Ok(Self::Local),
+            "socks" | "socks5" => Ok(Self::Socks),
+            _ => Err(format!("invalid forward kind '{value}' (expected local or socks)")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardDefinition {
+    pub profile_name: String,
+    pub name: String,
+    pub kind: ForwardKind,
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+    pub description: Option<String>,
+}

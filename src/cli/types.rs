@@ -27,6 +27,8 @@ pub enum Command {
     Open(OpenArgs),
     /// Execute a remote command without opening an interactive shell.
     Exec(ExecArgs),
+    /// Inspect the local environment and an optional saved profile.
+    Doctor(DoctorArgs),
     /// Add a new SSH profile.
     Add(AddArgs),
     /// Edit an existing SSH profile.
@@ -39,6 +41,8 @@ pub enum Command {
     Show(ShowArgs),
     /// Copy files between the local machine and a remote host.
     Copy(CopyArgs),
+    /// Manage saved local SSH forwards.
+    Forward(ForwardArgs),
     /// Inspect SSH host keys for a profile.
     Hostkeys(HostkeysArgs),
     /// Generate shell completion scripts.
@@ -116,6 +120,10 @@ pub struct ShowArgs {
 pub struct CopyArgs {
     #[arg(long, short = 'r')]
     pub recursive: bool,
+    #[arg(long)]
+    pub resume: bool,
+    #[arg(long)]
+    pub progress: bool,
     #[arg(value_name = "SOURCE")]
     pub source: String,
     #[arg(value_name = "DESTINATION")]
@@ -141,6 +149,71 @@ pub struct ExecArgs {
         allow_hyphen_values = true
     )]
     pub command: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DoctorArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+pub struct ForwardArgs {
+    #[command(subcommand)]
+    pub command: Option<ForwardCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ForwardCommand {
+    /// Add a saved local forward definition.
+    Add(ForwardAddArgs),
+    /// List saved forwards for a profile.
+    List(ForwardListArgs),
+    /// Remove a saved forward definition.
+    Remove(ForwardRemoveArgs),
+    /// Validate and prepare one or more saved forwards.
+    Run(ForwardRunArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ForwardAddArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: String,
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    #[arg(long, conflicts_with = "socks")]
+    pub local: Option<String>,
+    #[arg(long, conflicts_with = "local")]
+    pub socks: Option<String>,
+    #[arg(long)]
+    pub description: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ForwardListArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ForwardRemoveArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: String,
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ForwardRunArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: String,
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug, Clone)]

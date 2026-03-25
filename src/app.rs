@@ -10,7 +10,8 @@ use directories::ProjectDirs;
 use crate::{
     cli::{
         commands::{
-            add, completion, copy, edit, exec, hostkeys, list, open, remove, show, version,
+            add, completion, copy, doctor, edit, exec, forward, hostkeys, list, open, remove,
+            show, version,
         },
         Cli, Command, HostkeysCommand,
     },
@@ -21,7 +22,10 @@ use crate::{
         open_profile as ssh_open_profile, CopySpec, ExecSpec, ProfileAuth, SshClient,
         SshConnectionContext,
     },
-    store::{Database, HostKeyStore, Profile, ProfileInput, ProfileStore},
+    store::{
+        Database, ForwardDefinition, ForwardStore, HostKeyStore, Profile, ProfileInput,
+        ProfileStore,
+    },
     terminal::prompt::StdioPrompt,
 };
 
@@ -86,6 +90,7 @@ impl AppPaths {
 pub struct App {
     _paths: AppPaths,
     profile_store: ProfileStore,
+    forward_store: ForwardStore,
     hostkey_store: HostKeyStore,
     secrets: Arc<dyn SecretStore>,
     secret_backend: SecretBackend,
@@ -143,6 +148,7 @@ impl App {
         Ok(Self {
             _paths: paths,
             profile_store: ProfileStore::new(database.clone()),
+            forward_store: ForwardStore::new(database.clone()),
             hostkey_store: HostKeyStore::new(database),
             secrets,
             secret_backend,
@@ -162,6 +168,33 @@ impl App {
 
     pub fn list_profiles(&self) -> Result<Vec<Profile>> {
         self.profile_store.list()
+    }
+
+    pub fn save_forward(&self, definition: ForwardDefinition) -> Result<ForwardDefinition> {
+        self.get_profile(&definition.profile_name)?;
+        self.forward_store.save(&definition)?;
+        self.get_forward(&definition.profile_name, &definition.name)
+    }
+
+    pub fn get_forward(&self, profile_name: &str, name: &str) -> Result<ForwardDefinition> {
+        self.get_profile(profile_name)?;
+        self.forward_store
+            .get(profile_name, name)?
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "forward '{name}' was not found for profile '{profile_name}'"
+                ))
+            })
+    }
+
+    pub fn list_forwards(&self, profile_name: &str) -> Result<Vec<ForwardDefinition>> {
+        self.get_profile(profile_name)?;
+        self.forward_store.list(profile_name)
+    }
+
+    pub fn delete_forward(&self, profile_name: &str, name: &str) -> Result<bool> {
+        self.get_profile(profile_name)?;
+        self.forward_store.delete(profile_name, name)
     }
 
     pub fn save_profile_with_secrets(
@@ -388,6 +421,10 @@ pub fn run() -> Result<()> {
             let app = App::load()?;
             add::run(&app, &prompt, &args, &mut stdout)
         }
+        Some(Command::Doctor(args)) => {
+            let app = App::load()?;
+            doctor::run(&app, &args, &mut stdout)
+        }
         Some(Command::Edit(args)) => {
             let app = App::load()?;
             edit::run(&app, &prompt, &args, &mut stdout)
@@ -424,6 +461,10 @@ pub fn run() -> Result<()> {
         Some(Command::Copy(args)) => {
             let app = App::load()?;
             copy::run(&app, &prompt, &args)
+        }
+        Some(Command::Forward(args)) => {
+            let app = App::load()?;
+            forward::run(&app, &prompt, &args, &mut stdout)
         }
         None => {
             let app = App::load()?;

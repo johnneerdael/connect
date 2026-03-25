@@ -23,7 +23,7 @@ use connect::{
         parse_copy_spec, CopyDirection, ExecSpec, ObservedHostKey, RemoteDirectoryEntry,
         RemoteFileType, SshClient, SshSession,
     },
-    store::ProfileInput,
+    store::{ForwardDefinition, ForwardKind, ProfileInput},
     terminal::prompt::Prompt,
 };
 
@@ -113,6 +113,73 @@ fn profile_save_updates_existing_metadata() {
     assert_eq!(loaded.host, "prod-2.example.com");
     assert_eq!(loaded.username, "root");
     assert_eq!(loaded.port, 2200);
+}
+
+#[test]
+fn forward_insert_round_trip_preserves_metadata() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    let definition = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: Some("postgres".into()),
+    };
+
+    harness.app().save_forward(definition.clone()).unwrap();
+
+    let loaded = harness.app().get_forward("prod", "db").unwrap();
+    assert_eq!(loaded, definition);
+}
+
+#[test]
+fn forward_list_and_delete_are_scoped_by_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    let primary = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+    let secondary = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "metrics".into(),
+        kind: ForwardKind::Socks,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 1080,
+        target_host: None,
+        target_port: None,
+        description: Some("socks proxy".into()),
+    };
+
+    harness.app().save_forward(primary.clone()).unwrap();
+    harness.app().save_forward(secondary.clone()).unwrap();
+
+    let mut list = harness.app().list_forwards("prod").unwrap();
+    list.sort_by(|left, right| left.name.cmp(&right.name));
+    assert_eq!(list, vec![primary.clone(), secondary.clone()]);
+
+    assert!(harness.app().delete_forward("prod", "db").unwrap());
+    assert!(harness.app().get_forward("prod", "db").is_err());
+    assert_eq!(
+        harness.app().list_forwards("prod").unwrap(),
+        vec![secondary]
+    );
 }
 
 #[test]

@@ -41,6 +41,19 @@ impl Database {
                 accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(host, port, algorithm, fingerprint)
             );
+
+            CREATE TABLE IF NOT EXISTS forward_definitions (
+                profile_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                bind_host TEXT NOT NULL,
+                bind_port INTEGER NOT NULL,
+                target_host TEXT,
+                target_port INTEGER,
+                description TEXT,
+                PRIMARY KEY (profile_name, name),
+                FOREIGN KEY (profile_name) REFERENCES profiles(name) ON DELETE CASCADE
+            );
             ",
         )?;
         add_profiles_auth_mode_column_if_missing(&connection)?;
