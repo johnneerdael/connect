@@ -222,6 +222,7 @@ impl SshClient for RusshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::SeekFrom;
 
     #[test]
     fn client_config_uses_keepalives_without_idle_disconnects() {
@@ -230,6 +231,54 @@ mod tests {
         assert_eq!(config.inactivity_timeout, None);
         assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
         assert_eq!(config.keepalive_max, KEEPALIVE_MAX_MISSES);
+    }
+
+    #[tokio::test]
+    async fn resume_copy_skips_prefix_on_both_sides() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        let source_path = dir.path().join("source.txt");
+        let destination_path = dir.path().join("destination.txt");
+
+        std::fs::write(&source_path, "hello-resume-upload").expect("source should be written");
+        std::fs::write(&destination_path, "hello-").expect("destination prefix should exist");
+
+        let mut source = File::open(&source_path).await.expect("source should open");
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .open(&destination_path)
+            .await
+            .expect("destination should open");
+
+        let copied = copy_stream_from_offsets(
+            &mut source,
+            &mut destination,
+            "resume test".into(),
+            Some(std::fs::metadata(&source_path).unwrap().len()),
+            false,
+            6,
+        )
+        .await
+        .expect("resume copy should succeed");
+
+        assert_eq!(copied, 13);
+        assert_eq!(
+            std::fs::read_to_string(&destination_path).expect("destination should be readable"),
+            "hello-resume-upload"
+        );
+
+        let mut source = File::open(&source_path)
+            .await
+            .expect("source should reopen");
+        source
+            .seek(SeekFrom::Start(6))
+            .await
+            .expect("source should seek");
+        let mut suffix = vec![0_u8; 6];
+        source
+            .read_exact(&mut suffix)
+            .await
+            .expect("source suffix should be readable after seek");
+        assert_eq!(suffix, b"resume");
     }
 }
 
@@ -498,17 +547,13 @@ impl SshSession for RusshSession {
                 )
                 .await
                 .map_err(map_sftp_error)?;
-            if options.resume_offset > 0 {
-                remote
-                    .seek(std::io::SeekFrom::Start(options.resume_offset))
-                    .await?;
-            }
-            let bytes_copied = copy_stream_with_progress(
+            let bytes_copied = copy_stream_from_offsets(
                 &mut local,
                 &mut remote,
                 progress_label("upload", local_path, remote_path),
                 Some(total_bytes),
                 options.show_progress,
+                options.resume_offset,
             )
             .await?;
             remote.shutdown().await?;
@@ -543,17 +588,13 @@ impl SshSession for RusshSession {
             } else {
                 File::create(local_path).await?
             };
-            if options.resume_offset > 0 {
-                local
-                    .seek(std::io::SeekFrom::Start(options.resume_offset))
-                    .await?;
-            }
-            let bytes_copied = copy_stream_with_progress(
+            let bytes_copied = copy_stream_from_offsets(
                 &mut remote,
                 &mut local,
                 progress_label("download", local_path, remote_path),
                 total_bytes,
                 options.show_progress,
+                options.resume_offset,
             )
             .await?;
             local.flush().await?;
@@ -717,6 +758,26 @@ where
         stderr.flush().await?;
     }
     Ok(copied)
+}
+
+async fn copy_stream_from_offsets<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    label: String,
+    total_bytes: Option<u64>,
+    show_progress: bool,
+    resume_offset: u64,
+) -> Result<u64>
+where
+    R: AsyncRead + tokio::io::AsyncSeek + Unpin,
+    W: AsyncWrite + tokio::io::AsyncSeek + Unpin,
+{
+    if resume_offset > 0 {
+        reader.seek(std::io::SeekFrom::Start(resume_offset)).await?;
+        writer.seek(std::io::SeekFrom::Start(resume_offset)).await?;
+    }
+
+    copy_stream_with_progress(reader, writer, label, total_bytes, show_progress).await
 }
 
 async fn print_progress(
