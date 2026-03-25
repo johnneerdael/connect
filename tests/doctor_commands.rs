@@ -189,6 +189,7 @@ fn doctor_report_aggregation_marks_all_passes_as_success() {
     assert_eq!(report.exit_code(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn doctor_command_routes_through_binary_for_success() {
     let root = TempRoot::new("connect-doctor-success");
