@@ -1,7 +1,14 @@
-use assert_cmd::Command;
+use assert_cmd::Command as AssertCommand;
+use clap::Parser;
 
-fn connect_test_bin() -> Command {
-    Command::cargo_bin("connect").expect("binary should build")
+use connect::cli::{Cli, Command as CliCommand, ForwardCommand};
+
+fn connect_test_bin() -> AssertCommand {
+    AssertCommand::cargo_bin("connect").expect("binary should build")
+}
+
+fn parse_cli(args: &[&str]) -> Cli {
+    Cli::try_parse_from(args).expect("CLI should parse")
 }
 
 #[test]
@@ -66,24 +73,58 @@ fn completion_command_accepts_shell_argument() {
 }
 
 #[test]
-fn doctor_help_lists_optional_profile_argument() {
-    let mut cmd = connect_test_bin();
-    cmd.args(["doctor", "--help"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("PROFILE"));
+fn doctor_parses_with_and_without_profile_subcommand() {
+    let local = parse_cli(&["connect", "doctor"]);
+    match local.command {
+        Some(CliCommand::Doctor(args)) => assert!(args.profile.is_none()),
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+    assert!(local.profile.is_none());
+
+    let remote = parse_cli(&["connect", "doctor", "prod"]);
+    match remote.command {
+        Some(CliCommand::Doctor(args)) => assert_eq!(args.profile.as_deref(), Some("prod")),
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+    assert!(remote.profile.is_none());
 }
 
 #[test]
-fn forward_help_lists_subcommands() {
-    let mut cmd = connect_test_bin();
-    cmd.args(["forward", "--help"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("add"))
-        .stdout(predicates::str::contains("list"))
-        .stdout(predicates::str::contains("remove"))
-        .stdout(predicates::str::contains("run"));
+fn forward_add_and_run_parse_with_explicit_subcommands() {
+    let add = parse_cli(&[
+        "connect",
+        "forward",
+        "add",
+        "prod",
+        "db",
+        "--local",
+        "127.0.0.1:15432:db.internal:5432",
+    ]);
+    match add.command {
+        Some(CliCommand::Forward(args)) => match args.command {
+            Some(ForwardCommand::Add(args)) => {
+                assert_eq!(args.profile, "prod");
+                assert_eq!(args.name, "db");
+                assert_eq!(args.local.as_deref(), Some("127.0.0.1:15432:db.internal:5432"));
+                assert!(args.socks.is_none());
+            }
+            other => panic!("expected forward add command, got {other:?}"),
+        },
+        other => panic!("expected forward command, got {other:?}"),
+    }
+
+    let run = parse_cli(&["connect", "forward", "run", "prod", "--all"]);
+    match run.command {
+        Some(CliCommand::Forward(args)) => match args.command {
+            Some(ForwardCommand::Run(args)) => {
+                assert_eq!(args.profile, "prod");
+                assert!(args.name.is_none());
+                assert!(args.all);
+            }
+            other => panic!("expected forward run command, got {other:?}"),
+        },
+        other => panic!("expected forward command, got {other:?}"),
+    }
 }
 
 #[test]
@@ -108,13 +149,26 @@ fn open_help_lists_profile_argument() {
 }
 
 #[test]
-fn copy_help_lists_resume_and_progress_flags() {
-    let mut cmd = connect_test_bin();
-    cmd.args(["copy", "--help"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("--resume"))
-        .stdout(predicates::str::contains("--progress"));
+fn copy_parses_resume_and_progress_flags() {
+    let cli = parse_cli(&[
+        "connect",
+        "copy",
+        "--resume",
+        "--progress",
+        "artifact.txt",
+        "prod:/tmp/artifact.txt",
+    ]);
+
+    match cli.command {
+        Some(CliCommand::Copy(args)) => {
+            assert!(args.resume);
+            assert!(args.progress);
+            assert!(!args.recursive);
+            assert_eq!(args.source, "artifact.txt");
+            assert_eq!(args.destination, "prod:/tmp/artifact.txt");
+        }
+        other => panic!("expected copy command, got {other:?}"),
+    }
 }
 
 #[test]
