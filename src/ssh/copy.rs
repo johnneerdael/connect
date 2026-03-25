@@ -154,11 +154,9 @@ pub async fn copy_profile(
     profile: &Profile,
     context: &dyn SshConnectionContext,
     prompt: &dyn Prompt,
-) -> Result<()> {
+) -> Result<CopySummary> {
     let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
-    let summary = execute_copy(&mut *session, spec).await?;
-    eprintln!("{summary}");
-    Ok(())
+    execute_copy(&mut *session, spec).await
 }
 
 async fn execute_copy(session: &mut dyn SshSession, spec: &CopySpec) -> Result<CopySummary> {

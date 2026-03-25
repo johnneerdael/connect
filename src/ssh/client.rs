@@ -222,7 +222,7 @@ impl SshClient for RusshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::SeekFrom;
+    use tokio::io::{duplex, AsyncReadExt, SeekFrom};
 
     #[test]
     fn client_config_uses_keepalives_without_idle_disconnects() {
@@ -260,7 +260,7 @@ mod tests {
         .await
         .expect("resume copy should succeed");
 
-        assert_eq!(copied, 13);
+        assert_eq!(copied, 19);
         assert_eq!(
             std::fs::read_to_string(&destination_path).expect("destination should be readable"),
             "hello-resume-upload"
@@ -279,6 +279,57 @@ mod tests {
             .await
             .expect("source suffix should be readable after seek");
         assert_eq!(suffix, b"resume");
+    }
+
+    #[tokio::test]
+    async fn resumed_progress_starts_from_the_resume_offset() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        let source_path = dir.path().join("source.txt");
+        let destination_path = dir.path().join("destination.txt");
+
+        std::fs::write(&source_path, "hello-resume-upload").expect("source should be written");
+        std::fs::write(&destination_path, "hello-").expect("destination prefix should exist");
+
+        let mut source = File::open(&source_path).await.expect("source should open");
+        source
+            .seek(SeekFrom::Start(6))
+            .await
+            .expect("source should seek");
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .open(&destination_path)
+            .await
+            .expect("destination should open");
+        destination
+            .seek(SeekFrom::Start(6))
+            .await
+            .expect("destination should seek");
+
+        let (mut progress_reader, mut progress_writer) = duplex(1024);
+        let bytes_copied = copy_stream_with_progress(
+            &mut source,
+            &mut destination,
+            &mut progress_writer,
+            "resume test".into(),
+            Some(std::fs::metadata(&source_path).unwrap().len()),
+            true,
+            6,
+        )
+        .await
+        .expect("copy should succeed");
+        drop(progress_writer);
+
+        let mut progress = String::new();
+        progress_reader
+            .read_to_string(&mut progress)
+            .await
+            .expect("progress should be readable");
+
+        assert_eq!(bytes_copied, 19);
+        assert!(progress.contains("\rresume test: 6/19 bytes"));
+        assert!(progress.contains("\rresume test: 19/19 bytes"));
+        assert!(!progress.contains("\rresume test: 0/19 bytes"));
+        assert!(progress.ends_with('\n'));
     }
 }
 
@@ -722,24 +773,26 @@ fn progress_label(direction: &str, local_path: &Path, remote_path: &str) -> Stri
     format!("{direction} {} <-> {remote_path}", local_path.display())
 }
 
-async fn copy_stream_with_progress<R, W>(
+async fn copy_stream_with_progress<R, W, P>(
     reader: &mut R,
     writer: &mut W,
+    progress: &mut P,
     label: String,
     total_bytes: Option<u64>,
     show_progress_override: bool,
+    initial_copied: u64,
 ) -> Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+    P: AsyncWrite + Unpin,
 {
-    let mut stderr = tokio::io::stderr();
     let show_progress = show_progress_override || std::io::stderr().is_terminal();
     if show_progress {
-        print_progress(&mut stderr, &label, 0, total_bytes).await?;
+        print_progress(progress, &label, initial_copied, total_bytes).await?;
     }
 
-    let mut copied = 0_u64;
+    let mut copied = initial_copied;
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer).await?;
@@ -749,13 +802,13 @@ where
         writer.write_all(&buffer[..read]).await?;
         copied += u64::try_from(read).unwrap_or(u64::MAX);
         if show_progress {
-            print_progress(&mut stderr, &label, copied, total_bytes).await?;
+            print_progress(progress, &label, copied, total_bytes).await?;
         }
     }
     writer.flush().await?;
     if show_progress {
-        stderr.write_all(b"\n").await?;
-        stderr.flush().await?;
+        progress.write_all(b"\n").await?;
+        progress.flush().await?;
     }
     Ok(copied)
 }
@@ -772,20 +825,33 @@ where
     R: AsyncRead + tokio::io::AsyncSeek + Unpin,
     W: AsyncWrite + tokio::io::AsyncSeek + Unpin,
 {
+    let mut progress = tokio::io::stderr();
     if resume_offset > 0 {
         reader.seek(std::io::SeekFrom::Start(resume_offset)).await?;
         writer.seek(std::io::SeekFrom::Start(resume_offset)).await?;
     }
 
-    copy_stream_with_progress(reader, writer, label, total_bytes, show_progress).await
+    copy_stream_with_progress(
+        reader,
+        writer,
+        &mut progress,
+        label,
+        total_bytes,
+        show_progress,
+        resume_offset,
+    )
+    .await
 }
 
-async fn print_progress(
-    stderr: &mut tokio::io::Stderr,
+async fn print_progress<W>(
+    stderr: &mut W,
     label: &str,
     copied: u64,
     total_bytes: Option<u64>,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let line = match total_bytes {
         Some(total) if total > 0 => format!("\r{label}: {copied}/{total} bytes"),
         _ => format!("\r{label}: {copied} bytes"),

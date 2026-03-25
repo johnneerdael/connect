@@ -14,7 +14,7 @@ use connect::store::AuthMode;
 use connect::{
     app::{App, AppPaths, ProfileSecretsInput, SecretBackend},
     cli::{
-        commands::{add, edit, forward, list, remove, show},
+        commands::{add, copy as copy_command, edit, forward, list, remove, show},
         AddArgs, EditArgs, ForwardArgs, ForwardCommand, ForwardRunArgs, RemoveArgs, ShowArgs,
     },
     error::Error,
@@ -1356,17 +1356,20 @@ async fn copy_rejects_resume_when_destination_is_larger_than_source() {
 }
 
 #[test]
-fn copy_summary_formats_direction_bytes_and_destination() {
+fn copy_summary_is_emitted_by_the_cli_boundary() {
     let summary = CopySummary {
         direction: CopyDirection::Upload,
         bytes_copied: 12,
         resumed_bytes: 4,
         destination: "prod:/tmp/artifact.txt".into(),
     };
+    let mut output = Vec::new();
+
+    copy_command::emit_summary_to(&summary, &mut output).unwrap();
 
     assert_eq!(
-        summary.to_string(),
-        "copy upload complete: 12 bytes copied (4 resumed) to prod:/tmp/artifact.txt"
+        String::from_utf8(output).unwrap(),
+        "copy upload complete: 12 bytes copied (4 resumed) to prod:/tmp/artifact.txt\n"
     );
 }
 

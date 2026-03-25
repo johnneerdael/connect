@@ -308,7 +308,7 @@ impl App {
         spec: &CopySpec,
         ssh: &dyn SshClient,
         prompt: &dyn crate::terminal::prompt::Prompt,
-    ) -> Result<()> {
+    ) -> Result<crate::ssh::CopySummary> {
         let profile = self.get_profile(spec.remote_profile())?;
         ssh_copy_profile(ssh, spec, &profile, self, prompt).await
     }
