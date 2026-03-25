@@ -766,6 +766,7 @@ dependencies = [
  "rusqlite",
  "russh",
  "russh-sftp",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

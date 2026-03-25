@@ -1,0 +1,480 @@
+#![cfg(target_os = "linux")]
+
+use std::{
+    env, fs, io,
+    net::TcpListener,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
+    sync::Arc,
+    thread,
+    time::{Duration, SystemTime},
+};
+
+use connect::{
+    app::{App, AppPaths, ProfileSecretsInput},
+    error::Error,
+    secrets::MemorySecretStore,
+    ssh::{parse_copy_spec, ExecSpec, RusshClient},
+    store::{AuthMode, ProfileInput},
+    terminal::prompt::Prompt,
+};
+use filetime::{set_file_mtime, FileTime};
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn openssh_end_to_end_supports_tofu_exec_agent_auth_and_recursive_copy() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let rejecting_prompt = RejectPrompt;
+    let ssh = RusshClient::new();
+
+    let stored_app = harness.app_with_profile("stored", AuthMode::StoredOnly, true);
+    let stored_exec = ExecSpec::new(vec!["sh".into(), "-lc".into(), "true".into()], false);
+    stored_app
+        .exec("stored", &stored_exec, &ssh, &prompt)
+        .await
+        .expect("first stored-key exec should succeed");
+
+    let host_keys = stored_app.list_host_keys().expect("host keys should load");
+    assert_eq!(
+        host_keys.len(),
+        1,
+        "first connect should persist the TOFU host key"
+    );
+    assert_eq!(host_keys[0].host, "127.0.0.1");
+    assert_eq!(host_keys[0].port, harness.port());
+
+    stored_app
+        .exec("stored", &stored_exec, &ssh, &rejecting_prompt)
+        .await
+        .expect("saved host key should avoid re-prompting");
+
+    let pty_exec = ExecSpec::new(
+        vec![
+            "sh".into(),
+            "-lc".into(),
+            "test -t 0 && test -t 1 && exit 0 || exit 17".into(),
+        ],
+        true,
+    );
+    stored_app
+        .exec("stored", &pty_exec, &ssh, &rejecting_prompt)
+        .await
+        .expect("PTY exec should succeed");
+
+    let quiet_exec = ExecSpec::new(vec!["sh".into(), "-lc".into(), "sleep 31".into()], false);
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        stored_app.exec("stored", &quiet_exec, &ssh, &rejecting_prompt),
+    )
+    .await
+    .expect("quiet exec should not hang")
+    .expect("quiet exec should survive keepalives");
+
+    let failing_exec = ExecSpec::new(vec!["sh".into(), "-lc".into(), "exit 23".into()], false);
+    let error = stored_app
+        .exec("stored", &failing_exec, &ssh, &rejecting_prompt)
+        .await
+        .expect_err("non-zero exec should propagate the remote exit code");
+    assert!(matches!(error, Error::RemoteExitStatus(23)));
+
+    let local_tree = harness.root().join("local-tree");
+    let nested_dir = local_tree.join("nested");
+    fs::create_dir_all(&nested_dir).expect("nested local directory should exist");
+    let local_file = nested_dir.join("hello.txt");
+    fs::write(&local_file, "hello over sftp\n").expect("local test file should be written");
+    fs::set_permissions(&local_file, fs::Permissions::from_mode(0o640))
+        .expect("test file mode should be set");
+    let source_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    set_file_mtime(&local_file, FileTime::from_system_time(source_mtime))
+        .expect("test file mtime should be set");
+
+    let remote_tree = harness.root().join("remote-tree");
+    let upload_spec = parse_copy_spec(
+        local_tree.to_str().expect("local path should be utf-8"),
+        &format!("stored:{}", remote_tree.display()),
+        true,
+    )
+    .expect("upload spec should parse");
+    stored_app
+        .copy(&upload_spec, &ssh, &rejecting_prompt)
+        .await
+        .expect("recursive upload should succeed");
+
+    let download_root = harness.root().join("downloaded-tree");
+    let download_spec = parse_copy_spec(
+        &format!("stored:{}", remote_tree.display()),
+        download_root
+            .to_str()
+            .expect("download path should be utf-8"),
+        true,
+    )
+    .expect("download spec should parse");
+    stored_app
+        .copy(&download_spec, &ssh, &rejecting_prompt)
+        .await
+        .expect("recursive download should succeed");
+
+    let downloaded_file = download_root.join("nested").join("hello.txt");
+    assert_eq!(
+        fs::read_to_string(&downloaded_file).expect("downloaded file should exist"),
+        "hello over sftp\n"
+    );
+    assert_eq!(
+        fs::metadata(&downloaded_file)
+            .expect("downloaded metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    assert_eq!(
+        fs::metadata(&downloaded_file)
+            .expect("downloaded metadata should exist")
+            .mtime(),
+        fs::metadata(&local_file)
+            .expect("source metadata should exist")
+            .mtime()
+    );
+
+    let agent = SshAgentGuard::start(harness.user_key_path());
+    let agent_app = harness.app_with_profile("agent", AuthMode::AgentOnly, false);
+    let agent_exec = ExecSpec::new(vec!["sh".into(), "-lc".into(), "true".into()], false);
+    agent_app
+        .exec("agent", &agent_exec, &ssh, &prompt)
+        .await
+        .expect("agent-only auth should succeed with ssh-agent");
+    drop(agent);
+}
+
+struct OpenSshHarness {
+    root: TempDir,
+    port: u16,
+    username: String,
+    user_key_path: PathBuf,
+    private_key_contents: String,
+    sshd: Child,
+}
+
+impl OpenSshHarness {
+    fn start() -> Self {
+        let root = TempDir::new().expect("tempdir should be created");
+        let sshd_root = root.path().join("sshd");
+        let home_root = root.path().join("home");
+        fs::create_dir_all(&sshd_root).expect("sshd root should exist");
+        fs::create_dir_all(home_root.join(".ssh")).expect("ssh home should exist");
+
+        let host_key = sshd_root.join("ssh_host_ed25519_key");
+        let user_key = root.path().join("id_ed25519");
+        run_command(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&host_key),
+        )
+        .expect("host key should be generated");
+        run_command(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&user_key),
+        )
+        .expect("user key should be generated");
+
+        let authorized_keys = home_root.join(".ssh").join("authorized_keys");
+        fs::copy(user_key.with_extension("pub"), &authorized_keys)
+            .expect("authorized keys should be populated");
+
+        let username = current_username();
+        let port = allocate_port();
+        let log_path = root.path().join("sshd.log");
+        let config_path = root.path().join("sshd_config");
+        fs::write(
+            &config_path,
+            format!(
+                "\
+Port {port}
+ListenAddress 127.0.0.1
+HostKey {host_key}
+PidFile {pid_file}
+AuthorizedKeysFile {authorized_keys}
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+UsePAM no
+StrictModes no
+AllowUsers {username}
+LogLevel VERBOSE
+PrintMotd no
+UseDNS no
+Subsystem sftp internal-sftp
+",
+                port = port,
+                host_key = host_key.display(),
+                pid_file = root.path().join("sshd.pid").display(),
+                authorized_keys = authorized_keys.display(),
+                username = username,
+            ),
+        )
+        .expect("sshd config should be written");
+
+        run_command(
+            Command::new("/usr/sbin/sshd")
+                .args(["-t", "-f"])
+                .arg(&config_path),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "sshd config validation failed: {error}\n{}",
+                read_optional(&log_path)
+            )
+        });
+
+        let sshd = Command::new("/usr/sbin/sshd")
+            .arg("-D")
+            .arg("-f")
+            .arg(&config_path)
+            .arg("-E")
+            .arg(&log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sshd should start");
+
+        wait_for_port(port, &log_path);
+
+        Self {
+            private_key_contents: fs::read_to_string(&user_key)
+                .expect("private key should be readable"),
+            root,
+            port,
+            username,
+            user_key_path: user_key,
+            sshd,
+        }
+    }
+
+    fn app_with_profile(&self, name: &str, auth_mode: AuthMode, include_private_key: bool) -> App {
+        let app_root = self.root.path().join(format!("app-{name}"));
+        let app = App::new(
+            AppPaths::from_root(&app_root),
+            Arc::new(MemorySecretStore::default()),
+        )
+        .expect("app should initialize");
+        let profile = ProfileInput::new(name, "127.0.0.1", &self.username)
+            .with_port(self.port)
+            .with_auth_mode(auth_mode);
+        let secrets = if include_private_key {
+            ProfileSecretsInput {
+                private_key: Some(self.private_key_contents.clone()),
+                ..Default::default()
+            }
+        } else {
+            ProfileSecretsInput::default()
+        };
+        app.save_profile_with_secrets(profile, secrets)
+            .expect("profile should be saved");
+        app
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    fn user_key_path(&self) -> &Path {
+        &self.user_key_path
+    }
+}
+
+impl Drop for OpenSshHarness {
+    fn drop(&mut self) {
+        let _ = self.sshd.kill();
+        let _ = self.sshd.wait();
+    }
+}
+
+struct SshAgentGuard {
+    child_pid: String,
+    previous_sock: Option<std::ffi::OsString>,
+    previous_pid: Option<std::ffi::OsString>,
+}
+
+impl SshAgentGuard {
+    fn start(key_path: &Path) -> Self {
+        let output = Command::new("ssh-agent")
+            .arg("-s")
+            .output()
+            .expect("ssh-agent should start");
+        if !output.status.success() {
+            panic!(
+                "ssh-agent failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let stdout = String::from_utf8(output.stdout).expect("ssh-agent output should be utf-8");
+        let sock = parse_agent_value(&stdout, "SSH_AUTH_SOCK");
+        let pid = parse_agent_value(&stdout, "SSH_AGENT_PID");
+
+        let previous_sock = env::var_os("SSH_AUTH_SOCK");
+        let previous_pid = env::var_os("SSH_AGENT_PID");
+        env::set_var("SSH_AUTH_SOCK", &sock);
+        env::set_var("SSH_AGENT_PID", &pid);
+
+        run_command(Command::new("ssh-add").arg(key_path)).expect("ssh-add should load the key");
+
+        Self {
+            child_pid: pid,
+            previous_sock,
+            previous_pid,
+        }
+    }
+}
+
+impl Drop for SshAgentGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("ssh-agent")
+            .arg("-k")
+            .env("SSH_AGENT_PID", &self.child_pid)
+            .env(
+                "SSH_AUTH_SOCK",
+                env::var("SSH_AUTH_SOCK").unwrap_or_default(),
+            )
+            .output();
+
+        match &self.previous_sock {
+            Some(value) => env::set_var("SSH_AUTH_SOCK", value),
+            None => env::remove_var("SSH_AUTH_SOCK"),
+        }
+
+        match &self.previous_pid {
+            Some(value) => env::set_var("SSH_AGENT_PID", value),
+            None => env::remove_var("SSH_AGENT_PID"),
+        }
+    }
+}
+
+struct AcceptPrompt;
+
+impl Prompt for AcceptPrompt {
+    fn prompt(
+        &self,
+        _key: &str,
+        _message: &str,
+        _default: Option<&str>,
+    ) -> connect::error::Result<String> {
+        Err(Error::new(
+            "text prompts are not expected in OpenSSH e2e tests",
+        ))
+    }
+
+    fn prompt_secret(&self, _key: &str, _message: &str) -> connect::error::Result<Option<String>> {
+        Err(Error::new(
+            "secret prompts are not expected in OpenSSH e2e tests",
+        ))
+    }
+
+    fn confirm(&self, _key: &str, _message: &str, _default: bool) -> connect::error::Result<bool> {
+        Ok(true)
+    }
+}
+
+struct RejectPrompt;
+
+impl Prompt for RejectPrompt {
+    fn prompt(
+        &self,
+        _key: &str,
+        _message: &str,
+        _default: Option<&str>,
+    ) -> connect::error::Result<String> {
+        Err(Error::new(
+            "text prompts are not expected in OpenSSH e2e tests",
+        ))
+    }
+
+    fn prompt_secret(&self, _key: &str, _message: &str) -> connect::error::Result<Option<String>> {
+        Err(Error::new(
+            "secret prompts are not expected in OpenSSH e2e tests",
+        ))
+    }
+
+    fn confirm(&self, _key: &str, _message: &str, _default: bool) -> connect::error::Result<bool> {
+        Err(Error::new(
+            "host key prompt should not repeat after TOFU trust",
+        ))
+    }
+}
+
+fn run_command(command: &mut Command) -> io::Result<Output> {
+    let output = command.output()?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "command {:?} failed with status {}: {}",
+                command,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ))
+    }
+}
+
+fn parse_agent_value(output: &str, key: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .and_then(|line| line.split(';').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("ssh-agent output missing {key}: {output}"))
+}
+
+fn current_username() -> String {
+    env::var("USER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let output = run_command(Command::new("id").arg("-un"))
+                .expect("current username should be discoverable");
+            String::from_utf8(output.stdout)
+                .expect("username should be utf-8")
+                .trim()
+                .to_string()
+        })
+}
+
+fn allocate_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("ephemeral port should allocate")
+        .local_addr()
+        .expect("local addr should resolve")
+        .port()
+}
+
+fn wait_for_port(port: u16, log_path: &Path) {
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    panic!(
+        "sshd did not start listening on port {port}\n{}",
+        read_optional(log_path)
+    );
+}
+
+fn read_optional(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|_| String::new())
+}
