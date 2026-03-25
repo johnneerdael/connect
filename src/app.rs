@@ -173,16 +173,6 @@ impl App {
     pub fn save_forward(&self, definition: ForwardDefinition) -> Result<ForwardDefinition> {
         self.validate_forward_definition(&definition)?;
         self.get_profile(&definition.profile_name)?;
-        if self
-            .forward_store
-            .get(&definition.profile_name, &definition.name)?
-            .is_some()
-        {
-            return Err(Error::new(format!(
-                "forward '{}' already exists for profile '{}'",
-                definition.name, definition.profile_name
-            )));
-        }
         self.forward_store.save(&definition)?;
         self.get_forward(&definition.profile_name, &definition.name)
     }

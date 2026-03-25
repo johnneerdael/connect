@@ -23,7 +23,7 @@ use connect::{
         parse_copy_spec, CopyDirection, CopySummary, ExecSpec, ObservedHostKey,
         RemoteDirectoryEntry, RemoteFileType, SshClient, SshSession,
     },
-    store::ProfileInput,
+    store::{Database, ForwardDefinition, ForwardKind, ForwardStore, ProfileInput},
     terminal::prompt::Prompt,
 };
 
@@ -113,6 +113,65 @@ fn profile_save_updates_existing_metadata() {
     assert_eq!(loaded.host, "prod-2.example.com");
     assert_eq!(loaded.username, "root");
     assert_eq!(loaded.port, 2200);
+}
+
+#[test]
+fn app_save_forward_rejects_duplicate_name_for_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let definition = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+
+    harness.app().save_forward(definition.clone()).unwrap();
+
+    let error = harness.app().save_forward(definition).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "forward 'db' already exists for profile 'prod'"
+    );
+}
+
+#[test]
+fn forward_store_rejects_duplicate_name_for_profile_atomically() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let store = ForwardStore::new(Database::new(
+        harness.root.join("data").join("connect.db"),
+    ));
+    let definition = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+
+    store.save(&definition).unwrap();
+
+    let error = store.save(&definition).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "forward 'db' already exists for profile 'prod'"
+    );
 }
 
 #[test]

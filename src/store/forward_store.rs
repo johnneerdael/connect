@@ -1,6 +1,6 @@
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, ffi, ErrorCode, OptionalExtension, Row};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::{Database, ForwardDefinition};
 
@@ -16,7 +16,7 @@ impl ForwardStore {
 
     pub fn save(&self, definition: &ForwardDefinition) -> Result<()> {
         let connection = self.database.connect()?;
-        connection.execute(
+        match connection.execute(
             "
             INSERT INTO forward_definitions (
                 profile_name,
@@ -40,8 +40,10 @@ impl ForwardStore {
                 definition.target_port.map(i64::from),
                 definition.description.as_deref(),
             ],
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(map_save_error(error, definition)),
+        }
     }
 
     pub fn get(&self, profile_name: &str, name: &str) -> Result<Option<ForwardDefinition>> {
@@ -106,4 +108,20 @@ fn map_forward_definition(row: &Row<'_>) -> rusqlite::Result<ForwardDefinition> 
         target_port: row.get::<_, Option<u16>>(6)?,
         description: row.get(7)?,
     })
+}
+
+fn map_save_error(error: rusqlite::Error, definition: &ForwardDefinition) -> Error {
+    match error {
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == ErrorCode::ConstraintViolation
+                && (err.extended_code == ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                    || err.extended_code == ffi::SQLITE_CONSTRAINT_UNIQUE) =>
+        {
+            Error::new(format!(
+                "forward '{}' already exists for profile '{}'",
+                definition.name, definition.profile_name
+            ))
+        }
+        other => other.into(),
+    }
 }
