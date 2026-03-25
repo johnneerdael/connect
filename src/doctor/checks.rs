@@ -1,6 +1,7 @@
 use std::fs;
 
 use rusqlite::params;
+use tokio::runtime::Builder;
 
 use crate::{
     app::AppPaths,
@@ -70,7 +71,11 @@ impl DoctorEnvironment for DefaultDoctorEnvironment {
     }
 
     fn ssh_agent_available(&self) -> bool {
-        ssh::agent_auth_available()
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| runtime.block_on(ssh::agent_connection_available()))
+            .unwrap_or(false)
     }
 }
 
@@ -124,14 +129,15 @@ pub fn collect_local_checks(env: &dyn DoctorEnvironment) -> LocalDoctorReport {
         },
     });
 
+    let ssh_agent_available = env.ssh_agent_available();
     checks.push(LocalDoctorCheckResult {
         name: "SSH agent availability".into(),
-        status: if env.ssh_agent_available() {
+        status: if ssh_agent_available {
             LocalDoctorCheckStatus::Pass
         } else {
             LocalDoctorCheckStatus::Fail
         },
-        detail: if env.ssh_agent_available() {
+        detail: if ssh_agent_available {
             "available".into()
         } else {
             "not available".into()

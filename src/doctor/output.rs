@@ -18,7 +18,7 @@ fn write_check(
 ) -> Result<()> {
     match check.status {
         LocalDoctorCheckStatus::Pass => {
-            writeln!(writer, "PASS {}", check.name).map_err(Error::from)
+            writeln!(writer, "PASS {}: {}", check.name, check.detail).map_err(Error::from)
         }
         LocalDoctorCheckStatus::Fail => {
             writeln!(writer, "FAIL {}: {}", check.name, check.detail).map_err(Error::from)

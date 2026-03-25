@@ -443,10 +443,13 @@ pub fn run() -> Result<()> {
         }
         Some(Command::Doctor(_args)) => {
             let report = doctor::run(&mut stdout)?;
-            if report.is_success() {
+            if report.exit_code() == 0 {
                 Ok(())
             } else {
-                Err(Error::new("doctor checks failed"))
+                Err(Error::new(format!(
+                    "doctor checks failed (exit code {})",
+                    report.exit_code()
+                )))
             }
         }
         Some(Command::Edit(args)) => {

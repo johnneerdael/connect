@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -24,7 +25,15 @@ fn unique_temp_root(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock should be monotonic")
         .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{stamp}-{}", std::process::id()))
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp").join(format!("{prefix}-{stamp}-{}", std::process::id()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join(format!("{prefix}-{stamp}-{}", std::process::id()))
+    }
 }
 
 struct TempRoot {
@@ -43,6 +52,16 @@ impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn spawn_agent_socket(path: &PathBuf) -> thread::JoinHandle<()> {
+    use std::os::unix::net::UnixListener;
+
+    let listener = UnixListener::bind(path).expect("agent socket should bind");
+    thread::spawn(move || {
+        let _ = listener.accept();
+    })
 }
 
 #[derive(Clone)]
@@ -101,10 +120,10 @@ fn doctor_without_profile_reports_local_environment_checks() {
     assert_eq!(
         String::from_utf8(output).unwrap(),
         concat!(
-            "PASS app path resolution\n",
-            "PASS database open/read/write sanity\n",
-            "PASS secret backend initialization\n",
-            "PASS SSH agent availability\n",
+            "PASS app path resolution: resolved application directories\n",
+            "PASS database open/read/write sanity: opened /tmp/connect-data/connect.db\n",
+            "PASS secret backend initialization: initialized\n",
+            "PASS SSH agent availability: available\n",
         )
     );
 }
@@ -173,19 +192,26 @@ fn doctor_report_aggregation_marks_all_passes_as_success() {
 #[test]
 fn doctor_command_routes_through_binary_for_success() {
     let root = TempRoot::new("connect-doctor-success");
+    let agent_socket = root.path.join("agent.sock");
+    let agent_thread = spawn_agent_socket(&agent_socket);
+    let database_path = root.path.join("data").join("connect.db");
+    let expected_stdout = format!(
+        "PASS app path resolution: resolved application directories\n\
+PASS database open/read/write sanity: opened {}\n\
+PASS secret backend initialization: initialized\n\
+PASS SSH agent availability: available\n",
+        database_path.display(),
+    );
 
     connect_test_bin()
         .env("CONNECT_APP_ROOT", &root.path)
-        .env("SSH_AUTH_SOCK", "/tmp/connect-doctor-agent.sock")
+        .env("SSH_AUTH_SOCK", &agent_socket)
         .args(["doctor"])
         .assert()
         .success()
-        .stdout(concat!(
-            "PASS app path resolution\n",
-            "PASS database open/read/write sanity\n",
-            "PASS secret backend initialization\n",
-            "PASS SSH agent availability\n",
-        ));
+        .stdout(expected_stdout);
+
+    let _ = agent_thread.join();
 }
 
 #[test]
@@ -194,7 +220,7 @@ fn doctor_command_routes_through_binary_for_failure() {
 
     connect_test_bin()
         .env("CONNECT_APP_ROOT", &root.path)
-        .env_remove("SSH_AUTH_SOCK")
+        .env("SSH_AUTH_SOCK", root.path.join("missing-agent.sock"))
         .args(["doctor"])
         .assert()
         .failure()
@@ -211,4 +237,20 @@ fn doctor_command_rejects_an_unexpected_profile_argument() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("unexpected argument 'prod'"));
+}
+
+#[test]
+fn doctor_output_includes_pass_details() {
+    let report = LocalDoctorReport {
+        checks: vec![LocalDoctorCheckResult {
+            name: "check-a".into(),
+            status: LocalDoctorCheckStatus::Pass,
+            detail: "all good".into(),
+        }],
+    };
+    let mut output = Vec::new();
+
+    doctor::output::write_report(&report, &mut output).unwrap();
+
+    assert_eq!(String::from_utf8(output).unwrap(), "PASS check-a: all good\n");
 }

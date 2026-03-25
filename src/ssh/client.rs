@@ -167,6 +167,10 @@ pub fn agent_auth_available() -> bool {
     }
 }
 
+pub async fn agent_connection_available() -> bool {
+    connect_agent().await.is_ok()
+}
+
 impl SshClient for RusshClient {
     fn connect<'a>(
         &'a self,
