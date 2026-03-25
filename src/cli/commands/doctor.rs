@@ -34,9 +34,7 @@ fn run_profile(profile: &str, writer: &mut dyn Write) -> Result<doctor::checks::
     match crate::app::App::load() {
         Ok(app) => {
             let profile_report = runtime.block_on(doctor::collect_profile_specific_checks(
-                &app,
-                &profile,
-                &ssh,
+                &app, &profile, &ssh,
             ));
             report.checks.extend(profile_report.checks);
         }

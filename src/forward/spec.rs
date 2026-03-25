@@ -103,7 +103,10 @@ impl fmt::Display for ForwardSpec {
                 bind_port,
                 target_host,
                 target_port,
-            } => write!(f, "local {bind_host}:{bind_port} -> {target_host}:{target_port}"),
+            } => write!(
+                f,
+                "local {bind_host}:{bind_port} -> {target_host}:{target_port}"
+            ),
             Self::Socks {
                 bind_host,
                 bind_port,
@@ -133,4 +136,3 @@ fn parse_port(field: &str, value: Option<&str>) -> Result<u16> {
         Ok(port)
     }
 }
-

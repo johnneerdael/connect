@@ -11,9 +11,13 @@ It is built for Windows, macOS, and Linux, stores secrets in the OS-native keych
 - non-interactive remote command execution with exact exit-code propagation
 - local-to-remote and remote-to-local copy support
 - recursive directory copy with `--recursive`
+- resumable single-file copy with `--resume`
+- optional copy progress reporting with `--progress`
 - OS-native secret storage for passwords, imported private keys, and key passphrases
 - SSH agent support with configurable auth precedence
 - TOFU host key verification with commands to list and delete saved host keys
+- local environment and live-profile diagnostics with `connect doctor`
+- saved foreground local TCP forwards and local SOCKS5 proxies
 - standalone release artifacts for Linux, macOS, and Windows
 - shell completion generation
 
@@ -74,6 +78,8 @@ Inspect saved profiles:
 ```bash
 connect list
 connect show prod
+connect doctor
+connect doctor prod
 ```
 
 Open an interactive SSH session:
@@ -119,6 +125,7 @@ Rules:
 
 - exactly one side must be remote
 - directory copy requires `--recursive`
+- `--resume` is supported for single-file transfers only
 - remote paths must use absolute paths
 
 To force a remote interpretation for ambiguous names, prefix the profile with `@`:
@@ -127,6 +134,68 @@ To force a remote interpretation for ambiguous names, prefix the profile with `@
 connect copy @p:/tmp/file.txt ./file.txt
 connect copy @@prod:/tmp/file.txt ./file.txt
 ```
+
+Resume a partial single-file transfer:
+
+```bash
+connect copy --resume ./artifact.tgz prod:/tmp/artifact.tgz
+connect copy --resume prod:/tmp/artifact.tgz ./downloads/artifact.tgz
+```
+
+Force progress output on a TTY-aware copy:
+
+```bash
+connect copy --progress ./artifact.tgz prod:/tmp/artifact.tgz
+```
+
+## Diagnostics
+
+Run local environment checks only:
+
+```bash
+connect doctor
+```
+
+Run local checks plus profile-specific reachability, handshake, host-key, and auth checks:
+
+```bash
+connect doctor prod
+```
+
+`connect doctor <profile>` is non-destructive. It does not open an interactive shell.
+
+## Forwarding
+
+Saved forwards stay attached to the foreground process. `connect` does not daemonize or background tunnels.
+
+Create, inspect, and remove forwards:
+
+```bash
+connect forward add prod db --local 127.0.0.1:15432:db.internal:5432
+connect forward add prod proxy --socks 127.0.0.1:1080
+connect forward list prod
+connect forward remove prod db
+```
+
+Run one saved forward:
+
+```bash
+connect forward run prod db
+connect forward run prod proxy
+```
+
+Run every saved forward for a profile together:
+
+```bash
+connect forward run prod --all
+```
+
+Forwarding scope in the current release:
+
+- local TCP forwards are supported
+- local SOCKS5 proxies support no-auth `CONNECT`
+- forwarding stays in the foreground until interrupted
+- remote forwards and background tunnel management are not supported
 
 ## Host Keys
 

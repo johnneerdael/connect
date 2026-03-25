@@ -2,13 +2,19 @@ use std::{fs, net::SocketAddr};
 
 use rusqlite::params;
 use tokio::runtime::Builder;
-use tokio::{net::{lookup_host, TcpStream}, time::{timeout, Duration}};
+use tokio::{
+    net::{lookup_host, TcpStream},
+    time::{timeout, Duration},
+};
 
 use crate::{
     app::AppPaths,
     error::{Error, Result},
     secrets::KeyringSecretStore,
-    ssh::{self, authenticate_session, verify_observed_host_key, HostKeyVerification, SshClient, SshConnectionContext},
+    ssh::{
+        self, authenticate_session, verify_observed_host_key, HostKeyVerification, SshClient,
+        SshConnectionContext,
+    },
     store::Database,
 };
 
@@ -155,9 +161,11 @@ pub async fn collect_profile_checks(
     ssh_client: &dyn SshClient,
 ) -> LocalDoctorReport {
     let mut report = collect_local_checks(env);
-    report
-        .checks
-        .extend(collect_profile_specific_checks(app, profile_name, ssh_client).await.checks);
+    report.checks.extend(
+        collect_profile_specific_checks(app, profile_name, ssh_client)
+            .await
+            .checks,
+    );
     report
 }
 
@@ -199,11 +207,7 @@ pub async fn collect_profile_specific_checks(
             report.checks.push(LocalDoctorCheckResult {
                 name: "hostname resolution".into(),
                 status: LocalDoctorCheckStatus::Pass,
-                detail: format!(
-                    "resolved {} to {}",
-                    profile.host,
-                    join_addresses(&resolved)
-                ),
+                detail: format!("resolved {} to {}", profile.host, join_addresses(&resolved)),
             });
             resolved
         }
@@ -233,17 +237,18 @@ pub async fn collect_profile_specific_checks(
         }
     }
 
-    let stored_host_key = match <crate::app::App as SshConnectionContext>::load_host_key(app, &profile) {
-        Ok(record) => record,
-        Err(error) => {
-            report.checks.push(LocalDoctorCheckResult {
-                name: "SSH handshake".into(),
-                status: LocalDoctorCheckStatus::Fail,
-                detail: error.to_string(),
-            });
-            return report;
-        }
-    };
+    let stored_host_key =
+        match <crate::app::App as SshConnectionContext>::load_host_key(app, &profile) {
+            Ok(record) => record,
+            Err(error) => {
+                report.checks.push(LocalDoctorCheckResult {
+                    name: "SSH handshake".into(),
+                    status: LocalDoctorCheckStatus::Fail,
+                    detail: error.to_string(),
+                });
+                return report;
+            }
+        };
 
     let mut session = match ssh_client.connect(&profile, stored_host_key.as_ref()).await {
         Ok(session) => {
@@ -447,7 +452,9 @@ async fn resolve_profile_host(profile: &crate::store::Profile) -> Result<Vec<Soc
         .collect::<Vec<_>>();
 
     if resolved.is_empty() {
-        Err(Error::new("hostname did not resolve to any socket addresses"))
+        Err(Error::new(
+            "hostname did not resolve to any socket addresses",
+        ))
     } else {
         Ok(resolved)
     }
@@ -460,7 +467,7 @@ async fn tcp_reachability_check(
     let connect_future = async {
         for addr in resolved {
             if let Ok(stream) = TcpStream::connect(addr).await {
-                return Ok::<SocketAddr, Error>(stream.peer_addr().map_err(Error::from)?);
+                return stream.peer_addr().map_err(Error::from);
             }
         }
 

@@ -1,4 +1,4 @@
-use rusqlite::{params, ffi, ErrorCode, OptionalExtension, Row};
+use rusqlite::{ffi, params, ErrorCode, OptionalExtension, Row};
 
 use crate::error::{Error, Result};
 

@@ -37,6 +37,8 @@ use super::{
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
 type SshResultFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+type DirectTcpipResult = Box<dyn DirectTcpipStream + Send + Unpin + 'static>;
+type DirectTcpipFuture<'a> = Pin<Box<dyn Future<Output = Result<DirectTcpipResult>> + Send + 'a>>;
 pub trait DirectTcpipStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> DirectTcpipStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -96,14 +98,7 @@ pub trait SshSession: Send {
         _target_port: u16,
         _originator_host: &'a str,
         _originator_port: u16,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<Box<dyn DirectTcpipStream + Send + Unpin + 'static>>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> DirectTcpipFuture<'a> {
         Box::pin(async {
             Err(Error::new(
                 "ssh session does not support direct TCP forwarding",
@@ -540,14 +535,7 @@ impl SshSession for RusshSession {
         target_port: u16,
         originator_host: &'a str,
         originator_port: u16,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<Box<dyn DirectTcpipStream + Send + Unpin + 'static>>,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> DirectTcpipFuture<'a> {
         Box::pin(async move {
             let channel = self
                 .handle
@@ -694,6 +682,7 @@ impl SshSession for RusshSession {
             let mut local = if options.resume_offset > 0 {
                 OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .write(true)
                     .open(local_path)
                     .await?

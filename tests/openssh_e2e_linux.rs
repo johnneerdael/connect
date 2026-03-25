@@ -872,11 +872,7 @@ async fn socks5_greet(stream: &mut tokio::net::TcpStream) {
     assert_eq!(response, [5, 0]);
 }
 
-async fn socks5_connect_ipv4(
-    stream: &mut tokio::net::TcpStream,
-    address: [u8; 4],
-    port: u16,
-) {
+async fn socks5_connect_ipv4(stream: &mut tokio::net::TcpStream, address: [u8; 4], port: u16) {
     let mut request = vec![5, 1, 0, 1];
     request.extend_from_slice(&address);
     request.extend_from_slice(&port.to_be_bytes());

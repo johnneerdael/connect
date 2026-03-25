@@ -162,7 +162,11 @@ fn app_save_forward_enforces_local_and_socks_definition_invariants() {
         description: None,
     };
     assert_eq!(
-        harness.app().save_forward(invalid_local).unwrap_err().to_string(),
+        harness
+            .app()
+            .save_forward(invalid_local)
+            .unwrap_err()
+            .to_string(),
         "local forward requires target_host and target_port"
     );
 
@@ -177,7 +181,11 @@ fn app_save_forward_enforces_local_and_socks_definition_invariants() {
         description: None,
     };
     assert_eq!(
-        harness.app().save_forward(invalid_socks).unwrap_err().to_string(),
+        harness
+            .app()
+            .save_forward(invalid_socks)
+            .unwrap_err()
+            .to_string(),
         "socks forward must not include target_host or target_port"
     );
 }
@@ -190,9 +198,7 @@ fn forward_store_rejects_duplicate_name_for_profile_atomically() {
         .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
         .unwrap();
 
-    let store = ForwardStore::new(Database::new(
-        harness.root.join("data").join("connect.db"),
-    ));
+    let store = ForwardStore::new(Database::new(harness.root.join("data").join("connect.db")));
     let definition = ForwardDefinition {
         profile_name: "prod".into(),
         name: "db".into(),

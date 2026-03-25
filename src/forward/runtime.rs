@@ -8,8 +8,8 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     io::copy_bidirectional,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinSet,
     time::{self, MissedTickBehavior},
@@ -34,8 +34,20 @@ struct BoundForward {
 }
 
 enum ForwardRoute {
-    Local { target_host: String, target_port: u16 },
+    Local {
+        target_host: String,
+        target_port: u16,
+    },
     Socks,
+}
+
+struct OpenTunnelRequest<'a> {
+    forward_name: &'a str,
+    target_host: &'a str,
+    target_port: u16,
+    origin_host: &'a str,
+    origin_port: u16,
+    send_socks_success: bool,
 }
 
 pub async fn run_saved_forwards<F>(
@@ -86,7 +98,9 @@ where
             Ok(Err(error)) if result.is_ok() => return Err(error),
             Ok(Err(_)) => {}
             Err(error) if result.is_ok() => {
-                return Err(Error::new(format!("forward supervisor task failed: {error}")));
+                return Err(Error::new(format!(
+                    "forward supervisor task failed: {error}"
+                )));
             }
             Err(_) => {}
         }
@@ -191,13 +205,15 @@ async fn run_listener(
                     } => {
                         open_tunnel_or_continue(
                             &mut session,
-                            &forward_name,
                             local_stream,
-                            target_host,
-                            target_port,
-                            &origin_host,
-                            origin_port,
-                            false,
+                            OpenTunnelRequest {
+                                forward_name: &forward_name,
+                                target_host,
+                                target_port,
+                                origin_host: &origin_host,
+                                origin_port,
+                                send_socks_success: false,
+                            },
                             &mut proxy_tasks,
                         )
                         .await?;
@@ -263,13 +279,15 @@ async fn handle_socks_connection(
         SocksCommand::Connect => {
             open_tunnel_or_continue(
                 session,
-                forward_name,
                 local_stream,
-                &request.target_host,
-                request.target_port,
-                origin_host,
-                origin_port,
-                true,
+                OpenTunnelRequest {
+                    forward_name,
+                    target_host: &request.target_host,
+                    target_port: request.target_port,
+                    origin_host,
+                    origin_port,
+                    send_socks_success: true,
+                },
                 proxy_tasks,
             )
             .await
@@ -283,31 +301,32 @@ async fn handle_socks_connection(
 
 async fn open_tunnel_or_continue(
     session: &mut Box<dyn crate::ssh::SshSession + Send + 'static>,
-    forward_name: &str,
     mut local_stream: TcpStream,
-    target_host: &str,
-    target_port: u16,
-    origin_host: &str,
-    origin_port: u16,
-    send_socks_success: bool,
+    request: OpenTunnelRequest<'_>,
     proxy_tasks: &mut JoinSet<Result<()>>,
 ) -> Result<()> {
     match session
-        .open_direct_tcpip(target_host, target_port, origin_host, origin_port)
+        .open_direct_tcpip(
+            request.target_host,
+            request.target_port,
+            request.origin_host,
+            request.origin_port,
+        )
         .await
     {
         Ok(remote_stream) => {
-            if send_socks_success {
+            if request.send_socks_success {
                 write_socks_reply(&mut local_stream, SocksReply::Succeeded).await?;
             }
             proxy_tasks.spawn(proxy_connection(local_stream, remote_stream));
             Ok(())
         }
         Err(_) if !session.is_alive() => Err(Error::new(format!(
-            "ssh session for forward '{forward_name}' disconnected"
+            "ssh session for forward '{}' disconnected",
+            request.forward_name
         ))),
         Err(_) => {
-            if send_socks_success {
+            if request.send_socks_success {
                 let _ = write_socks_reply(&mut local_stream, SocksReply::GeneralFailure).await;
             }
             Ok(())
@@ -377,7 +396,8 @@ async fn read_socks_address(stream: &mut TcpStream, atyp: u8) -> Result<String> 
             stream.read_exact(&mut length).await?;
             let mut bytes = vec![0_u8; usize::from(length[0])];
             stream.read_exact(&mut bytes).await?;
-            String::from_utf8(bytes).map_err(|_| Error::new("SOCKS domain name was not valid utf-8"))
+            String::from_utf8(bytes)
+                .map_err(|_| Error::new("SOCKS domain name was not valid utf-8"))
         }
         SOCKS_ATYP_IPV6 => {
             let mut octets = [0_u8; 16];

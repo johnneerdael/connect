@@ -136,7 +136,9 @@ impl FromStr for ForwardKind {
         match value {
             "local" => Ok(Self::Local),
             "socks" | "socks5" => Ok(Self::Socks),
-            _ => Err(format!("invalid forward kind '{value}' (expected local or socks)")),
+            _ => Err(format!(
+                "invalid forward kind '{value}' (expected local or socks)"
+            )),
         }
     }
 }

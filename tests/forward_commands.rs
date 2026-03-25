@@ -14,9 +14,8 @@ use std::{
 use connect::{
     app::{App, AppPaths, ProfileSecretsInput},
     cli::{
-        commands::forward,
-        ForwardAddArgs, ForwardArgs, ForwardCommand, ForwardListArgs, ForwardRemoveArgs,
-        ForwardRunArgs,
+        commands::forward, ForwardAddArgs, ForwardArgs, ForwardCommand, ForwardListArgs,
+        ForwardRemoveArgs, ForwardRunArgs,
     },
     secrets::MemorySecretStore,
     ssh::{DirectTcpipStream, ObservedHostKey, SshClient, SshSession},
@@ -38,8 +37,7 @@ impl TestHarness {
         let root = unique_temp_path("connect-forward-tests");
         let paths = AppPaths::from_root(&root);
         let app = Arc::new(
-            App::new(paths, Arc::new(MemorySecretStore::default()))
-                .expect("app should initialize"),
+            App::new(paths, Arc::new(MemorySecretStore::default())).expect("app should initialize"),
         );
 
         Self { root, app }
@@ -206,10 +204,7 @@ fn forward_add_rejects_malformed_specs_and_impossible_ports() {
         &mut output,
     )
     .unwrap_err();
-    assert_eq!(
-        malformed_local.to_string(),
-        "target_port is required"
-    );
+    assert_eq!(malformed_local.to_string(), "target_port is required");
 
     let impossible_port = forward::run(
         harness.app(),
@@ -251,7 +246,10 @@ fn forward_run_rejects_missing_or_conflicting_selector_arguments() {
         &mut output,
     )
     .unwrap_err();
-    assert_eq!(missing_selector.to_string(), "forward run requires a name or --all");
+    assert_eq!(
+        missing_selector.to_string(),
+        "forward run requires a name or --all"
+    );
 
     let conflicting_selector = forward::run(
         harness.app(),
@@ -322,7 +320,9 @@ async fn forward_run_starts_only_the_named_saved_forward() {
         async move {
             wait_for_port(db_port).await;
             assert!(TcpStream::connect(("127.0.0.1", db_port)).await.is_ok());
-            assert!(TcpStream::connect(("127.0.0.1", metrics_port)).await.is_err());
+            assert!(TcpStream::connect(("127.0.0.1", metrics_port))
+                .await
+                .is_err());
         },
     )
     .await
@@ -371,7 +371,9 @@ async fn forward_run_with_all_binds_each_saved_local_forward() {
             wait_for_port(db_port).await;
             wait_for_port(metrics_port).await;
             assert!(TcpStream::connect(("127.0.0.1", db_port)).await.is_ok());
-            assert!(TcpStream::connect(("127.0.0.1", metrics_port)).await.is_ok());
+            assert!(TcpStream::connect(("127.0.0.1", metrics_port))
+                .await
+                .is_ok());
         },
     )
     .await
@@ -460,8 +462,14 @@ async fn forward_run_rejects_unsupported_socks_commands_without_killing_the_list
                 .await
                 .expect("SOCKS listener should accept the rejected command connection");
             socks5_greet(&mut rejected).await;
-            socks5_request(&mut rejected, 2, &["db.internal".len() as u8], b"db.internal", 5432)
-                .await;
+            socks5_request(
+                &mut rejected,
+                2,
+                &["db.internal".len() as u8],
+                b"db.internal",
+                5432,
+            )
+            .await;
             let reply = read_socks_reply(&mut rejected).await;
             assert_eq!(reply[1], 7);
             assert_eq!(ssh.open_count(), 0);
@@ -521,9 +529,9 @@ async fn forward_run_fails_startup_without_leaving_partial_listeners() {
     .await
     .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains(&format!("failed to bind local forward 'metrics' on 127.0.0.1:{blocked_port}")));
+    assert!(error.to_string().contains(&format!(
+        "failed to bind local forward 'metrics' on 127.0.0.1:{blocked_port}"
+    )));
     drop(blocker);
     assert!(
         StdTcpListener::bind(("127.0.0.1", first_port)).is_ok(),
@@ -739,20 +747,11 @@ impl Prompt for AcceptPrompt {
             .ok_or_else(|| connect::error::Error::new("prompt not expected"))
     }
 
-    fn prompt_secret(
-        &self,
-        _key: &str,
-        _message: &str,
-    ) -> connect::error::Result<Option<String>> {
+    fn prompt_secret(&self, _key: &str, _message: &str) -> connect::error::Result<Option<String>> {
         Ok(None)
     }
 
-    fn confirm(
-        &self,
-        _key: &str,
-        _message: &str,
-        _default: bool,
-    ) -> connect::error::Result<bool> {
+    fn confirm(&self, _key: &str, _message: &str, _default: bool) -> connect::error::Result<bool> {
         Ok(true)
     }
 }

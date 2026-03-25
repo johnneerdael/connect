@@ -1,11 +1,11 @@
 use std::{
-    future::Future,
     fs,
+    future::Future,
     net::TcpListener,
     path::PathBuf,
     pin::Pin,
-    thread,
     sync::{Arc, Mutex},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -253,9 +253,7 @@ fn doctor_command_routes_profile_through_binary_even_when_app_load_fails() {
         .stdout(predicates::str::contains(
             "FAIL database open/read/write sanity",
         ))
-        .stdout(predicates::str::contains(
-            "FAIL profile app initialization",
-        ));
+        .stdout(predicates::str::contains("FAIL profile app initialization"));
 }
 
 #[test]
@@ -288,10 +286,9 @@ async fn doctor_profile_reports_missing_profile_as_a_failed_check() {
     .await;
 
     assert!(!report.is_success());
-    assert!(report
-        .checks
-        .iter()
-        .any(|check| check.name == "profile exists" && check.status == LocalDoctorCheckStatus::Fail));
+    assert!(report.checks.iter().any(
+        |check| check.name == "profile exists" && check.status == LocalDoctorCheckStatus::Fail
+    ));
 }
 
 #[tokio::test]
@@ -330,8 +327,12 @@ async fn doctor_profile_reports_saved_host_key_presence_even_when_secret_lookup_
     .await;
 
     assert!(check_status(&report, "saved host key") == Some(LocalDoctorCheckStatus::Pass));
-    assert!(check_detail(&report, "saved host key").unwrap().contains("present"));
-    assert!(check_status(&report, "auth mode vs stored secrets") == Some(LocalDoctorCheckStatus::Fail));
+    assert!(check_detail(&report, "saved host key")
+        .unwrap()
+        .contains("present"));
+    assert!(
+        check_status(&report, "auth mode vs stored secrets") == Some(LocalDoctorCheckStatus::Fail)
+    );
 }
 
 #[tokio::test]
@@ -360,7 +361,10 @@ async fn doctor_profile_reports_saved_host_key_absence_even_when_secret_lookup_f
     .await;
 
     assert!(check_status(&report, "saved host key") == Some(LocalDoctorCheckStatus::Pass));
-    assert_eq!(check_detail(&report, "saved host key").as_deref(), Some("absent"));
+    assert_eq!(
+        check_detail(&report, "saved host key").as_deref(),
+        Some("absent")
+    );
 }
 
 #[tokio::test]
@@ -395,7 +399,9 @@ async fn doctor_profile_requires_password_for_password_only_auth_even_with_priva
 
     let auth_check = check_result(&report, "auth mode vs stored secrets").unwrap();
     assert_eq!(auth_check.status, LocalDoctorCheckStatus::Fail);
-    assert!(auth_check.detail.contains("password-only profiles require a stored password"));
+    assert!(auth_check
+        .detail
+        .contains("password-only profiles require a stored password"));
 }
 
 #[tokio::test]
@@ -430,7 +436,9 @@ async fn doctor_profile_accepts_private_key_material_for_stored_only_auth() {
 
     let auth_check = check_result(&report, "auth mode vs stored secrets").unwrap();
     assert_eq!(auth_check.status, LocalDoctorCheckStatus::Pass);
-    assert!(auth_check.detail.contains("stored-only has a stored private key"));
+    assert!(auth_check
+        .detail
+        .contains("stored-only has a stored private key"));
 }
 
 #[tokio::test]
@@ -461,21 +469,24 @@ async fn doctor_profile_reports_successful_live_checks_for_a_valid_profile() {
         "prod",
         &FakeDoctorSshClient::matched("127.0.0.1", harness.port),
     )
-        .await;
+    .await;
 
     assert!(report.is_success());
+    assert!(report.checks.iter().any(
+        |check| check.name == "profile exists" && check.status == LocalDoctorCheckStatus::Pass
+    ));
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "SSH handshake"
+                && check.status == LocalDoctorCheckStatus::Pass)
+    );
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "profile exists" && check.status == LocalDoctorCheckStatus::Pass));
-    assert!(report
-        .checks
-        .iter()
-        .any(|check| check.name == "SSH handshake" && check.status == LocalDoctorCheckStatus::Pass));
-    assert!(report
-        .checks
-        .iter()
-        .any(|check| check.name == "SSH auth usability" && check.status == LocalDoctorCheckStatus::Pass));
+        .any(|check| check.name == "SSH auth usability"
+            && check.status == LocalDoctorCheckStatus::Pass));
 }
 
 #[tokio::test]
@@ -516,13 +527,14 @@ async fn doctor_profile_rejects_a_host_key_mismatch() {
         "prod",
         &FakeDoctorSshClient::mismatched("127.0.0.1", harness.port),
     )
-        .await;
+    .await;
 
     assert!(!report.is_success());
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "host key verification" && check.status == LocalDoctorCheckStatus::Fail));
+        .any(|check| check.name == "host key verification"
+            && check.status == LocalDoctorCheckStatus::Fail));
 }
 
 #[tokio::test]
@@ -549,13 +561,14 @@ async fn doctor_profile_rejects_an_unusable_auth_mode() {
         "prod",
         &FakeDoctorSshClient::matched("127.0.0.1", harness.port),
     )
-        .await;
+    .await;
 
     assert!(!report.is_success());
     assert!(report
         .checks
         .iter()
-        .any(|check| check.name == "SSH auth usability" && check.status == LocalDoctorCheckStatus::Fail));
+        .any(|check| check.name == "SSH auth usability"
+            && check.status == LocalDoctorCheckStatus::Fail));
 }
 
 #[test]
@@ -571,7 +584,10 @@ fn doctor_output_includes_pass_details() {
 
     doctor::output::write_report(&report, &mut output).unwrap();
 
-    assert_eq!(String::from_utf8(output).unwrap(), "PASS check-a: all good\n");
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "PASS check-a: all good\n"
+    );
 }
 
 struct DoctorProfileHarness {
@@ -589,8 +605,12 @@ impl DoctorProfileHarness {
     fn with_secret_store(prefix: &str, secrets: Arc<dyn SecretStore>) -> Self {
         let root = TempRoot::new(prefix);
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
-        let port = listener.local_addr().expect("listener addr should resolve").port();
-        let app = App::new(AppPaths::from_root(&root.path), secrets).expect("app should initialize");
+        let port = listener
+            .local_addr()
+            .expect("listener addr should resolve")
+            .port();
+        let app =
+            App::new(AppPaths::from_root(&root.path), secrets).expect("app should initialize");
         Self {
             _root: root,
             _listener: listener,

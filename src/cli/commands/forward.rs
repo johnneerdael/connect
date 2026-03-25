@@ -7,10 +7,7 @@ use crate::{
         ForwardRunArgs,
     },
     error::{Error, Result},
-    forward::{
-        runtime::SavedForwardSelection,
-        spec::ForwardSpec,
-    },
+    forward::{runtime::SavedForwardSelection, spec::ForwardSpec},
     ssh::{RusshClient, SshClient},
     store::ForwardDefinition,
     terminal::prompt::Prompt,
@@ -33,15 +30,9 @@ pub fn run(
                 .enable_all()
                 .build()?;
             let ssh = RusshClient::new();
-            runtime.block_on(run_with_ssh_and_shutdown(
-                app,
-                prompt,
-                args,
-                &ssh,
-                async {
-                    let _ = tokio::signal::ctrl_c().await;
-                },
-            ))
+            runtime.block_on(run_with_ssh_and_shutdown(app, prompt, args, &ssh, async {
+                let _ = tokio::signal::ctrl_c().await;
+            }))
         }
     }
 }
@@ -121,7 +112,9 @@ where
         (None, true) => SavedForwardSelection::All,
         (None, false) => return Err(Error::new("forward run requires a name or --all")),
         (Some(_), true) => {
-            return Err(Error::new("forward run cannot accept both a name and --all"));
+            return Err(Error::new(
+                "forward run cannot accept both a name and --all",
+            ));
         }
     };
 

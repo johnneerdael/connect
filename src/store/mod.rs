@@ -1,6 +1,6 @@
 mod db;
-mod hostkey_store;
 mod forward_store;
+mod hostkey_store;
 mod models;
 mod profile_store;
 
