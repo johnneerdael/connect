@@ -29,13 +29,6 @@ impl ForwardStore {
                 description
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(profile_name, name) DO UPDATE SET
-                kind = excluded.kind,
-                bind_host = excluded.bind_host,
-                bind_port = excluded.bind_port,
-                target_host = excluded.target_host,
-                target_port = excluded.target_port,
-                description = excluded.description
             ",
             params![
                 &definition.profile_name,

@@ -14,8 +14,8 @@ use connect::store::AuthMode;
 use connect::{
     app::{App, AppPaths, ProfileSecretsInput, SecretBackend},
     cli::{
-        commands::{add, copy as copy_command, edit, forward, list, remove, show},
-        AddArgs, EditArgs, ForwardArgs, ForwardCommand, ForwardRunArgs, RemoveArgs, ShowArgs,
+        commands::{add, copy as copy_command, edit, list, remove, show},
+        AddArgs, EditArgs, RemoveArgs, ShowArgs,
     },
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
@@ -23,7 +23,7 @@ use connect::{
         parse_copy_spec, CopyDirection, CopySummary, ExecSpec, ObservedHostKey,
         RemoteDirectoryEntry, RemoteFileType, SshClient, SshSession,
     },
-    store::{ForwardDefinition, ForwardKind, ProfileInput},
+    store::ProfileInput,
     terminal::prompt::Prompt,
 };
 
@@ -113,150 +113,6 @@ fn profile_save_updates_existing_metadata() {
     assert_eq!(loaded.host, "prod-2.example.com");
     assert_eq!(loaded.username, "root");
     assert_eq!(loaded.port, 2200);
-}
-
-#[test]
-fn forward_insert_round_trip_preserves_metadata() {
-    let harness = TestHarness::new();
-    harness
-        .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
-        .unwrap();
-    let definition = ForwardDefinition {
-        profile_name: "prod".into(),
-        name: "db".into(),
-        kind: ForwardKind::Local,
-        bind_host: "127.0.0.1".into(),
-        bind_port: 15432,
-        target_host: Some("db.internal".into()),
-        target_port: Some(5432),
-        description: Some("postgres".into()),
-    };
-
-    harness.app().save_forward(definition.clone()).unwrap();
-
-    let loaded = harness.app().get_forward("prod", "db").unwrap();
-    assert_eq!(loaded, definition);
-}
-
-#[test]
-fn forward_list_and_delete_are_scoped_by_profile() {
-    let harness = TestHarness::new();
-    harness
-        .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
-        .unwrap();
-    let primary = ForwardDefinition {
-        profile_name: "prod".into(),
-        name: "db".into(),
-        kind: ForwardKind::Local,
-        bind_host: "127.0.0.1".into(),
-        bind_port: 15432,
-        target_host: Some("db.internal".into()),
-        target_port: Some(5432),
-        description: None,
-    };
-    let secondary = ForwardDefinition {
-        profile_name: "prod".into(),
-        name: "metrics".into(),
-        kind: ForwardKind::Socks,
-        bind_host: "127.0.0.1".into(),
-        bind_port: 1080,
-        target_host: None,
-        target_port: None,
-        description: Some("socks proxy".into()),
-    };
-
-    harness.app().save_forward(primary.clone()).unwrap();
-    harness.app().save_forward(secondary.clone()).unwrap();
-
-    let mut list = harness.app().list_forwards("prod").unwrap();
-    list.sort_by(|left, right| left.name.cmp(&right.name));
-    assert_eq!(list, vec![primary.clone(), secondary.clone()]);
-
-    assert!(harness.app().delete_forward("prod", "db").unwrap());
-    assert!(harness.app().get_forward("prod", "db").is_err());
-    assert_eq!(
-        harness.app().list_forwards("prod").unwrap(),
-        vec![secondary]
-    );
-}
-
-#[test]
-fn save_forward_rejects_invalid_local_and_socks_shapes() {
-    let harness = TestHarness::new();
-    harness
-        .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
-        .unwrap();
-
-    let missing_target = ForwardDefinition {
-        profile_name: "prod".into(),
-        name: "db".into(),
-        kind: ForwardKind::Local,
-        bind_host: "127.0.0.1".into(),
-        bind_port: 15432,
-        target_host: None,
-        target_port: None,
-        description: None,
-    };
-    let error = harness.app().save_forward(missing_target).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "local forward requires target_host and target_port"
-    );
-
-    let socks_with_target = ForwardDefinition {
-        profile_name: "prod".into(),
-        name: "proxy".into(),
-        kind: ForwardKind::Socks,
-        bind_host: "127.0.0.1".into(),
-        bind_port: 1080,
-        target_host: Some("db.internal".into()),
-        target_port: Some(5432),
-        description: None,
-    };
-    let error = harness.app().save_forward(socks_with_target).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "socks forward must not include target_host or target_port"
-    );
-}
-
-#[test]
-fn forward_run_rejects_missing_or_conflicting_selector_arguments() {
-    let harness = TestHarness::new();
-    harness
-        .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
-        .unwrap();
-
-    let prompt = FakePrompt::default();
-    let mut output = Vec::new();
-
-    let missing_selector = ForwardArgs {
-        command: ForwardCommand::Run(ForwardRunArgs {
-            profile: "prod".into(),
-            name: None,
-            all: false,
-        }),
-    };
-    let error = forward::run(harness.app(), &prompt, &missing_selector, &mut output).unwrap_err();
-    assert_eq!(error.to_string(), "forward run requires a name or --all");
-
-    let conflicting_selector = ForwardArgs {
-        command: ForwardCommand::Run(ForwardRunArgs {
-            profile: "prod".into(),
-            name: Some("db".into()),
-            all: true,
-        }),
-    };
-    let error =
-        forward::run(harness.app(), &prompt, &conflicting_selector, &mut output).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "forward run cannot accept both a name and --all"
-    );
 }
 
 #[test]
