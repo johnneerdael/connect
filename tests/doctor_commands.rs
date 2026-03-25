@@ -1,5 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use assert_cmd::Command as AssertCommand;
 use connect::{
     doctor::{
         self,
@@ -9,6 +14,36 @@ use connect::{
     },
     error::Error,
 };
+
+fn connect_test_bin() -> AssertCommand {
+    AssertCommand::cargo_bin("connect").expect("binary should build")
+}
+
+fn unique_temp_root(prefix: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{stamp}-{}", std::process::id()))
+}
+
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new(prefix: &str) -> Self {
+        let path = unique_temp_root(prefix);
+        fs::create_dir_all(&path).expect("temp root should be creatable");
+        Self { path }
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 #[derive(Clone)]
 struct FakeDoctorEnvironment {
@@ -133,4 +168,47 @@ fn doctor_report_aggregation_marks_all_passes_as_success() {
 
     assert!(report.is_success());
     assert_eq!(report.exit_code(), 0);
+}
+
+#[test]
+fn doctor_command_routes_through_binary_for_success() {
+    let root = TempRoot::new("connect-doctor-success");
+
+    connect_test_bin()
+        .env("CONNECT_APP_ROOT", &root.path)
+        .env("SSH_AUTH_SOCK", "/tmp/connect-doctor-agent.sock")
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(concat!(
+            "PASS app path resolution\n",
+            "PASS database open/read/write sanity\n",
+            "PASS secret backend initialization\n",
+            "PASS SSH agent availability\n",
+        ));
+}
+
+#[test]
+fn doctor_command_routes_through_binary_for_failure() {
+    let root = TempRoot::new("connect-doctor-failure");
+
+    connect_test_bin()
+        .env("CONNECT_APP_ROOT", &root.path)
+        .env_remove("SSH_AUTH_SOCK")
+        .args(["doctor"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("FAIL SSH agent availability"));
+}
+
+#[test]
+fn doctor_command_rejects_an_unexpected_profile_argument() {
+    let root = TempRoot::new("connect-doctor-profile-rejected");
+
+    connect_test_bin()
+        .env("CONNECT_APP_ROOT", &root.path)
+        .args(["doctor", "prod"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unexpected argument 'prod'"));
 }

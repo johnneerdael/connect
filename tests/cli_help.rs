@@ -1,5 +1,6 @@
 use assert_cmd::Command as AssertCommand;
 use clap::Parser;
+use predicates::prelude::PredicateBooleanExt;
 
 use connect::cli::{Cli, Command as CliCommand, ForwardCommand};
 
@@ -73,20 +74,20 @@ fn completion_command_accepts_shell_argument() {
 }
 
 #[test]
-fn doctor_parses_with_and_without_profile_subcommand() {
+fn doctor_parses_as_local_only_command() {
     let local = parse_cli(&["connect", "doctor"]);
-    match local.command {
-        Some(CliCommand::Doctor(args)) => assert!(args.profile.is_none()),
-        other => panic!("expected doctor command, got {other:?}"),
-    }
+    assert!(matches!(local.command, Some(CliCommand::Doctor(_))));
     assert!(local.profile.is_none());
+}
 
-    let remote = parse_cli(&["connect", "doctor", "prod"]);
-    match remote.command {
-        Some(CliCommand::Doctor(args)) => assert_eq!(args.profile.as_deref(), Some("prod")),
-        other => panic!("expected doctor command, got {other:?}"),
-    }
-    assert!(remote.profile.is_none());
+#[test]
+fn doctor_help_does_not_advertise_a_profile_argument() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Inspect the local environment"))
+        .stdout(predicates::str::contains("PROFILE").not());
 }
 
 #[test]
@@ -105,7 +106,10 @@ fn forward_add_and_run_parse_with_explicit_subcommands() {
             ForwardCommand::Add(args) => {
                 assert_eq!(args.profile, "prod");
                 assert_eq!(args.name, "db");
-                assert_eq!(args.local.as_deref(), Some("127.0.0.1:15432:db.internal:5432"));
+                assert_eq!(
+                    args.local.as_deref(),
+                    Some("127.0.0.1:15432:db.internal:5432")
+                );
                 assert!(args.socks.is_none());
             }
             other => panic!("expected forward add command, got {other:?}"),

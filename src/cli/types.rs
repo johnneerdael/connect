@@ -27,7 +27,7 @@ pub enum Command {
     Open(OpenArgs),
     /// Execute a remote command without opening an interactive shell.
     Exec(ExecArgs),
-    /// Inspect the local environment and an optional saved profile.
+    /// Inspect the local environment.
     Doctor(DoctorArgs),
     /// Add a new SSH profile.
     Add(AddArgs),
@@ -151,11 +151,8 @@ pub struct ExecArgs {
     pub command: Vec<String>,
 }
 
-#[derive(Args, Debug, Clone)]
-pub struct DoctorArgs {
-    #[arg(value_name = "PROFILE")]
-    pub profile: Option<String>,
-}
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorArgs;
 
 #[derive(Args, Debug, Clone)]
 #[command(subcommand_required = true, arg_required_else_help = true)]
