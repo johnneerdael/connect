@@ -43,6 +43,15 @@ CONNECT_INSTALL_PREFIX="$HOME/.local" ./install.sh
 
 Install the `.pkg` release artifact. The package installs `connect` to `/usr/local/bin/connect` and ensures `/usr/local/bin` is available on `PATH` for new shell sessions.
 
+Tagged macOS releases can be signed in GitHub Actions when these repository secrets are configured:
+
+- `MACOS_DEVELOPER_ID_APPLICATION_P12`
+- `MACOS_DEVELOPER_ID_INSTALLER_P12`
+- `MACOS_DEVELOPER_ID_P12_PASSWORD`
+- `MACOS_KEYCHAIN_PASSWORD`
+
+The certificate payload secrets should contain base64-encoded `.p12` files for your `Developer ID Application` and `Developer ID Installer` certificates. When the secrets are absent, the workflow still produces an unsigned `.pkg` so local development and forks do not break.
+
 ### Windows
 
 Install the `.msi` release artifact. The installer places `connect.exe` under `Program Files` and updates the machine `PATH`.
@@ -258,3 +267,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 cargo test
 ```
+
+## Release Signing
+
+The GitHub Actions release workflow supports optional macOS signing for tagged releases.
+
+When signing secrets are present, the macOS job will:
+
+- import the `Developer ID Application` certificate into a temporary keychain
+- import the `Developer ID Installer` certificate into a temporary keychain
+- codesign the `connect` binary before packaging
+- sign the generated `.pkg` with `productsign`
+
+When the secrets are not configured, the workflow falls back to unsigned macOS packaging automatically.

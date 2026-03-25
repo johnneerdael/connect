@@ -37,6 +37,49 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Default macOS signing state
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          echo "MACOS_SIGNING_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Import macOS signing certificates
+        if: matrix.kind == 'macos' && secrets.MACOS_DEVELOPER_ID_APPLICATION_P12 != '' && secrets.MACOS_DEVELOPER_ID_INSTALLER_P12 != '' && secrets.MACOS_DEVELOPER_ID_P12_PASSWORD != '' && secrets.MACOS_KEYCHAIN_PASSWORD != ''
+        shell: bash
+        env:
+          MACOS_DEVELOPER_ID_APPLICATION_P12: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION_P12 }}
+          MACOS_DEVELOPER_ID_INSTALLER_P12: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12 }}
+          MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/connect-signing.keychain-db"
+          APP_CERT_PATH="$RUNNER_TEMP/connect-app-cert.p12"
+          INSTALLER_CERT_PATH="$RUNNER_TEMP/connect-installer-cert.p12"
+
+          echo "$MACOS_DEVELOPER_ID_APPLICATION_P12" | base64 --decode > "$APP_CERT_PATH"
+          echo "$MACOS_DEVELOPER_ID_INSTALLER_P12" | base64 --decode > "$INSTALLER_CERT_PATH"
+
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$APP_CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$INSTALLER_CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/productsign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          APP_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'\"' '/Developer ID Application/ {print $2; exit}')"
+          INSTALLER_IDENTITY="$(security find-identity -v "$KEYCHAIN_PATH" | awk -F'\"' '/Developer ID Installer/ {print $2; exit}')"
+
+          if [ -z "$APP_IDENTITY" ] || [ -z "$INSTALLER_IDENTITY" ]; then
+            echo "Unable to locate imported Developer ID identities" >&2
+            exit 1
+          fi
+
+          echo "MACOS_SIGNING_ENABLED=true" >> "$GITHUB_ENV"
+          echo "MACOS_CODESIGN_IDENTITY=$APP_IDENTITY" >> "$GITHUB_ENV"
+          echo "MACOS_INSTALLER_IDENTITY=$INSTALLER_IDENTITY" >> "$GITHUB_ENV"
+
       - name: Package Linux tarball
         if: matrix.kind == 'linux'
         shell: bash
@@ -58,6 +101,9 @@ jobs:
           mkdir -p distroot/usr/local/bin dist
           cp target/release/connect distroot/usr/local/bin/connect
           chmod 755 distroot/usr/local/bin/connect
+          if [ "${MACOS_SIGNING_ENABLED:-false}" = "true" ]; then
+            codesign --force --timestamp --options runtime --sign "$MACOS_CODESIGN_IDENTITY" distroot/usr/local/bin/connect
+          fi
           pkgbuild \
             --root distroot \
             --scripts packaging/macos \
@@ -65,6 +111,10 @@ jobs:
             --version "$version" \
             --install-location / \
             dist/${{ matrix.package_name }}
+          if [ "${MACOS_SIGNING_ENABLED:-false}" = "true" ]; then
+            productsign --sign "$MACOS_INSTALLER_IDENTITY" dist/${{ matrix.package_name }} dist/connect-macos-signed.pkg
+            mv dist/connect-macos-signed.pkg dist/${{ matrix.package_name }}
+          fi
 
       - name: Install WiX
         if: matrix.kind == 'windows'
@@ -93,3 +143,12 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.package_name }}
+
+      - name: Clean up macOS signing keychain
+        if: always() && matrix.kind == 'macos'
+        shell: bash
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/connect-signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi

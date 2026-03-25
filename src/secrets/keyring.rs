@@ -247,7 +247,9 @@ impl KeyringSecretStore {
         profile_name: &str,
         field: impl FnOnce(&SecretBundle) -> Option<String>,
     ) -> Result<Option<String>> {
-        Ok(self.load_bundle(profile_name)?.and_then(|bundle| field(&bundle)))
+        Ok(self
+            .load_bundle(profile_name)?
+            .and_then(|bundle| field(&bundle)))
     }
 
     fn delete_legacy_entries(&self, profile_name: &str) -> Result<()> {
@@ -261,7 +263,9 @@ impl KeyringSecretStore {
 
 impl SecretStore for KeyringSecretStore {
     fn set_password(&self, profile_name: &str, password: &str) -> Result<()> {
-        self.update_bundle(profile_name, |bundle| bundle.with_password(Some(password.into())))
+        self.update_bundle(profile_name, |bundle| {
+            bundle.with_password(Some(password.into()))
+        })
     }
 
     fn get_password(&self, profile_name: &str) -> Result<Option<String>> {
@@ -269,7 +273,9 @@ impl SecretStore for KeyringSecretStore {
     }
 
     fn set_private_key(&self, profile_name: &str, pem: &str) -> Result<()> {
-        self.update_bundle(profile_name, |bundle| bundle.with_private_key(Some(pem.into())))
+        self.update_bundle(profile_name, |bundle| {
+            bundle.with_private_key(Some(pem.into()))
+        })
     }
 
     fn get_private_key(&self, profile_name: &str) -> Result<Option<String>> {
@@ -390,7 +396,10 @@ mod tests {
 
         store.delete_profile_secrets("prod").unwrap();
 
-        assert!(backend.get_secret(&KeyringSecretStore::bundle_account("prod")).unwrap().is_none());
+        assert!(backend
+            .get_secret(&KeyringSecretStore::bundle_account("prod"))
+            .unwrap()
+            .is_none());
         assert!(backend.legacy_entries_deleted("prod"));
     }
 
@@ -421,18 +430,16 @@ mod tests {
         ) -> Arc<Self> {
             let backend = Arc::new(Self::default());
             if let Some(password) = password {
-                backend
-                    .secrets
-                    .lock()
-                    .unwrap()
-                    .insert(secret_key(profile_name, PASSWORD_SUFFIX), password.to_string());
+                backend.secrets.lock().unwrap().insert(
+                    secret_key(profile_name, PASSWORD_SUFFIX),
+                    password.to_string(),
+                );
             }
             if let Some(private_key) = private_key {
-                backend
-                    .secrets
-                    .lock()
-                    .unwrap()
-                    .insert(secret_key(profile_name, PRIVATE_KEY_SUFFIX), private_key.to_string());
+                backend.secrets.lock().unwrap().insert(
+                    secret_key(profile_name, PRIVATE_KEY_SUFFIX),
+                    private_key.to_string(),
+                );
             }
             if let Some(key_passphrase) = key_passphrase {
                 backend.secrets.lock().unwrap().insert(

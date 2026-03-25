@@ -29,13 +29,25 @@ fn packaging_assets_exist() {
             "cargo metadata --no-deps --format-version 1",
             "ConvertFrom-Json",
             "GITHUB_REF_NAME",
+            "MACOS_DEVELOPER_ID_APPLICATION_P12",
+            "MACOS_DEVELOPER_ID_INSTALLER_P12",
+            "security create-keychain",
+            "codesign",
+            "productsign",
             "pkgbuild",
             "wix build",
         ],
     );
     assert_file_contains(
         &repo_root.join("README.md"),
-        ["connect add", "connect copy", "hostkeys", "install"],
+        [
+            "connect add",
+            "connect copy",
+            "hostkeys",
+            "install",
+            "MACOS_DEVELOPER_ID_APPLICATION_P12",
+            "Developer ID Application",
+        ],
     );
     assert_file_contains(&repo_root.join("Cargo.toml"), ["readme = \"README.md\""]);
 }
