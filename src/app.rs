@@ -10,8 +10,8 @@ use directories::ProjectDirs;
 use crate::{
     cli::{
         commands::{
-            add, completion, copy, doctor, edit, exec, forward, hostkeys, list, open, remove,
-            show, version,
+            add, completion, copy, doctor, edit, exec, forward, hostkeys, list, open, remove, show,
+            version,
         },
         Cli, Command, HostkeysCommand,
     },
@@ -179,13 +179,11 @@ impl App {
 
     pub fn get_forward(&self, profile_name: &str, name: &str) -> Result<ForwardDefinition> {
         self.get_profile(profile_name)?;
-        self.forward_store
-            .get(profile_name, name)?
-            .ok_or_else(|| {
-                Error::new(format!(
-                    "forward '{name}' was not found for profile '{profile_name}'"
-                ))
-            })
+        self.forward_store.get(profile_name, name)?.ok_or_else(|| {
+            Error::new(format!(
+                "forward '{name}' was not found for profile '{profile_name}'"
+            ))
+        })
     }
 
     pub fn list_forwards(&self, profile_name: &str) -> Result<Vec<ForwardDefinition>> {
@@ -444,8 +442,12 @@ pub fn run() -> Result<()> {
             add::run(&app, &prompt, &args, &mut stdout)
         }
         Some(Command::Doctor(args)) => {
-            let app = App::load()?;
-            doctor::run(&app, &args, &mut stdout)
+            let report = doctor::run(&args, &mut stdout)?;
+            if report.is_success() {
+                Ok(())
+            } else {
+                Err(Error::new("doctor checks failed"))
+            }
         }
         Some(Command::Edit(args)) => {
             let app = App::load()?;

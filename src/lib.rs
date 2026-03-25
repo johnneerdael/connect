@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod doctor;
 pub mod error;
 pub mod secrets;
 pub mod ssh;
