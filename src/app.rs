@@ -16,6 +16,7 @@ use crate::{
         Cli, Command, HostkeysCommand,
     },
     error::{Error, Result},
+    forward::runtime::{run_saved_forwards, SavedForwardSelection},
     secrets::{KeyringSecretStore, SecretStore},
     ssh::{
         copy_profile as ssh_copy_profile, exec_profile as ssh_exec_profile,
@@ -311,6 +312,26 @@ impl App {
     ) -> Result<crate::ssh::CopySummary> {
         let profile = self.get_profile(spec.remote_profile())?;
         ssh_copy_profile(ssh, spec, &profile, self, prompt).await
+    }
+
+    pub async fn run_saved_forward<F>(
+        &self,
+        profile_name: &str,
+        selection: SavedForwardSelection,
+        ssh: &dyn SshClient,
+        prompt: &dyn crate::terminal::prompt::Prompt,
+        shutdown: F,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        let profile = self.get_profile(profile_name)?;
+        let definitions = match selection {
+            SavedForwardSelection::Named(name) => vec![self.get_forward(profile_name, &name)?],
+            SavedForwardSelection::All => self.list_forwards(profile_name)?,
+        };
+
+        run_saved_forwards(ssh, &profile, definitions, self, prompt, shutdown).await
     }
 }
 

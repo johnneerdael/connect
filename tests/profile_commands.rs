@@ -144,6 +144,45 @@ fn app_save_forward_rejects_duplicate_name_for_profile() {
 }
 
 #[test]
+fn app_save_forward_enforces_local_and_socks_definition_invariants() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let invalid_local = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: None,
+        target_port: Some(5432),
+        description: None,
+    };
+    assert_eq!(
+        harness.app().save_forward(invalid_local).unwrap_err().to_string(),
+        "local forward requires target_host and target_port"
+    );
+
+    let invalid_socks = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "proxy".into(),
+        kind: ForwardKind::Socks,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 1080,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+    assert_eq!(
+        harness.app().save_forward(invalid_socks).unwrap_err().to_string(),
+        "socks forward must not include target_host or target_port"
+    );
+}
+
+#[test]
 fn forward_store_rejects_duplicate_name_for_profile_atomically() {
     let harness = TestHarness::new();
     harness

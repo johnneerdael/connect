@@ -22,6 +22,10 @@ use connect::{
 };
 use filetime::{set_file_mtime, FileTime};
 use tempfile::TempDir;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener as TokioTcpListener,
+};
 
 #[tokio::test]
 async fn openssh_end_to_end_supports_tofu_exec_agent_auth_and_recursive_copy() {
@@ -221,6 +225,65 @@ async fn openssh_end_to_end_supports_resumable_upload_and_download() {
         fs::read_to_string(&download_local).expect("downloaded file should exist"),
         "download-resume"
     );
+}
+
+#[tokio::test]
+async fn openssh_end_to_end_supports_saved_local_tcp_forward_run() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let ssh = RusshClient::new();
+    let app = harness.app_with_profile("forward", AuthMode::StoredOnly, true);
+    let remote_port = allocate_port();
+    let local_port = allocate_port();
+
+    app.save_forward(
+        connect::forward::spec::ForwardSpec::parse_local(&format!(
+            "127.0.0.1:{local_port}:127.0.0.1:{remote_port}"
+        ))
+        .expect("forward spec should parse")
+        .into_definition("forward", "echo", None),
+    )
+    .expect("forward should save");
+
+    let remote_listener = TokioTcpListener::bind(("127.0.0.1", remote_port))
+        .await
+        .expect("remote listener should bind");
+    let remote_task = tokio::spawn(async move {
+        let (mut socket, _) = remote_listener
+            .accept()
+            .await
+            .expect("remote listener should accept");
+        let mut request = [0_u8; 4];
+        socket
+            .read_exact(&mut request)
+            .await
+            .expect("request should arrive through SSH");
+        assert_eq!(&request, b"ping");
+        socket
+            .write_all(b"pong")
+            .await
+            .expect("response should travel through SSH");
+    });
+
+    run_saved_forward_until(&app, &ssh, &prompt, "forward", "echo", async move {
+        wait_for_tokio_port(local_port).await;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .expect("local forwarded listener should accept");
+        client
+            .write_all(b"ping")
+            .await
+            .expect("request should be sent");
+        let mut response = [0_u8; 4];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("response should be readable");
+        assert_eq!(&response, b"pong");
+    })
+    .await
+    .unwrap();
+    remote_task.await.unwrap();
 }
 
 struct PassingDoctorEnvironment;
@@ -686,6 +749,55 @@ fn wait_for_port(port: u16, log_path: &Path) {
         "sshd did not start listening on port {port}\n{}",
         read_optional(log_path)
     );
+}
+
+async fn wait_for_tokio_port(port: u16) {
+    for _ in 0..100 {
+        if TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("port {port} did not start listening in time");
+}
+
+async fn run_saved_forward_until<F>(
+    app: &App,
+    ssh: &RusshClient,
+    prompt: &dyn Prompt,
+    profile: &str,
+    forward_name: &str,
+    checks: F,
+) -> connect::error::Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run = app.run_saved_forward(
+        profile,
+        connect::forward::runtime::SavedForwardSelection::Named(forward_name.into()),
+        ssh,
+        prompt,
+        {
+            let shutdown = Arc::clone(&shutdown);
+            async move {
+                while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        },
+    );
+    tokio::pin!(run);
+    tokio::pin!(checks);
+
+    tokio::select! {
+        result = &mut run => result,
+        _ = &mut checks => {
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            run.await
+        }
+    }
 }
 
 fn read_optional(path: &Path) -> String {

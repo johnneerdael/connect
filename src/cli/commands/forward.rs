@@ -7,7 +7,11 @@ use crate::{
         ForwardRunArgs,
     },
     error::{Error, Result},
-    forward::spec::ForwardSpec,
+    forward::{
+        runtime::SavedForwardSelection,
+        spec::ForwardSpec,
+    },
+    ssh::{RusshClient, SshClient},
     store::ForwardDefinition,
     terminal::prompt::Prompt,
 };
@@ -24,7 +28,21 @@ pub fn run(
         ForwardCommand::Add(args) => add(app, args, writer),
         ForwardCommand::List(args) => list(app, args, writer),
         ForwardCommand::Remove(args) => remove(app, prompt, args, writer),
-        ForwardCommand::Run(args) => run_forward(app, args, writer),
+        ForwardCommand::Run(args) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let ssh = RusshClient::new();
+            runtime.block_on(run_with_ssh_and_shutdown(
+                app,
+                prompt,
+                args,
+                &ssh,
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+            ))
+        }
     }
 }
 
@@ -85,32 +103,30 @@ fn remove(
     }
 }
 
-fn run_forward(app: &App, args: &ForwardRunArgs, writer: &mut dyn Write) -> Result<()> {
+pub async fn run_with_ssh_and_shutdown<F>(
+    app: &App,
+    prompt: &dyn Prompt,
+    args: &ForwardRunArgs,
+    ssh: &dyn SshClient,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
     let profile = validate_non_empty("profile", args.profile.clone())?;
-    match (&args.name, args.all) {
+    let selection = match (&args.name, args.all) {
         (Some(name), false) => {
-            let name = validate_non_empty("name", name.clone())?;
-            let _ = app.get_forward(&profile, &name)?;
-            writeln!(
-                writer,
-                "Validated forward '{name}' for profile '{profile}'."
-            )
-            .map_err(Error::from)
+            SavedForwardSelection::Named(validate_non_empty("name", name.clone())?)
         }
-        (None, true) => {
-            let forwards = app.list_forwards(&profile)?;
-            writeln!(
-                writer,
-                "Validated {} saved forward(s) for profile '{profile}'.",
-                forwards.len()
-            )
-            .map_err(Error::from)
+        (None, true) => SavedForwardSelection::All,
+        (None, false) => return Err(Error::new("forward run requires a name or --all")),
+        (Some(_), true) => {
+            return Err(Error::new("forward run cannot accept both a name and --all"));
         }
-        (None, false) => Err(Error::new("forward run requires a name or --all")),
-        (Some(_), true) => Err(Error::new(
-            "forward run cannot accept both a name and --all",
-        )),
-    }
+    };
+
+    app.run_saved_forward(&profile, selection, ssh, prompt, shutdown)
+        .await
 }
 
 fn format_forward_definition(definition: &ForwardDefinition) -> String {

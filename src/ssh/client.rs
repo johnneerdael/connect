@@ -37,6 +37,8 @@ use super::{
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
 type SshResultFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+pub trait DirectTcpipStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> DirectTcpipStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_MAX_MISSES: usize = 3;
 #[cfg(windows)]
@@ -86,6 +88,31 @@ pub trait SshSession: Send {
                 "ssh session does not support remote command execution",
             ))
         })
+    }
+
+    fn open_direct_tcpip<'a>(
+        &'a mut self,
+        _target_host: &'a str,
+        _target_port: u16,
+        _originator_host: &'a str,
+        _originator_port: u16,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Box<dyn DirectTcpipStream + Send + Unpin + 'static>>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(Error::new(
+                "ssh session does not support direct TCP forwarding",
+            ))
+        })
+    }
+
+    fn is_alive(&self) -> bool {
+        true
     }
 
     fn disconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
@@ -505,6 +532,40 @@ impl SshSession for RusshSession {
                 .await
                 .map_err(map_ssh_error)
         })
+    }
+
+    fn open_direct_tcpip<'a>(
+        &'a mut self,
+        target_host: &'a str,
+        target_port: u16,
+        originator_host: &'a str,
+        originator_port: u16,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Box<dyn DirectTcpipStream + Send + Unpin + 'static>>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let channel = self
+                .handle
+                .channel_open_direct_tcpip(
+                    target_host,
+                    u32::from(target_port),
+                    originator_host,
+                    u32::from(originator_port),
+                )
+                .await
+                .map_err(map_ssh_error)?;
+            Ok(Box::new(channel.into_stream())
+                as Box<dyn DirectTcpipStream + Send + Unpin + 'static>)
+        })
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.handle.is_closed()
     }
 
     fn remote_file_type<'a>(
