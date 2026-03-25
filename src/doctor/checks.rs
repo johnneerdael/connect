@@ -1,13 +1,14 @@
-use std::fs;
+use std::{fs, net::SocketAddr};
 
 use rusqlite::params;
 use tokio::runtime::Builder;
+use tokio::{net::{lookup_host, TcpStream}, time::{timeout, Duration}};
 
 use crate::{
     app::AppPaths,
     error::{Error, Result},
     secrets::KeyringSecretStore,
-    ssh,
+    ssh::{self, authenticate_session, verify_observed_host_key, HostKeyVerification, SshClient, SshConnectionContext},
     store::Database,
 };
 
@@ -145,6 +146,287 @@ pub fn collect_local_checks(env: &dyn DoctorEnvironment) -> LocalDoctorReport {
     });
 
     LocalDoctorReport { checks }
+}
+
+pub async fn collect_profile_checks(
+    env: &dyn DoctorEnvironment,
+    app: &crate::app::App,
+    profile_name: &str,
+    ssh_client: &dyn SshClient,
+) -> LocalDoctorReport {
+    let mut report = collect_local_checks(env);
+    let profile = match app.get_profile(profile_name) {
+        Ok(profile) => profile,
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "profile exists".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    report.checks.push(LocalDoctorCheckResult {
+        name: "profile exists".into(),
+        status: LocalDoctorCheckStatus::Pass,
+        detail: format!(
+            "loaded {}@{}:{}",
+            profile.username, profile.host, profile.port
+        ),
+    });
+
+    let auth = match <crate::app::App as SshConnectionContext>::load_profile_auth(app, &profile) {
+        Ok(auth) => auth,
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "stored secrets consistency".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    report
+        .checks
+        .push(secret_consistency_check(&profile, &auth));
+    report
+        .checks
+        .push(saved_host_key_check(app, &profile));
+
+    let resolved = match resolve_profile_host(&profile).await {
+        Ok(resolved) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "hostname resolution".into(),
+                status: LocalDoctorCheckStatus::Pass,
+                detail: format!(
+                    "resolved {} to {}",
+                    profile.host,
+                    join_addresses(&resolved)
+                ),
+            });
+            resolved
+        }
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "hostname resolution".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    match tcp_reachability_check(&profile, &resolved).await {
+        Ok(addr) => report.checks.push(LocalDoctorCheckResult {
+            name: "TCP reachability".into(),
+            status: LocalDoctorCheckStatus::Pass,
+            detail: format!("connected to {addr}"),
+        }),
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "TCP reachability".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    }
+
+    let stored_host_key = match <crate::app::App as SshConnectionContext>::load_host_key(app, &profile) {
+        Ok(record) => record,
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "SSH handshake".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    let mut session = match ssh_client.connect(&profile, None).await {
+        Ok(session) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "SSH handshake".into(),
+                status: LocalDoctorCheckStatus::Pass,
+                detail: "connected".into(),
+            });
+            session
+        }
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "SSH handshake".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    let observed = match session.observe_host_key().await {
+        Ok(observed) => observed,
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "host key verification".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    match verify_observed_host_key(stored_host_key.as_ref(), &observed) {
+        Ok(HostKeyVerification::Trusted) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "host key verification".into(),
+                status: LocalDoctorCheckStatus::Pass,
+                detail: "trusted".into(),
+            });
+        }
+        Ok(HostKeyVerification::TrustOnFirstUse) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "host key verification".into(),
+                status: LocalDoctorCheckStatus::Pass,
+                detail: "trust on first use".into(),
+            });
+        }
+        Err(error) => {
+            report.checks.push(LocalDoctorCheckResult {
+                name: "host key verification".into(),
+                status: LocalDoctorCheckStatus::Fail,
+                detail: error.to_string(),
+            });
+            return report;
+        }
+    }
+
+    match authenticate_session(&mut *session, &profile, &auth).await {
+        Ok(()) => report.checks.push(LocalDoctorCheckResult {
+            name: "SSH auth usability".into(),
+            status: LocalDoctorCheckStatus::Pass,
+            detail: format!("usable under {}", profile.auth_mode),
+        }),
+        Err(error) => report.checks.push(LocalDoctorCheckResult {
+            name: "SSH auth usability".into(),
+            status: LocalDoctorCheckStatus::Fail,
+            detail: error.to_string(),
+        }),
+    }
+
+    report
+}
+
+fn secret_consistency_check(
+    profile: &crate::store::Profile,
+    auth: &crate::ssh::ProfileAuth,
+) -> LocalDoctorCheckResult {
+    let mismatches = [
+        (
+            "password",
+            profile.has_password,
+            auth.password.is_some(),
+        ),
+        (
+            "private key",
+            profile.has_private_key,
+            auth.private_key.is_some(),
+        ),
+        (
+            "key passphrase",
+            profile.has_key_passphrase,
+            auth.key_passphrase.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, flag, actual)| {
+        (flag != actual).then_some(format!("{label} flag={flag} secret={actual}"))
+    })
+    .collect::<Vec<_>>();
+
+    if mismatches.is_empty() {
+        LocalDoctorCheckResult {
+            name: "stored secrets consistency".into(),
+            status: LocalDoctorCheckStatus::Pass,
+            detail: format!("consistent for {}", profile.auth_mode),
+        }
+    } else {
+        LocalDoctorCheckResult {
+            name: "stored secrets consistency".into(),
+            status: LocalDoctorCheckStatus::Fail,
+            detail: mismatches.join(", "),
+        }
+    }
+}
+
+fn saved_host_key_check(
+    app: &crate::app::App,
+    profile: &crate::store::Profile,
+) -> LocalDoctorCheckResult {
+    match <crate::app::App as SshConnectionContext>::load_host_key(app, profile) {
+        Ok(Some(record)) => LocalDoctorCheckResult {
+            name: "saved host key".into(),
+            status: LocalDoctorCheckStatus::Pass,
+            detail: format!(
+                "present for {}:{} ({})",
+                record.host, record.port, record.fingerprint
+            ),
+        },
+        Ok(None) => LocalDoctorCheckResult {
+            name: "saved host key".into(),
+            status: LocalDoctorCheckStatus::Pass,
+            detail: "absent".into(),
+        },
+        Err(error) => LocalDoctorCheckResult {
+            name: "saved host key".into(),
+            status: LocalDoctorCheckStatus::Fail,
+            detail: error.to_string(),
+        },
+    }
+}
+
+async fn resolve_profile_host(profile: &crate::store::Profile) -> Result<Vec<SocketAddr>> {
+    let resolved = lookup_host((profile.host.as_str(), profile.port))
+        .await
+        .map_err(Error::from)?
+        .collect::<Vec<_>>();
+
+    if resolved.is_empty() {
+        Err(Error::new("hostname did not resolve to any socket addresses"))
+    } else {
+        Ok(resolved)
+    }
+}
+
+async fn tcp_reachability_check(
+    profile: &crate::store::Profile,
+    resolved: &[SocketAddr],
+) -> Result<SocketAddr> {
+    let connect_future = async {
+        for addr in resolved {
+            if let Ok(stream) = TcpStream::connect(addr).await {
+                return Ok::<SocketAddr, Error>(stream.peer_addr().map_err(Error::from)?);
+            }
+        }
+
+        Err(Error::new(format!(
+            "unable to connect to {}:{}",
+            profile.host, profile.port
+        )))
+    };
+
+    timeout(Duration::from_secs(5), connect_future)
+        .await
+        .map_err(|_| Error::new("TCP connection attempt timed out"))?
+}
+
+fn join_addresses(addresses: &[SocketAddr]) -> String {
+    addresses
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn check_database_sanity(paths: &AppPaths) -> Result<()> {

@@ -1,6 +1,5 @@
 use assert_cmd::Command as AssertCommand;
 use clap::Parser;
-use predicates::prelude::PredicateBooleanExt;
 
 use connect::cli::{Cli, Command as CliCommand, ForwardCommand};
 
@@ -81,13 +80,24 @@ fn doctor_parses_as_local_only_command() {
 }
 
 #[test]
-fn doctor_help_does_not_advertise_a_profile_argument() {
+fn doctor_parses_an_optional_profile_argument() {
+    let parsed = parse_cli(&["connect", "doctor", "prod"]);
+    match parsed.command {
+        Some(CliCommand::Doctor(args)) => {
+            assert_eq!(args.profile.as_deref(), Some("prod"));
+        }
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+}
+
+#[test]
+fn doctor_help_advertises_an_optional_profile_argument() {
     let mut cmd = connect_test_bin();
     cmd.args(["doctor", "--help"])
         .assert()
         .success()
         .stdout(predicates::str::contains("Inspect the local environment"))
-        .stdout(predicates::str::contains("PROFILE").not());
+        .stdout(predicates::str::contains("PROFILE"));
 }
 
 #[test]

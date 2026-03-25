@@ -441,8 +441,13 @@ pub fn run() -> Result<()> {
             let app = App::load()?;
             add::run(&app, &prompt, &args, &mut stdout)
         }
-        Some(Command::Doctor(_args)) => {
-            let report = doctor::run(&mut stdout)?;
+        Some(Command::Doctor(args)) => {
+            let report = if args.profile.is_some() {
+                let app = App::load()?;
+                doctor::run(&app, &args, &mut stdout)?
+            } else {
+                doctor::run_local(&mut stdout)?
+            };
             if report.exit_code() == 0 {
                 Ok(())
             } else {

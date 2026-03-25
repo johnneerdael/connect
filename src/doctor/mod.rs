@@ -3,7 +3,9 @@ pub mod output;
 
 use std::io::Write;
 
-pub use checks::{collect_local_checks, DefaultDoctorEnvironment, LocalDoctorReport};
+pub use checks::{
+    collect_local_checks, collect_profile_checks, DefaultDoctorEnvironment, LocalDoctorReport,
+};
 
 use crate::error::Result;
 

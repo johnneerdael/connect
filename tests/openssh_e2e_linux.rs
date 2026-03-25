@@ -13,6 +13,7 @@ use std::{
 
 use connect::{
     app::{App, AppPaths, ProfileSecretsInput},
+    doctor::checks::{collect_profile_checks, DoctorEnvironment, LocalDoctorCheckStatus},
     error::Error,
     secrets::MemorySecretStore,
     ssh::{parse_copy_spec, ExecSpec, RusshClient},
@@ -146,6 +147,95 @@ async fn openssh_end_to_end_supports_tofu_exec_agent_auth_and_recursive_copy() {
         .await
         .expect("agent-only auth should succeed with ssh-agent");
     drop(agent);
+}
+
+struct PassingDoctorEnvironment;
+
+impl DoctorEnvironment for PassingDoctorEnvironment {
+    fn resolve_app_paths(&self) -> connect::error::Result<connect::app::AppPaths> {
+        Ok(connect::app::AppPaths {
+            config_dir: PathBuf::from("/tmp/connect-doctor-config"),
+            data_dir: PathBuf::from("/tmp/connect-doctor-data"),
+            database_path: PathBuf::from("/tmp/connect-doctor-data/connect.db"),
+        })
+    }
+
+    fn check_database(&self, _paths: &connect::app::AppPaths) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn initialize_secret_backend(&self) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn ssh_agent_available(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn doctor_profile_succeeds_for_a_live_ssh_profile() {
+    let harness = OpenSshHarness::start();
+    let app = harness.app_with_profile("doctor", AuthMode::StoredOnly, true);
+    let env = PassingDoctorEnvironment;
+    let ssh = RusshClient::new();
+
+    let report = collect_profile_checks(&env, &app, "doctor", &ssh).await;
+
+    assert!(report.is_success(), "{report:?}");
+    assert!(report
+        .checks
+        .iter()
+        .any(|check| check.name == "hostname resolution" && check.status == LocalDoctorCheckStatus::Pass));
+    assert!(report
+        .checks
+        .iter()
+        .any(|check| check.name == "TCP reachability" && check.status == LocalDoctorCheckStatus::Pass));
+    assert!(report
+        .checks
+        .iter()
+        .any(|check| check.name == "SSH handshake" && check.status == LocalDoctorCheckStatus::Pass));
+}
+
+#[tokio::test]
+async fn doctor_profile_rejects_saved_host_key_mismatch() {
+    let harness = OpenSshHarness::start();
+    let app = harness.app_with_profile("doctor-mismatch", AuthMode::StoredOnly, true);
+    let env = PassingDoctorEnvironment;
+    app.save_host_key(
+        "127.0.0.1",
+        harness.port(),
+        "ssh-ed25519",
+        "wrong-fingerprint",
+        "wrong-public-key",
+    )
+    .expect("host key should be saved");
+    let ssh = RusshClient::new();
+
+    let report = collect_profile_checks(&env, &app, "doctor-mismatch", &ssh).await;
+
+    assert!(!report.is_success());
+    assert!(report
+        .checks
+        .iter()
+        .any(|check| check.name == "host key verification" && check.status == LocalDoctorCheckStatus::Fail));
+}
+
+#[tokio::test]
+async fn doctor_profile_rejects_an_unusable_auth_mode() {
+    let _guard = EnvVarGuard::set("SSH_AUTH_SOCK", "/tmp/connect-doctor-missing-agent.sock");
+    let harness = OpenSshHarness::start();
+    let app = harness.app_with_profile("doctor-agent", AuthMode::AgentOnly, false);
+    let env = PassingDoctorEnvironment;
+    let ssh = RusshClient::new();
+
+    let report = collect_profile_checks(&env, &app, "doctor-agent", &ssh).await;
+
+    assert!(!report.is_success());
+    assert!(report
+        .checks
+        .iter()
+        .any(|check| check.name == "SSH auth usability" && check.status == LocalDoctorCheckStatus::Fail));
 }
 
 struct OpenSshHarness {
@@ -334,6 +424,28 @@ impl SshAgentGuard {
             child_pid: pid,
             previous_sock,
             previous_pid,
+        }
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
         }
     }
 }

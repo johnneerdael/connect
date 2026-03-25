@@ -152,7 +152,10 @@ pub struct ExecArgs {
 }
 
 #[derive(Args, Debug, Clone, Default)]
-pub struct DoctorArgs;
+pub struct DoctorArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: Option<String>,
+}
 
 #[derive(Args, Debug, Clone)]
 #[command(subcommand_required = true, arg_required_else_help = true)]
