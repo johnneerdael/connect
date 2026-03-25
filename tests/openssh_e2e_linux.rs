@@ -286,6 +286,65 @@ async fn openssh_end_to_end_supports_saved_local_tcp_forward_run() {
     remote_task.await.unwrap();
 }
 
+#[tokio::test]
+async fn openssh_end_to_end_supports_saved_socks5_forward_run() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let ssh = RusshClient::new();
+    let app = harness.app_with_profile("socks-forward", AuthMode::StoredOnly, true);
+    let remote_port = allocate_port();
+    let local_port = allocate_port();
+
+    app.save_forward(
+        connect::forward::spec::ForwardSpec::parse_socks(&format!("127.0.0.1:{local_port}"))
+            .expect("SOCKS forward spec should parse")
+            .into_definition("socks-forward", "proxy", None),
+    )
+    .expect("SOCKS forward should save");
+
+    let remote_listener = TokioTcpListener::bind(("127.0.0.1", remote_port))
+        .await
+        .expect("remote listener should bind");
+    let remote_task = tokio::spawn(async move {
+        let (mut socket, _) = remote_listener
+            .accept()
+            .await
+            .expect("remote listener should accept");
+        let mut request = [0_u8; 4];
+        socket
+            .read_exact(&mut request)
+            .await
+            .expect("request should arrive through SOCKS over SSH");
+        assert_eq!(&request, b"ping");
+        socket
+            .write_all(b"pong")
+            .await
+            .expect("response should travel through SOCKS over SSH");
+    });
+
+    run_saved_forward_until(&app, &ssh, &prompt, "socks-forward", "proxy", async move {
+        wait_for_tokio_port(local_port).await;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .expect("local SOCKS listener should accept");
+        socks5_greet(&mut client).await;
+        socks5_connect_ipv4(&mut client, [127, 0, 0, 1], remote_port).await;
+        client
+            .write_all(b"ping")
+            .await
+            .expect("request should be sent through SOCKS");
+        let mut response = [0_u8; 4];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("response should be readable through SOCKS");
+        assert_eq!(&response, b"pong");
+    })
+    .await
+    .unwrap();
+    remote_task.await.unwrap();
+}
+
 struct PassingDoctorEnvironment;
 
 impl DoctorEnvironment for PassingDoctorEnvironment {
@@ -798,6 +857,39 @@ where
             run.await
         }
     }
+}
+
+async fn socks5_greet(stream: &mut tokio::net::TcpStream) {
+    stream
+        .write_all(&[5, 1, 0])
+        .await
+        .expect("SOCKS greeting should be written");
+    let mut response = [0_u8; 2];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("SOCKS greeting response should be readable");
+    assert_eq!(response, [5, 0]);
+}
+
+async fn socks5_connect_ipv4(
+    stream: &mut tokio::net::TcpStream,
+    address: [u8; 4],
+    port: u16,
+) {
+    let mut request = vec![5, 1, 0, 1];
+    request.extend_from_slice(&address);
+    request.extend_from_slice(&port.to_be_bytes());
+    stream
+        .write_all(&request)
+        .await
+        .expect("SOCKS CONNECT request should be written");
+    let mut reply = [0_u8; 10];
+    stream
+        .read_exact(&mut reply)
+        .await
+        .expect("SOCKS CONNECT reply should be readable");
+    assert_eq!(reply[1], 0, "SOCKS CONNECT should succeed");
 }
 
 fn read_optional(path: &Path) -> String {

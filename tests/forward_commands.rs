@@ -24,7 +24,7 @@ use connect::{
     terminal::prompt::Prompt,
 };
 use tokio::{
-    io::{duplex, AsyncWriteExt},
+    io::{duplex, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -380,6 +380,106 @@ async fn forward_run_with_all_binds_each_saved_local_forward() {
 }
 
 #[tokio::test]
+async fn forward_run_supports_socks5_connect_requests() {
+    let harness = TestHarness::with_profile("prod");
+    let ssh = FakeForwardSshClient::always_alive();
+    let socks_port = allocate_port();
+
+    forward::run(
+        harness.app(),
+        &AcceptPrompt,
+        &ForwardArgs {
+            command: ForwardCommand::Add(ForwardAddArgs {
+                profile: "prod".into(),
+                name: "proxy".into(),
+                local: None,
+                socks: Some(format!("127.0.0.1:{socks_port}")),
+                description: None,
+            }),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    run_forward_until(
+        harness.app(),
+        ssh.clone(),
+        ForwardRunArgs {
+            profile: "prod".into(),
+            name: Some("proxy".into()),
+            all: false,
+        },
+        async move {
+            wait_for_port(socks_port).await;
+            let mut client = TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("SOCKS listener should accept connections");
+            socks5_greet(&mut client).await;
+            socks5_connect_domain(&mut client, "db.internal", 5432).await;
+            assert_eq!(ssh.open_count(), 1);
+            assert_eq!(ssh.last_target(), Some(("db.internal".into(), 5432)));
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn forward_run_rejects_unsupported_socks_commands_without_killing_the_listener() {
+    let harness = TestHarness::with_profile("prod");
+    let ssh = FakeForwardSshClient::always_alive();
+    let socks_port = allocate_port();
+
+    forward::run(
+        harness.app(),
+        &AcceptPrompt,
+        &ForwardArgs {
+            command: ForwardCommand::Add(ForwardAddArgs {
+                profile: "prod".into(),
+                name: "proxy".into(),
+                local: None,
+                socks: Some(format!("127.0.0.1:{socks_port}")),
+                description: None,
+            }),
+        },
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    run_forward_until(
+        harness.app(),
+        ssh.clone(),
+        ForwardRunArgs {
+            profile: "prod".into(),
+            name: Some("proxy".into()),
+            all: false,
+        },
+        async move {
+            wait_for_port(socks_port).await;
+            let mut rejected = TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("SOCKS listener should accept the rejected command connection");
+            socks5_greet(&mut rejected).await;
+            socks5_request(&mut rejected, 2, &["db.internal".len() as u8], b"db.internal", 5432)
+                .await;
+            let reply = read_socks_reply(&mut rejected).await;
+            assert_eq!(reply[1], 7);
+            assert_eq!(ssh.open_count(), 0);
+
+            let mut accepted = TcpStream::connect(("127.0.0.1", socks_port))
+                .await
+                .expect("SOCKS listener should stay alive after rejecting a command");
+            socks5_greet(&mut accepted).await;
+            socks5_connect_domain(&mut accepted, "metrics.internal", 9100).await;
+            assert_eq!(ssh.open_count(), 1);
+            assert_eq!(ssh.last_target(), Some(("metrics.internal".into(), 9100)));
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn forward_run_fails_startup_without_leaving_partial_listeners() {
     let harness = TestHarness::with_profile("prod");
     let first_port = allocate_port();
@@ -577,6 +677,51 @@ async fn wait_for_open_count(ssh: &FakeForwardSshClient, expected: usize) {
     }
 
     panic!("open count did not reach {expected} in time");
+}
+
+async fn socks5_greet(stream: &mut TcpStream) {
+    stream
+        .write_all(&[5, 1, 0])
+        .await
+        .expect("SOCKS greeting should be written");
+    let mut response = [0_u8; 2];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("SOCKS greeting response should be readable");
+    assert_eq!(response, [5, 0]);
+}
+
+async fn socks5_connect_domain(stream: &mut TcpStream, host: &str, port: u16) {
+    socks5_request(stream, 1, &[host.len() as u8], host.as_bytes(), port).await;
+    let reply = read_socks_reply(stream).await;
+    assert_eq!(reply[1], 0);
+}
+
+async fn socks5_request(
+    stream: &mut TcpStream,
+    command: u8,
+    address_prefix: &[u8],
+    address: &[u8],
+    port: u16,
+) {
+    let mut request = vec![5, command, 0, if address_prefix.len() == 1 { 3 } else { 1 }];
+    request.extend_from_slice(address_prefix);
+    request.extend_from_slice(address);
+    request.extend_from_slice(&port.to_be_bytes());
+    stream
+        .write_all(&request)
+        .await
+        .expect("SOCKS request should be written");
+}
+
+async fn read_socks_reply(stream: &mut TcpStream) -> [u8; 10] {
+    let mut reply = [0_u8; 10];
+    stream
+        .read_exact(&mut reply)
+        .await
+        .expect("SOCKS reply should be readable");
+    reply
 }
 
 #[derive(Default)]

@@ -8,6 +8,7 @@ use std::{
 };
 
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
     task::JoinSet,
@@ -30,6 +31,11 @@ pub enum SavedForwardSelection {
 struct BoundForward {
     definition: ForwardDefinition,
     listener: TcpListener,
+}
+
+enum ForwardRoute {
+    Local { target_host: String, target_port: u16 },
+    Socks,
 }
 
 pub async fn run_saved_forwards<F>(
@@ -121,10 +127,7 @@ fn ensure_supported_local_forward(definition: &ForwardDefinition) -> Result<()> 
                 Ok(())
             }
         }
-        ForwardKind::Socks => Err(Error::new(format!(
-            "socks forward '{}' is not supported by forward run yet",
-            definition.name
-        ))),
+        ForwardKind::Socks => Ok(()),
     }
 }
 
@@ -133,16 +136,21 @@ async fn run_listener(
     mut session: Box<dyn crate::ssh::SshSession + Send + 'static>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let target_host = bound_forward
-        .definition
-        .target_host
-        .clone()
-        .expect("local forward target host should be validated");
-    let target_port = bound_forward
-        .definition
-        .target_port
-        .expect("local forward target port should be validated");
     let forward_name = bound_forward.definition.name.clone();
+    let route = match bound_forward.definition.kind {
+        ForwardKind::Local => ForwardRoute::Local {
+            target_host: bound_forward
+                .definition
+                .target_host
+                .clone()
+                .expect("local forward target host should be validated"),
+            target_port: bound_forward
+                .definition
+                .target_port
+                .expect("local forward target port should be validated"),
+        },
+        ForwardKind::Socks => ForwardRoute::Socks,
+    };
     let mut proxy_tasks = JoinSet::new();
     let mut health_check = time::interval(Duration::from_millis(200));
     health_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -176,22 +184,34 @@ async fn run_listener(
                 let (local_stream, peer_addr) = accepted?;
                 let origin_host = peer_addr.ip().to_string();
                 let origin_port = peer_addr.port();
-                match session
-                    .open_direct_tcpip(&target_host, target_port, &origin_host, origin_port)
-                    .await
-                {
-                    Ok(remote_stream) => {
-                        proxy_tasks.spawn(proxy_connection(local_stream, remote_stream));
+                match route {
+                    ForwardRoute::Local {
+                        ref target_host,
+                        target_port,
+                    } => {
+                        open_tunnel_or_continue(
+                            &mut session,
+                            &forward_name,
+                            local_stream,
+                            target_host,
+                            target_port,
+                            &origin_host,
+                            origin_port,
+                            false,
+                            &mut proxy_tasks,
+                        )
+                        .await?;
                     }
-                    Err(error) => {
-                        if !session.is_alive() {
-                            return Err(Error::new(format!(
-                                "ssh session for forward '{forward_name}' disconnected"
-                            )));
-                        }
-
-                        drop(local_stream);
-                        let _ = error;
+                    ForwardRoute::Socks => {
+                        handle_socks_connection(
+                            &mut session,
+                            &forward_name,
+                            local_stream,
+                            &origin_host,
+                            origin_port,
+                            &mut proxy_tasks,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -210,4 +230,204 @@ async fn proxy_connection(
 ) -> Result<()> {
     copy_bidirectional(&mut local_stream, &mut remote_stream).await?;
     Ok(())
+}
+
+async fn handle_socks_connection(
+    session: &mut Box<dyn crate::ssh::SshSession + Send + 'static>,
+    forward_name: &str,
+    mut local_stream: TcpStream,
+    origin_host: &str,
+    origin_port: u16,
+    proxy_tasks: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    let handshake_accepted = match perform_socks_handshake(&mut local_stream).await {
+        Ok(accepted) => accepted,
+        Err(_) => {
+            let _ = local_stream.shutdown().await;
+            return Ok(());
+        }
+    };
+    if !handshake_accepted {
+        return Ok(());
+    }
+
+    let request = match read_socks_request(&mut local_stream).await {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = local_stream.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    match request.command {
+        SocksCommand::Connect => {
+            open_tunnel_or_continue(
+                session,
+                forward_name,
+                local_stream,
+                &request.target_host,
+                request.target_port,
+                origin_host,
+                origin_port,
+                true,
+                proxy_tasks,
+            )
+            .await
+        }
+        SocksCommand::Unsupported => {
+            write_socks_reply(&mut local_stream, SocksReply::CommandNotSupported).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn open_tunnel_or_continue(
+    session: &mut Box<dyn crate::ssh::SshSession + Send + 'static>,
+    forward_name: &str,
+    mut local_stream: TcpStream,
+    target_host: &str,
+    target_port: u16,
+    origin_host: &str,
+    origin_port: u16,
+    send_socks_success: bool,
+    proxy_tasks: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    match session
+        .open_direct_tcpip(target_host, target_port, origin_host, origin_port)
+        .await
+    {
+        Ok(remote_stream) => {
+            if send_socks_success {
+                write_socks_reply(&mut local_stream, SocksReply::Succeeded).await?;
+            }
+            proxy_tasks.spawn(proxy_connection(local_stream, remote_stream));
+            Ok(())
+        }
+        Err(_) if !session.is_alive() => Err(Error::new(format!(
+            "ssh session for forward '{forward_name}' disconnected"
+        ))),
+        Err(_) => {
+            if send_socks_success {
+                let _ = write_socks_reply(&mut local_stream, SocksReply::GeneralFailure).await;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn perform_socks_handshake(stream: &mut TcpStream) -> Result<bool> {
+    let mut header = [0_u8; 2];
+    stream.read_exact(&mut header).await?;
+    if header[0] != SOCKS_VERSION {
+        return Err(Error::new("unsupported SOCKS version"));
+    }
+
+    let method_count = usize::from(header[1]);
+    let mut methods = vec![0_u8; method_count];
+    stream.read_exact(&mut methods).await?;
+    if methods.contains(&SOCKS_AUTH_NONE) {
+        stream.write_all(&[SOCKS_VERSION, SOCKS_AUTH_NONE]).await?;
+        Ok(true)
+    } else {
+        stream
+            .write_all(&[SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE_METHODS])
+            .await?;
+        Ok(false)
+    }
+}
+
+async fn read_socks_request(stream: &mut TcpStream) -> Result<SocksRequest> {
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header).await?;
+    if header[0] != SOCKS_VERSION {
+        return Err(Error::new("unsupported SOCKS version"));
+    }
+    if header[2] != 0 {
+        return Err(Error::new("SOCKS request used a non-zero reserved field"));
+    }
+
+    let command = match header[1] {
+        SOCKS_COMMAND_CONNECT => SocksCommand::Connect,
+        _ => SocksCommand::Unsupported,
+    };
+    let target_host = read_socks_address(stream, header[3]).await?;
+    let mut port_bytes = [0_u8; 2];
+    stream.read_exact(&mut port_bytes).await?;
+    let target_port = u16::from_be_bytes(port_bytes);
+    if target_port == 0 {
+        return Err(Error::new("SOCKS target port must be between 1 and 65535"));
+    }
+
+    Ok(SocksRequest {
+        command,
+        target_host,
+        target_port,
+    })
+}
+
+async fn read_socks_address(stream: &mut TcpStream, atyp: u8) -> Result<String> {
+    match atyp {
+        SOCKS_ATYP_IPV4 => {
+            let mut octets = [0_u8; 4];
+            stream.read_exact(&mut octets).await?;
+            Ok(std::net::Ipv4Addr::from(octets).to_string())
+        }
+        SOCKS_ATYP_DOMAIN => {
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await?;
+            let mut bytes = vec![0_u8; usize::from(length[0])];
+            stream.read_exact(&mut bytes).await?;
+            String::from_utf8(bytes).map_err(|_| Error::new("SOCKS domain name was not valid utf-8"))
+        }
+        SOCKS_ATYP_IPV6 => {
+            let mut octets = [0_u8; 16];
+            stream.read_exact(&mut octets).await?;
+            Ok(std::net::Ipv6Addr::from(octets).to_string())
+        }
+        _ => Err(Error::new("unsupported SOCKS address type")),
+    }
+}
+
+async fn write_socks_reply(stream: &mut TcpStream, reply: SocksReply) -> Result<()> {
+    stream
+        .write_all(&[
+            SOCKS_VERSION,
+            reply as u8,
+            0,
+            SOCKS_ATYP_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
+        .await?;
+    Ok(())
+}
+
+const SOCKS_VERSION: u8 = 5;
+const SOCKS_AUTH_NONE: u8 = 0;
+const SOCKS_AUTH_NO_ACCEPTABLE_METHODS: u8 = 0xff;
+const SOCKS_COMMAND_CONNECT: u8 = 1;
+const SOCKS_ATYP_IPV4: u8 = 1;
+const SOCKS_ATYP_DOMAIN: u8 = 3;
+const SOCKS_ATYP_IPV6: u8 = 4;
+
+enum SocksCommand {
+    Connect,
+    Unsupported,
+}
+
+struct SocksRequest {
+    command: SocksCommand,
+    target_host: String,
+    target_port: u16,
+}
+
+#[repr(u8)]
+enum SocksReply {
+    GeneralFailure = 1,
+    Succeeded = 0,
+    CommandNotSupported = 7,
 }
