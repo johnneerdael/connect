@@ -5,6 +5,7 @@ use connect::{
     cli::{
         commands::forward,
         ForwardAddArgs, ForwardArgs, ForwardCommand, ForwardListArgs, ForwardRemoveArgs,
+        ForwardRunArgs,
     },
     secrets::MemorySecretStore,
     store::ProfileInput,
@@ -209,6 +210,95 @@ fn forward_add_rejects_malformed_specs_and_impossible_ports() {
         impossible_port.to_string(),
         "bind_port must be between 1 and 65535"
     );
+}
+
+#[test]
+fn forward_run_rejects_missing_or_conflicting_selector_arguments() {
+    let harness = TestHarness::with_profile("prod");
+    let prompt = AcceptPrompt;
+    let mut output = Vec::new();
+
+    let missing_selector = forward::run(
+        harness.app(),
+        &prompt,
+        &ForwardArgs {
+            command: ForwardCommand::Run(ForwardRunArgs {
+                profile: "prod".into(),
+                name: None,
+                all: false,
+            }),
+        },
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(missing_selector.to_string(), "forward run requires a name or --all");
+
+    let conflicting_selector = forward::run(
+        harness.app(),
+        &prompt,
+        &ForwardArgs {
+            command: ForwardCommand::Run(ForwardRunArgs {
+                profile: "prod".into(),
+                name: Some("db".into()),
+                all: true,
+            }),
+        },
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(
+        conflicting_selector.to_string(),
+        "forward run cannot accept both a name and --all"
+    );
+}
+
+#[test]
+fn forward_run_accepts_named_forward_and_all_for_existing_profile() {
+    let harness = TestHarness::with_profile("prod");
+    let prompt = AcceptPrompt;
+    let mut output = Vec::new();
+
+    forward::run(
+        harness.app(),
+        &prompt,
+        &ForwardArgs {
+            command: ForwardCommand::Add(ForwardAddArgs {
+                profile: "prod".into(),
+                name: "db".into(),
+                local: Some("127.0.0.1:15432:db.internal:5432".into()),
+                socks: None,
+                description: None,
+            }),
+        },
+        &mut output,
+    )
+    .unwrap();
+
+    let named_output = run_forward(
+        harness.app(),
+        &ForwardArgs {
+            command: ForwardCommand::Run(ForwardRunArgs {
+                profile: "prod".into(),
+                name: Some("db".into()),
+                all: false,
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(named_output, "Validated forward 'db' for profile 'prod'.\n");
+
+    let all_output = run_forward(
+        harness.app(),
+        &ForwardArgs {
+            command: ForwardCommand::Run(ForwardRunArgs {
+                profile: "prod".into(),
+                name: None,
+                all: true,
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(all_output, "Validated 1 saved forward(s) for profile 'prod'.\n");
 }
 
 fn run_forward(harness: &App, args: &ForwardArgs) -> Result<String, connect::error::Error> {
