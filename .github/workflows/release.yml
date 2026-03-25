@@ -101,7 +101,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
           else
-            version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(pkg[\"version\"] for pkg in json.load(sys.stdin)[\"packages\"] if pkg[\"name\"] == \"connect\"))')"
+            version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(pkg["version"] for pkg in json.load(sys.stdin)["packages"] if pkg["name"] == "connect"))')"
           fi
           mkdir -p distroot/usr/local/bin dist
           cp target/release/connect distroot/usr/local/bin/connect
