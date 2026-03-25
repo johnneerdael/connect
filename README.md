@@ -8,9 +8,11 @@ It is built for Windows, macOS, and Linux, stores secrets in the OS-native keych
 
 - named SSH profiles
 - embedded SSH session support
+- non-interactive remote command execution with exact exit-code propagation
 - local-to-remote and remote-to-local copy support
 - recursive directory copy with `--recursive`
 - OS-native secret storage for passwords, imported private keys, and key passphrases
+- SSH agent support with configurable auth precedence
 - TOFU host key verification with commands to list and delete saved host keys
 - standalone release artifacts for Linux, macOS, and Windows
 - shell completion generation
@@ -46,13 +48,19 @@ Install the `.msi` release artifact. The installer places `connect.exe` under `P
 Add a profile with interactive secret entry:
 
 ```bash
-connect add prod --host prod.example.com --user alice --password
+connect add prod --host prod.example.com --user alice --password --auth-mode auto
 ```
 
 Import a private key from disk. The key is read once and stored in the OS keychain:
 
 ```bash
 connect add prod --host prod.example.com --user alice --private-key ~/.ssh/id_ed25519
+```
+
+Restrict a profile to password-only authentication:
+
+```bash
+connect add legacy --host legacy.example.com --user alice --password --auth-mode password-only
 ```
 
 Provide a password non-interactively from standard input:
@@ -71,13 +79,26 @@ connect show prod
 Open an interactive SSH session:
 
 ```bash
+connect open prod
 connect prod
+```
+
+Run a remote command without allocating a TTY:
+
+```bash
+connect exec prod -- uname -a
+```
+
+Run a remote command that needs a PTY:
+
+```bash
+connect exec prod --pty -- sudo systemctl status nginx
 ```
 
 Update or remove a profile:
 
 ```bash
-connect edit prod --host prod-2.example.com
+connect edit prod --host prod-2.example.com --auth-mode agent-only
 connect remove prod
 ```
 
@@ -126,7 +147,14 @@ connect hostkeys delete 1
 - profile metadata and trusted host keys are stored locally in the per-user app data directory
 - `connect show` reports whether credentials exist, but never prints secret values
 
-If both a private key and a password are available, `connect` tries private-key authentication first and falls back to password authentication if needed.
+Auth modes:
+
+- `auto`: try SSH agent, then stored private key, then password
+- `agent-only`: require SSH agent authentication
+- `stored-only`: use only credentials stored by `connect`
+- `password-only`: skip key-based authentication
+
+`connect show <profile>` prints the saved auth mode and whether agent auth is currently available on the host system.
 
 ## Shell Completions
 

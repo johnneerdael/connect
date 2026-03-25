@@ -10,6 +10,7 @@ use std::{
     },
 };
 
+use connect::store::AuthMode;
 use connect::{
     app::{App, AppPaths, ProfileSecretsInput, SecretBackend},
     cli::{
@@ -19,8 +20,8 @@ use connect::{
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
     ssh::{
-        parse_copy_spec, CopyDirection, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
-        SshClient, SshSession,
+        parse_copy_spec, CopyDirection, ExecSpec, ObservedHostKey, RemoteDirectoryEntry,
+        RemoteFileType, SshClient, SshSession,
     },
     store::ProfileInput,
     terminal::prompt::Prompt,
@@ -125,6 +126,7 @@ fn add_command_imports_private_key_and_persists_profile() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: Some(temp_key.path().into()),
@@ -157,6 +159,7 @@ fn add_command_prompts_for_missing_required_fields() {
         host: None,
         user: None,
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -185,6 +188,7 @@ fn add_command_stores_password_and_key_passphrase_from_secret_prompt() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: true,
         password_stdin: false,
         private_key: Some(temp_key.path().into()),
@@ -209,6 +213,34 @@ fn add_command_stores_password_and_key_passphrase_from_secret_prompt() {
 }
 
 #[test]
+fn add_command_persists_selected_auth_mode() {
+    let harness = TestHarness::new();
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::PasswordOnly,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.auth_mode, AuthMode::PasswordOnly);
+}
+
+#[test]
 fn add_command_rejects_invalid_host() {
     let harness = TestHarness::new();
 
@@ -217,6 +249,7 @@ fn add_command_rejects_invalid_host() {
         host: Some("not a host name".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -246,6 +279,7 @@ fn add_command_accepts_absolute_fqdn_and_internal_hostname() {
         host: Some("prod.example.com.".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -266,6 +300,7 @@ fn add_command_accepts_absolute_fqdn_and_internal_hostname() {
         host: Some("stage_api".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -304,6 +339,7 @@ fn add_command_rejects_duplicate_profile_names() {
         host: Some("prod-2.example.com".into()),
         user: Some("root".into()),
         port: Some(2200),
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -339,6 +375,7 @@ fn add_command_rejects_reserved_profile_name() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -369,6 +406,7 @@ fn add_command_rejects_single_letter_profile_name() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -408,6 +446,7 @@ fn add_command_rolls_back_secrets_when_secret_write_fails() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: true,
         password_stdin: false,
         private_key: None,
@@ -442,6 +481,7 @@ fn add_command_preserves_primary_error_when_rollback_fails() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: true,
         password_stdin: false,
         private_key: None,
@@ -469,6 +509,7 @@ fn add_command_rolls_back_new_secrets_when_metadata_save_fails() {
         host: Some("prod.example.com".into()),
         user: Some("deploy".into()),
         port: None,
+        auth_mode: AuthMode::Auto,
         password: true,
         password_stdin: false,
         private_key: None,
@@ -501,6 +542,7 @@ fn edit_command_updates_only_supplied_fields() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: Some(2200),
+        auth_mode: None,
         password: true,
         password_stdin: false,
         private_key: Some(temp_key.path().into()),
@@ -527,6 +569,39 @@ fn edit_command_updates_only_supplied_fields() {
 }
 
 #[test]
+fn edit_command_updates_auth_mode_when_supplied() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: Some(AuthMode::AgentOnly),
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+    };
+
+    edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.auth_mode, AuthMode::AgentOnly);
+}
+
+#[test]
 fn edit_command_rejects_invalid_host() {
     let harness = TestHarness::new();
     harness
@@ -539,6 +614,7 @@ fn edit_command_rejects_invalid_host() {
         host: Some("not a host name".into()),
         user: None,
         port: None,
+        auth_mode: None,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -572,6 +648,7 @@ fn edit_command_accepts_absolute_fqdn() {
         host: Some("prod.example.com.".into()),
         user: None,
         port: None,
+        auth_mode: None,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -601,6 +678,7 @@ fn edit_command_rejects_reserved_profile_name() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: None,
+        auth_mode: None,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -634,6 +712,7 @@ fn edit_command_allows_existing_single_letter_profile_name() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: None,
+        auth_mode: None,
         password: false,
         password_stdin: false,
         private_key: None,
@@ -680,6 +759,7 @@ fn edit_command_rolls_back_overwritten_secrets_when_secret_write_fails() {
         host: Some("prod-2.example.com".into()),
         user: None,
         port: None,
+        auth_mode: None,
         password: true,
         password_stdin: false,
         private_key: None,
@@ -805,6 +885,7 @@ fn show_command_prints_metadata_and_redacted_secret_availability_only() {
     assert!(stdout.contains("Name: prod"));
     assert!(stdout.contains("Host: prod.example.com"));
     assert!(stdout.contains("Username: deploy"));
+    assert!(stdout.contains("Auth mode: auto"));
     assert!(stdout.contains("Password: configured"));
     assert!(stdout.contains("Private key: configured"));
     assert!(stdout.contains("Key passphrase: not configured"));
@@ -862,6 +943,13 @@ async fn connect_uses_profile_and_rejects_host_key_mismatch() {
 #[tokio::test]
 async fn connect_tries_private_key_before_password() {
     let harness = TestHarness::with_profile("prod");
+    harness
+        .app()
+        .save_profile(
+            ProfileInput::new("prod", "prod.example.com", "deploy")
+                .with_auth_mode(AuthMode::StoredOnly),
+        )
+        .unwrap();
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
         .secrets()
@@ -888,6 +976,62 @@ async fn connect_tries_private_key_before_password() {
         .unwrap();
 
     assert_eq!(ssh.auth_attempts(), vec!["key", "password"]);
+}
+
+#[tokio::test]
+async fn connect_auto_prefers_agent_before_stored_auth() {
+    let _agent = EnvVarGuard::set("SSH_AUTH_SOCK", "/tmp/connect-test-agent.sock");
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_private_key(
+            "prod",
+            "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", false, true, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::agent_succeeds();
+
+    harness
+        .app()
+        .connect_profile("prod", &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.auth_attempts(), vec!["agent"]);
+}
+
+#[tokio::test]
+async fn exec_uses_profile_and_propagates_remote_exit_status() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_exec_exit_status(17);
+    let spec = ExecSpec::new(vec!["printf".into(), "hello world".into()], false);
+    let error = harness
+        .app()
+        .exec("prod", &spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RemoteExitStatus(17)));
+    assert_eq!(
+        ssh.executed_command(),
+        Some(("printf 'hello world'".into(), false))
+    );
 }
 
 #[tokio::test]
@@ -939,6 +1083,13 @@ async fn copy_uses_profile_and_rejects_host_key_mismatch() {
 #[tokio::test]
 async fn copy_tries_private_key_before_password() {
     let harness = TestHarness::with_profile("prod");
+    harness
+        .app()
+        .save_profile(
+            ProfileInput::new("prod", "prod.example.com", "deploy")
+                .with_auth_mode(AuthMode::StoredOnly),
+        )
+        .unwrap();
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
         .secrets()
@@ -1318,6 +1469,7 @@ struct FakeCopySshClient {
 struct FakeCopyState {
     observed: ObservedHostKey,
     auth_attempts: Vec<&'static str>,
+    agent_result: bool,
     key_result: bool,
     password_result: bool,
     remote_paths: HashMap<String, RemoteFileType>,
@@ -1337,6 +1489,7 @@ impl FakeCopySshClient {
                     public_key: format!("public-key-{fingerprint}"),
                 },
                 auth_attempts: Vec::new(),
+                agent_result: false,
                 key_result: true,
                 password_result: true,
                 remote_paths: HashMap::new(),
@@ -1401,6 +1554,18 @@ impl SshSession for FakeCopySession {
     ) -> Pin<Box<dyn Future<Output = connect::error::Result<ObservedHostKey>> + Send + 'a>> {
         let observed = self.state.lock().unwrap().observed.clone();
         Box::pin(async move { Ok(observed) })
+    }
+
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        _username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("agent");
+            state.agent_result
+        };
+        Box::pin(async move { Ok(result) })
     }
 
     fn authenticate_public_key<'a>(
@@ -1501,10 +1666,13 @@ impl SshSession for FakeCopySession {
 struct FakeConnectState {
     observed: ObservedHostKey,
     auth_attempts: Vec<&'static str>,
+    agent_result: bool,
     key_result: bool,
     password_result: bool,
     shell_opened: bool,
     exit_status: u32,
+    exec_status: u32,
+    executed_command: Option<(String, bool)>,
 }
 
 impl FakeConnectSshClient {
@@ -1519,10 +1687,13 @@ impl FakeConnectSshClient {
                     public_key: format!("public-key-{fingerprint}"),
                 },
                 auth_attempts: Vec::new(),
+                agent_result: false,
                 key_result: true,
                 password_result: true,
                 shell_opened: false,
                 exit_status: 0,
+                exec_status: 0,
+                executed_command: None,
             })),
         }
     }
@@ -1538,12 +1709,21 @@ impl FakeConnectSshClient {
                     public_key: "public-key-fp-123".into(),
                 },
                 auth_attempts: Vec::new(),
+                agent_result: false,
                 key_result: false,
                 password_result: true,
                 shell_opened: false,
                 exit_status: 0,
+                exec_status: 0,
+                executed_command: None,
             })),
         }
+    }
+
+    fn agent_succeeds() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().agent_result = true;
+        client
     }
 
     fn with_exit_status(exit_status: u32) -> Self {
@@ -1552,8 +1732,18 @@ impl FakeConnectSshClient {
         client
     }
 
+    fn with_exec_exit_status(exit_status: u32) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().exec_status = exit_status;
+        client
+    }
+
     fn auth_attempts(&self) -> Vec<&'static str> {
         self.state.lock().unwrap().auth_attempts.clone()
+    }
+
+    fn executed_command(&self) -> Option<(String, bool)> {
+        self.state.lock().unwrap().executed_command.clone()
     }
 }
 
@@ -1591,6 +1781,20 @@ impl SshSession for FakeConnectSession {
         Box::pin(async move { Ok(observed) })
     }
 
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        _username: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>,
+    > {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("agent");
+            state.agent_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
     fn authenticate_public_key<'a>(
         &'a mut self,
         _username: &'a str,
@@ -1626,9 +1830,47 @@ impl SshSession for FakeConnectSession {
         &'a mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<u32>> + Send + 'a>>
     {
-        self.state.lock().unwrap().shell_opened = true;
-        let exit_status = self.state.lock().unwrap().exit_status;
+        let exit_status = {
+            let mut state = self.state.lock().unwrap();
+            state.shell_opened = true;
+            state.exit_status
+        };
         Box::pin(async move { Ok(exit_status) })
+    }
+
+    fn execute_command<'a>(
+        &'a mut self,
+        spec: &'a ExecSpec,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<u32>> + Send + 'a>>
+    {
+        let exit_status = {
+            let mut state = self.state.lock().unwrap();
+            state.executed_command = Some((spec.command_line().unwrap(), spec.pty));
+            state.exec_status
+        };
+        Box::pin(async move { Ok(exit_status) })
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
     }
 }
 

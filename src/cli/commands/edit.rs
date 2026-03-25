@@ -29,6 +29,7 @@ pub fn run(app: &App, prompt: &dyn Prompt, args: &EditArgs, writer: &mut dyn Wri
         None => existing.username,
     };
     let port = validate_port(args.port.unwrap_or(existing.port))?;
+    let auth_mode = args.auth_mode.unwrap_or(existing.auth_mode);
 
     let secrets = ProfileSecretsInput {
         password: secret_value(
@@ -51,7 +52,9 @@ pub fn run(app: &App, prompt: &dyn Prompt, args: &EditArgs, writer: &mut dyn Wri
         )?,
     };
 
-    let mut profile = ProfileInput::new(name.clone(), host, user).with_port(port);
+    let mut profile = ProfileInput::new(name.clone(), host, user)
+        .with_port(port)
+        .with_auth_mode(auth_mode);
     profile.has_password = existing.has_password;
     profile.has_private_key = existing.has_private_key;
     profile.has_key_passphrase = existing.has_key_passphrase;

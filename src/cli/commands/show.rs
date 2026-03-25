@@ -16,6 +16,8 @@ pub fn run(app: &App, args: &ShowArgs, writer: &mut dyn Write) -> Result<()> {
     writeln!(writer, "Host: {}", profile.host).map_err(Error::from)?;
     writeln!(writer, "Port: {}", profile.port).map_err(Error::from)?;
     writeln!(writer, "Username: {}", profile.username).map_err(Error::from)?;
+    writeln!(writer, "Auth mode: {}", profile.auth_mode).map_err(Error::from)?;
+    writeln!(writer, "Agent auth: {}", app.agent_auth_status()).map_err(Error::from)?;
     writeln!(
         writer,
         "Password: {}",

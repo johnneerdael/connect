@@ -32,8 +32,30 @@ impl InteractiveTerminal {
         let mut stdin = io::stdin();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        self.attach_io(&mut channel, &mut stdin, &mut stdout, &mut stderr)
+        self.attach_io(&mut channel, &mut stdin, &mut stdout, &mut stderr, true)
             .await
+    }
+
+    pub async fn stream_command_output<S>(
+        &self,
+        channel: &mut Channel<S>,
+        watch_resize: bool,
+    ) -> Result<u32>
+    where
+        S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
+    {
+        let mut channel = RusshChannelAdapter { channel };
+        let mut stdin = io::empty();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        self.attach_io(
+            &mut channel,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            watch_resize,
+        )
+        .await
     }
 
     async fn attach_io<C, I, O, E>(
@@ -42,6 +64,7 @@ impl InteractiveTerminal {
         stdin: &mut I,
         stdout: &mut O,
         stderr: &mut E,
+        watch_resize: bool,
     ) -> Result<u32>
     where
         C: SessionChannel,
@@ -52,6 +75,7 @@ impl InteractiveTerminal {
         let mut buffer = vec![0; 1024];
         let mut stdin_open = true;
         let mut exit_status = None;
+        let mut resize_stream = ResizeStream::new(watch_resize);
 
         loop {
             tokio::select! {
@@ -94,6 +118,12 @@ impl InteractiveTerminal {
                         Err(error) => return Err(Error::from(error)),
                     }
                 }
+                resize = resize_stream.next(), if watch_resize => {
+                    if resize {
+                        let (columns, rows) = self.size();
+                        channel.window_change(columns, rows, 0, 0).await?;
+                    }
+                }
             }
         }
 
@@ -129,6 +159,13 @@ trait SessionChannel {
     fn data<'a>(&'a self, data: &'a [u8]) -> BoxFuture<'a, Result<()>>;
     fn eof<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>>;
+    fn window_change<'a>(
+        &'a self,
+        columns: u32,
+        rows: u32,
+        pix_width: u32,
+        pix_height: u32,
+    ) -> BoxFuture<'a, Result<()>>;
 }
 
 struct RusshChannelAdapter<'a, S>
@@ -152,6 +189,64 @@ where
 
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>> {
         Box::pin(async move { self.channel.wait().await })
+    }
+
+    fn window_change<'a>(
+        &'a self,
+        columns: u32,
+        rows: u32,
+        pix_width: u32,
+        pix_height: u32,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.channel
+                .window_change(columns, rows, pix_width, pix_height)
+                .await
+                .map_err(map_ssh_error)
+        })
+    }
+}
+
+struct ResizeStream {
+    #[cfg(unix)]
+    signal: Option<tokio::signal::unix::Signal>,
+}
+
+impl ResizeStream {
+    fn new(enabled: bool) -> Self {
+        #[cfg(unix)]
+        {
+            let signal = if enabled {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok()
+            } else {
+                None
+            };
+            Self { signal }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = enabled;
+            Self {}
+        }
+    }
+
+    async fn next(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            match self.signal.as_mut() {
+                Some(signal) => {
+                    signal.recv().await;
+                    true
+                }
+                None => std::future::pending::<bool>().await,
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<bool>().await
+        }
     }
 }
 
@@ -182,7 +277,7 @@ mod tests {
 
         let exit_status = timeout(
             Duration::from_millis(100),
-            terminal.attach_io(&mut channel, &mut stdin, &mut stdout, &mut stderr),
+            terminal.attach_io(&mut channel, &mut stdin, &mut stdout, &mut stderr, false),
         )
         .await
         .expect("session loop should stop on exit status")
@@ -250,6 +345,16 @@ mod tests {
                     std::future::pending().await
                 }
             })
+        }
+
+        fn window_change<'a>(
+            &'a self,
+            _columns: u32,
+            _rows: u32,
+            _pix_width: u32,
+            _pix_height: u32,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 }

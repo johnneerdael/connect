@@ -23,6 +23,7 @@ impl Database {
                 host TEXT NOT NULL,
                 port INTEGER NOT NULL,
                 username TEXT NOT NULL,
+                auth_mode TEXT NOT NULL DEFAULT 'auto',
                 has_password INTEGER NOT NULL DEFAULT 0,
                 has_private_key INTEGER NOT NULL DEFAULT 0,
                 has_key_passphrase INTEGER NOT NULL DEFAULT 0,
@@ -42,6 +43,7 @@ impl Database {
             );
             ",
         )?;
+        add_profiles_auth_mode_column_if_missing(&connection)?;
         Ok(())
     }
 
@@ -51,4 +53,20 @@ impl Database {
         connection.pragma_update(None, "foreign_keys", true)?;
         Ok(connection)
     }
+}
+
+fn add_profiles_auth_mode_column_if_missing(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(profiles)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "auth_mode" {
+            return Ok(());
+        }
+    }
+
+    connection.execute(
+        "ALTER TABLE profiles ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'auto'",
+        [],
+    )?;
+    Ok(())
 }

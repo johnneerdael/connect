@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 
+use crate::store::AuthMode;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "connect",
@@ -21,6 +23,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
+    /// Open an interactive SSH shell.
+    Open(OpenArgs),
+    /// Execute a remote command without opening an interactive shell.
+    Exec(ExecArgs),
     /// Add a new SSH profile.
     Add(AddArgs),
     /// Edit an existing SSH profile.
@@ -51,6 +57,8 @@ pub struct AddArgs {
     pub user: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
+    #[arg(long, default_value_t = AuthMode::Auto, value_parser = parse_auth_mode)]
+    pub auth_mode: AuthMode,
     #[arg(long, conflicts_with = "password_stdin")]
     pub password: bool,
     #[arg(long = "password-stdin", conflicts_with = "password")]
@@ -73,6 +81,8 @@ pub struct EditArgs {
     pub user: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
+    #[arg(long, value_parser = parse_auth_mode)]
+    pub auth_mode: Option<AuthMode>,
     #[arg(long, conflicts_with = "password_stdin")]
     pub password: bool,
     #[arg(long = "password-stdin", conflicts_with = "password")]
@@ -113,6 +123,27 @@ pub struct CopyArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct OpenArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ExecArgs {
+    #[arg(value_name = "PROFILE")]
+    pub profile: String,
+    #[arg(long)]
+    pub pty: bool,
+    #[arg(
+        value_name = "COMMAND",
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct CompletionArgs {
     #[arg(value_name = "SHELL")]
     pub shell: Shell,
@@ -141,4 +172,8 @@ pub struct HostkeysDeleteArgs {
     pub target: String,
     #[arg(long, short = 'y')]
     pub yes: bool,
+}
+
+fn parse_auth_mode(value: &str) -> Result<AuthMode, String> {
+    value.parse()
 }

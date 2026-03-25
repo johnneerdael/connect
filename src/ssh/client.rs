@@ -1,23 +1,27 @@
 use std::{
     future::Future,
+    io::IsTerminal,
     path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use filetime::{set_file_mtime, FileTime};
 use russh::{
     client::{self, Handle},
+    keys::agent::client::AgentClient,
     keys::{self, PrivateKeyWithHashAlg, PublicKeyBase64},
     Disconnect,
 };
 use russh_sftp::{
+    client::fs::Metadata as SftpMetadata,
     client::{error::Error as SftpError, SftpSession},
-    protocol::{OpenFlags, StatusCode},
+    protocol::{FileAttributes, OpenFlags, StatusCode},
 };
 use tokio::{
     fs::File,
-    io::{copy, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::{
@@ -26,12 +30,16 @@ use crate::{
     terminal::interactive::InteractiveTerminal,
 };
 
-use super::{verify_observed_host_key, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType};
+use super::{
+    verify_observed_host_key, ExecSpec, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
+};
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
 type SshResultFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_MAX_MISSES: usize = 3;
+#[cfg(windows)]
+const OPENSSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 pub trait SshClient: Send + Sync {
     fn connect<'a>(
@@ -45,6 +53,13 @@ pub trait SshSession: Send {
     fn observe_host_key<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<ObservedHostKey>> + Send + 'a>>;
+
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        _username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async { Ok(false) })
+    }
 
     fn authenticate_public_key<'a>(
         &'a mut self,
@@ -60,6 +75,21 @@ pub trait SshSession: Send {
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
 
     fn open_shell<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>>;
+
+    fn execute_command<'a>(
+        &'a mut self,
+        _spec: &'a ExecSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>> {
+        Box::pin(async {
+            Err(Error::new(
+                "ssh session does not support remote command execution",
+            ))
+        })
+    }
+
+    fn disconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn remote_file_type<'a>(
         &'a mut self,
@@ -116,6 +146,24 @@ impl RusshClient {
             keepalive_max: KEEPALIVE_MAX_MISSES,
             ..Default::default()
         }
+    }
+}
+
+pub fn agent_auth_available() -> bool {
+    #[cfg(unix)]
+    {
+        std::env::var_os("SSH_AUTH_SOCK").is_some()
+    }
+
+    #[cfg(windows)]
+    {
+        std::env::var_os("SSH_AUTH_SOCK").is_some()
+            || std::path::Path::new(OPENSSH_AGENT_PIPE).exists()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -238,6 +286,45 @@ impl SshSession for RusshSession {
         })
     }
 
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut agent = connect_agent().await?;
+            let identities = agent
+                .request_identities()
+                .await
+                .map_err(|error| Error::new(format!("ssh agent error: {error}")))?;
+
+            if identities.is_empty() {
+                return Ok(false);
+            }
+
+            for identity in identities {
+                let hash_alg = match identity.algorithm() {
+                    keys::ssh_key::Algorithm::Rsa { .. } => self
+                        .handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(map_ssh_error)?
+                        .flatten(),
+                    _ => None,
+                };
+                let auth = self
+                    .handle
+                    .authenticate_publickey_with(username, identity, hash_alg, &mut agent)
+                    .await
+                    .map_err(|error| Error::new(format!("ssh agent auth error: {error}")))?;
+                if auth.success() {
+                    return Ok(true);
+                }
+            }
+
+            Ok(false)
+        })
+    }
+
     fn authenticate_password<'a>(
         &'a mut self,
         username: &'a str,
@@ -266,12 +353,43 @@ impl SshSession for RusshSession {
                 .await
                 .map_err(map_ssh_error)?;
             channel.request_shell(true).await.map_err(map_ssh_error)?;
-            let exit_status = self.terminal.attach(&mut channel).await?;
+            self.terminal.attach(&mut channel).await
+        })
+    }
+
+    fn execute_command<'a>(
+        &'a mut self,
+        spec: &'a ExecSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(map_ssh_error)?;
+            if spec.pty {
+                let (columns, rows) = self.terminal.size();
+                channel
+                    .request_pty(true, &self.terminal.term(), columns, rows, 0, 0, &[])
+                    .await
+                    .map_err(map_ssh_error)?;
+            }
+            channel
+                .exec(true, spec.command_line()?)
+                .await
+                .map_err(map_ssh_error)?;
+            self.terminal
+                .stream_command_output(&mut channel, spec.pty)
+                .await
+        })
+    }
+
+    fn disconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
             self.handle
                 .disconnect(Disconnect::ByApplication, "", "English")
                 .await
-                .map_err(map_ssh_error)?;
-            Ok(exit_status)
+                .map_err(map_ssh_error)
         })
     }
 
@@ -344,8 +462,21 @@ impl SshSession for RusshSession {
                 )
                 .await
                 .map_err(map_sftp_error)?;
-            copy(&mut local, &mut remote).await?;
+            let total_bytes = std::fs::metadata(local_path)
+                .ok()
+                .map(|metadata| metadata.len());
+            copy_stream_with_progress(
+                &mut local,
+                &mut remote,
+                progress_label("upload", local_path, remote_path),
+                total_bytes,
+            )
+            .await?;
             remote.shutdown().await?;
+            if let Ok(metadata) = std::fs::metadata(local_path) {
+                let attrs = FileAttributes::from(&metadata);
+                let _ = sftp.set_metadata(remote_path, attrs).await;
+            }
             Ok(())
         })
     }
@@ -358,9 +489,17 @@ impl SshSession for RusshSession {
         Box::pin(async move {
             let sftp = self.sftp().await?;
             let mut remote = sftp.open(remote_path).await.map_err(map_sftp_error)?;
+            let remote_metadata = remote.metadata().await.map_err(map_sftp_error)?;
             let mut local = File::create(local_path).await?;
-            copy(&mut remote, &mut local).await?;
+            copy_stream_with_progress(
+                &mut remote,
+                &mut local,
+                progress_label("download", local_path, remote_path),
+                remote_metadata.size,
+            )
+            .await?;
             local.flush().await?;
+            apply_local_metadata(local_path, &remote_metadata)?;
             Ok(())
         })
     }
@@ -450,4 +589,99 @@ fn map_remote_file_type(file_type: russh_sftp::protocol::FileType) -> RemoteFile
     } else {
         RemoteFileType::Other
     }
+}
+
+#[cfg(unix)]
+async fn connect_agent() -> Result<AgentClient<tokio::net::UnixStream>> {
+    AgentClient::connect_env()
+        .await
+        .map_err(|error| Error::new(format!("ssh agent is not available: {error}")))
+}
+
+#[cfg(windows)]
+async fn connect_agent() -> Result<AgentClient<tokio::net::windows::named_pipe::NamedPipeClient>> {
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+        AgentClient::connect_named_pipe(sock)
+            .await
+            .map_err(|error| Error::new(format!("ssh agent is not available: {error}")))
+    } else {
+        AgentClient::connect_named_pipe(OPENSSH_AGENT_PIPE)
+            .await
+            .map_err(|error| Error::new(format!("ssh agent is not available: {error}")))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn connect_agent() -> Result<()> {
+    Err(Error::new("ssh agent is not supported on this platform"))
+}
+
+fn progress_label(direction: &str, local_path: &Path, remote_path: &str) -> String {
+    format!("{direction} {} <-> {remote_path}", local_path.display())
+}
+
+async fn copy_stream_with_progress<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    label: String,
+    total_bytes: Option<u64>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stderr = tokio::io::stderr();
+    let show_progress = std::io::stderr().is_terminal();
+    if show_progress {
+        print_progress(&mut stderr, &label, 0, total_bytes).await?;
+    }
+
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read]).await?;
+        copied += u64::try_from(read).unwrap_or(u64::MAX);
+        if show_progress {
+            print_progress(&mut stderr, &label, copied, total_bytes).await?;
+        }
+    }
+    writer.flush().await?;
+    if show_progress {
+        stderr.write_all(b"\n").await?;
+        stderr.flush().await?;
+    }
+    Ok(())
+}
+
+async fn print_progress(
+    stderr: &mut tokio::io::Stderr,
+    label: &str,
+    copied: u64,
+    total_bytes: Option<u64>,
+) -> Result<()> {
+    let line = match total_bytes {
+        Some(total) if total > 0 => format!("\r{label}: {copied}/{total} bytes"),
+        _ => format!("\r{label}: {copied} bytes"),
+    };
+    stderr.write_all(line.as_bytes()).await?;
+    stderr.flush().await?;
+    Ok(())
+}
+
+fn apply_local_metadata(local_path: &Path, metadata: &SftpMetadata) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(mode) = metadata.permissions {
+        let permissions = std::os::unix::fs::PermissionsExt::from_mode(mode & 0o777);
+        let _ = std::fs::set_permissions(local_path, permissions);
+    }
+
+    if let Some(mtime) = metadata.mtime {
+        let _ = set_file_mtime(local_path, FileTime::from_unix_time(i64::from(mtime), 0));
+    }
+
+    Ok(())
 }

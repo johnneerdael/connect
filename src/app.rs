@@ -9,14 +9,17 @@ use directories::ProjectDirs;
 
 use crate::{
     cli::{
-        commands::{add, completion, connect, copy, edit, hostkeys, list, remove, show, version},
+        commands::{
+            add, completion, copy, edit, exec, hostkeys, list, open, remove, show, version,
+        },
         Cli, Command, HostkeysCommand,
     },
     error::{Error, Result},
     secrets::{KeyringSecretStore, SecretStore},
     ssh::{
-        connect_profile as ssh_connect_profile, copy_profile as ssh_copy_profile, CopySpec,
-        ProfileAuth, SshClient, SshConnectionContext,
+        copy_profile as ssh_copy_profile, exec_profile as ssh_exec_profile,
+        open_profile as ssh_open_profile, CopySpec, ExecSpec, ProfileAuth, SshClient,
+        SshConnectionContext,
     },
     store::{Database, HostKeyStore, Profile, ProfileInput, ProfileStore},
     terminal::prompt::StdioPrompt,
@@ -194,6 +197,7 @@ impl App {
         let profile = self.get_profile(name)?;
         let mut updated =
             ProfileInput::new(profile.name, profile.host, profile.username).with_port(profile.port);
+        updated.auth_mode = profile.auth_mode;
         updated.has_password = has_password;
         updated.has_private_key = has_private_key;
         updated.has_key_passphrase = has_key_passphrase;
@@ -237,14 +241,34 @@ impl App {
         self.hostkey_store.delete_host_port(host, port)
     }
 
-    pub async fn connect_profile(
+    pub async fn open_profile(
         &self,
         name: &str,
         ssh: &dyn SshClient,
         prompt: &dyn crate::terminal::prompt::Prompt,
     ) -> Result<()> {
         let profile = self.get_profile(name)?;
-        ssh_connect_profile(ssh, &profile, self, prompt).await
+        ssh_open_profile(ssh, &profile, self, prompt).await
+    }
+
+    pub async fn connect_profile(
+        &self,
+        name: &str,
+        ssh: &dyn SshClient,
+        prompt: &dyn crate::terminal::prompt::Prompt,
+    ) -> Result<()> {
+        self.open_profile(name, ssh, prompt).await
+    }
+
+    pub async fn exec(
+        &self,
+        name: &str,
+        spec: &ExecSpec,
+        ssh: &dyn SshClient,
+        prompt: &dyn crate::terminal::prompt::Prompt,
+    ) -> Result<()> {
+        let profile = self.get_profile(name)?;
+        ssh_exec_profile(ssh, spec, &profile, self, prompt).await
     }
 
     pub async fn copy(
@@ -318,10 +342,19 @@ impl App {
 
     fn load_profile_auth(&self, profile: &Profile) -> Result<ProfileAuth> {
         Ok(ProfileAuth {
+            auth_mode: profile.auth_mode,
             password: self.secrets.get_password(&profile.name)?,
             private_key: self.secrets.get_private_key(&profile.name)?,
             key_passphrase: self.secrets.get_key_passphrase(&profile.name)?,
         })
+    }
+
+    pub fn agent_auth_status(&self) -> &'static str {
+        if crate::ssh::agent_auth_available() {
+            "available"
+        } else {
+            "not available"
+        }
     }
 }
 
@@ -371,6 +404,14 @@ pub fn run() -> Result<()> {
             let app = App::load()?;
             show::run(&app, &args, &mut stdout)
         }
+        Some(Command::Open(args)) => {
+            let app = App::load()?;
+            open::run(&app, &prompt, &args.profile)
+        }
+        Some(Command::Exec(args)) => {
+            let app = App::load()?;
+            exec::run(&app, &prompt, &args)
+        }
         Some(Command::Hostkeys(args)) => {
             let app = App::load()?;
             let command = args
@@ -387,7 +428,7 @@ pub fn run() -> Result<()> {
         None => {
             let app = App::load()?;
             match cli.profile {
-                Some(profile) => connect::run(&app, &prompt, &profile),
+                Some(profile) => open::run(&app, &prompt, &profile),
                 None => Ok(()),
             }
         }

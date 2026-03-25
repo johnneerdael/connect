@@ -53,7 +53,9 @@ pub fn run(app: &App, prompt: &dyn Prompt, args: &AddArgs, writer: &mut dyn Writ
         )?,
     };
 
-    let profile = ProfileInput::new(name.clone(), host, user).with_port(port);
+    let profile = ProfileInput::new(name.clone(), host, user)
+        .with_port(port)
+        .with_auth_mode(args.auth_mode);
     let _ = app.save_profile_with_secrets(profile, secrets)?;
     writeln!(writer, "Added profile '{name}'.").map_err(Error::from)
 }
@@ -169,6 +171,8 @@ fn stdin_secret(key: &str) -> Result<Option<String>> {
 
 const RESERVED_PROFILE_NAMES: &[&str] = &[
     "add",
+    "open",
+    "exec",
     "edit",
     "remove",
     "list",

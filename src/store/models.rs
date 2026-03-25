@@ -1,9 +1,54 @@
+use std::{fmt, str::FromStr};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    #[default]
+    Auto,
+    AgentOnly,
+    StoredOnly,
+    PasswordOnly,
+}
+
+impl AuthMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::AgentOnly => "agent-only",
+            Self::StoredOnly => "stored-only",
+            Self::PasswordOnly => "password-only",
+        }
+    }
+}
+
+impl fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AuthMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "agent-only" => Ok(Self::AgentOnly),
+            "stored-only" => Ok(Self::StoredOnly),
+            "password-only" => Ok(Self::PasswordOnly),
+            _ => Err(format!(
+                "invalid auth mode '{value}' (expected auto, agent-only, stored-only, or password-only)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileInput {
     pub name: String,
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub auth_mode: AuthMode,
     pub has_password: bool,
     pub has_private_key: bool,
     pub has_key_passphrase: bool,
@@ -20,6 +65,7 @@ impl ProfileInput {
             host: host.into(),
             port: 22,
             username: username.into(),
+            auth_mode: AuthMode::Auto,
             has_password: false,
             has_private_key: false,
             has_key_passphrase: false,
@@ -30,6 +76,11 @@ impl ProfileInput {
         self.port = port;
         self
     }
+
+    pub fn with_auth_mode(mut self, auth_mode: AuthMode) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +89,7 @@ pub struct Profile {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub auth_mode: AuthMode,
     pub has_password: bool,
     pub has_private_key: bool,
     pub has_key_passphrase: bool,
