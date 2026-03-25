@@ -14,8 +14,8 @@ use connect::store::AuthMode;
 use connect::{
     app::{App, AppPaths, ProfileSecretsInput, SecretBackend},
     cli::{
-        commands::{add, edit, list, remove, show},
-        AddArgs, EditArgs, RemoveArgs, ShowArgs,
+        commands::{add, edit, forward, list, remove, show},
+        AddArgs, EditArgs, ForwardArgs, ForwardCommand, ForwardRunArgs, RemoveArgs, ShowArgs,
     },
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
@@ -179,6 +179,83 @@ fn forward_list_and_delete_are_scoped_by_profile() {
     assert_eq!(
         harness.app().list_forwards("prod").unwrap(),
         vec![secondary]
+    );
+}
+
+#[test]
+fn save_forward_rejects_invalid_local_and_socks_shapes() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let missing_target = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: None,
+        target_port: None,
+        description: None,
+    };
+    let error = harness.app().save_forward(missing_target).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "local forward requires target_host and target_port"
+    );
+
+    let socks_with_target = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "proxy".into(),
+        kind: ForwardKind::Socks,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 1080,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+    let error = harness.app().save_forward(socks_with_target).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "socks forward must not include target_host or target_port"
+    );
+}
+
+#[test]
+fn forward_run_rejects_missing_or_conflicting_selector_arguments() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let prompt = FakePrompt::default();
+    let mut output = Vec::new();
+
+    let missing_selector = ForwardArgs {
+        command: ForwardCommand::Run(ForwardRunArgs {
+            profile: "prod".into(),
+            name: None,
+            all: false,
+        }),
+    };
+    let error = forward::run(harness.app(), &prompt, &missing_selector, &mut output).unwrap_err();
+    assert_eq!(error.to_string(), "forward run requires a name or --all");
+
+    let conflicting_selector = ForwardArgs {
+        command: ForwardCommand::Run(ForwardRunArgs {
+            profile: "prod".into(),
+            name: Some("db".into()),
+            all: true,
+        }),
+    };
+    let error =
+        forward::run(harness.app(), &prompt, &conflicting_selector, &mut output).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "forward run cannot accept both a name and --all"
     );
 }
 

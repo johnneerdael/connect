@@ -161,7 +161,7 @@ pub struct DoctorArgs {
 #[command(subcommand_required = true, arg_required_else_help = true)]
 pub struct ForwardArgs {
     #[command(subcommand)]
-    pub command: Option<ForwardCommand>,
+    pub command: ForwardCommand,
 }
 
 #[derive(Subcommand, Debug, Clone)]

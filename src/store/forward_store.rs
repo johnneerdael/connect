@@ -4,13 +4,11 @@ use crate::error::Result;
 
 use super::{Database, ForwardDefinition};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ForwardStore {
     database: Database,
 }
 
-#[allow(dead_code)]
 impl ForwardStore {
     pub fn new(database: Database) -> Self {
         Self { database }
@@ -98,7 +96,6 @@ impl ForwardStore {
     }
 }
 
-#[allow(dead_code)]
 fn map_forward_definition(row: &Row<'_>) -> rusqlite::Result<ForwardDefinition> {
     Ok(ForwardDefinition {
         profile_name: row.get(0)?,

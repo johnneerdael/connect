@@ -102,7 +102,7 @@ fn forward_add_and_run_parse_with_explicit_subcommands() {
     ]);
     match add.command {
         Some(CliCommand::Forward(args)) => match args.command {
-            Some(ForwardCommand::Add(args)) => {
+            ForwardCommand::Add(args) => {
                 assert_eq!(args.profile, "prod");
                 assert_eq!(args.name, "db");
                 assert_eq!(args.local.as_deref(), Some("127.0.0.1:15432:db.internal:5432"));
@@ -116,7 +116,7 @@ fn forward_add_and_run_parse_with_explicit_subcommands() {
     let run = parse_cli(&["connect", "forward", "run", "prod", "--all"]);
     match run.command {
         Some(CliCommand::Forward(args)) => match args.command {
-            Some(ForwardCommand::Run(args)) => {
+            ForwardCommand::Run(args) => {
                 assert_eq!(args.profile, "prod");
                 assert!(args.name.is_none());
                 assert!(args.all);

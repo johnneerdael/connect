@@ -171,6 +171,7 @@ impl App {
     }
 
     pub fn save_forward(&self, definition: ForwardDefinition) -> Result<ForwardDefinition> {
+        self.validate_forward_definition(&definition)?;
         self.get_profile(&definition.profile_name)?;
         self.forward_store.save(&definition)?;
         self.get_forward(&definition.profile_name, &definition.name)
@@ -388,6 +389,27 @@ impl App {
         } else {
             "not available"
         }
+    }
+
+    fn validate_forward_definition(&self, definition: &ForwardDefinition) -> Result<()> {
+        match definition.kind {
+            crate::store::ForwardKind::Local => {
+                if definition.target_host.is_none() || definition.target_port.is_none() {
+                    return Err(Error::new(
+                        "local forward requires target_host and target_port",
+                    ));
+                }
+            }
+            crate::store::ForwardKind::Socks => {
+                if definition.target_host.is_some() || definition.target_port.is_some() {
+                    return Err(Error::new(
+                        "socks forward must not include target_host or target_port",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

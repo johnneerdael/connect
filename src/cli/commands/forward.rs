@@ -14,12 +14,11 @@ use crate::{
 use super::add::{validate_non_empty, validate_port};
 
 pub fn run(app: &App, prompt: &dyn Prompt, args: &ForwardArgs, writer: &mut dyn Write) -> Result<()> {
-    match args.command.as_ref() {
-        Some(ForwardCommand::Add(args)) => add(app, args, writer),
-        Some(ForwardCommand::List(args)) => list(app, args, writer),
-        Some(ForwardCommand::Remove(args)) => remove(app, prompt, args, writer),
-        Some(ForwardCommand::Run(args)) => run_forward(app, args, writer),
-        None => Err(Error::new("forward requires a subcommand")),
+    match &args.command {
+        ForwardCommand::Add(args) => add(app, args, writer),
+        ForwardCommand::List(args) => list(app, args, writer),
+        ForwardCommand::Remove(args) => remove(app, prompt, args, writer),
+        ForwardCommand::Run(args) => run_forward(app, args, writer),
     }
 }
 
@@ -139,7 +138,7 @@ fn parse_local_spec(spec: &str) -> Result<(String, u16, String, u16)> {
 
     if parts.next().is_some() {
         return Err(Error::new(
-            "forward specs must be either bind_host:bind_port:target_host:target_port or bind_host:bind_port",
+            "local forward specs must be bind_host:bind_port:target_host:target_port",
         ));
     }
 
