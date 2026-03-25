@@ -61,7 +61,7 @@ pub async fn open_profile(
 ) -> Result<()> {
     let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
     let exit_status = session.open_shell().await?;
-    session.disconnect().await?;
+    disconnect_session_best_effort(session);
     if exit_status == 0 {
         Ok(())
     } else {
@@ -78,12 +78,19 @@ pub async fn exec_profile(
 ) -> Result<()> {
     let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
     let exit_status = session.execute_command(spec).await?;
-    session.disconnect().await?;
+    disconnect_session_best_effort(session);
     if exit_status == 0 {
         Ok(())
     } else {
         Err(Error::RemoteExitStatus(exit_status))
     }
+}
+
+fn disconnect_session_best_effort(session: Box<dyn SshSession + Send + 'static>) {
+    tokio::spawn(async move {
+        let mut session = session;
+        let _ = session.disconnect().await;
+    });
 }
 
 pub(crate) async fn connect_authenticated_session(

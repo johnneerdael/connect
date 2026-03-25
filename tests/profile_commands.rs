@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use connect::store::AuthMode;
@@ -1162,6 +1163,59 @@ async fn connect_propagates_remote_exit_status() {
 }
 
 #[tokio::test]
+async fn connect_does_not_block_on_disconnect_after_remote_exit() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_pending_disconnect();
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        harness
+            .app()
+            .connect_profile("prod", &ssh, &FakePrompt::default()),
+    )
+    .await
+    .expect("connect should return without waiting for disconnect")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn exec_does_not_block_on_disconnect_after_remote_exit() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_pending_disconnect();
+    let spec = ExecSpec::new(vec!["true".into()], false);
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        harness
+            .app()
+            .exec("prod", &spec, &ssh, &FakePrompt::default()),
+    )
+    .await
+    .expect("exec should return without waiting for disconnect")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn copy_uses_profile_and_rejects_host_key_mismatch() {
     let harness = TestHarness::with_profile("prod");
     harness.save_hostkey("prod.example.com", 22, "expected-fingerprint");
@@ -1940,6 +1994,7 @@ struct FakeConnectState {
     exit_status: u32,
     exec_status: u32,
     executed_command: Option<(String, bool)>,
+    disconnect_pending: bool,
 }
 
 impl FakeConnectSshClient {
@@ -1961,6 +2016,7 @@ impl FakeConnectSshClient {
                 exit_status: 0,
                 exec_status: 0,
                 executed_command: None,
+                disconnect_pending: false,
             })),
         }
     }
@@ -1983,6 +2039,7 @@ impl FakeConnectSshClient {
                 exit_status: 0,
                 exec_status: 0,
                 executed_command: None,
+                disconnect_pending: false,
             })),
         }
     }
@@ -2002,6 +2059,12 @@ impl FakeConnectSshClient {
     fn with_exec_exit_status(exit_status: u32) -> Self {
         let client = Self::with_hostkey("fp-123");
         client.state.lock().unwrap().exec_status = exit_status;
+        client
+    }
+
+    fn with_pending_disconnect() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().disconnect_pending = true;
         client
     }
 
@@ -2116,6 +2179,19 @@ impl SshSession for FakeConnectSession {
             state.exec_status
         };
         Box::pin(async move { Ok(exit_status) })
+    }
+
+    fn disconnect<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<()>> + Send + 'a>>
+    {
+        let disconnect_pending = self.state.lock().unwrap().disconnect_pending;
+        Box::pin(async move {
+            if disconnect_pending {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
     }
 }
 
