@@ -44,7 +44,7 @@ jobs:
           echo "MACOS_SIGNING_ENABLED=false" >> "$GITHUB_ENV"
 
       - name: Import macOS signing certificates
-        if: matrix.kind == 'macos' && secrets.MACOS_DEVELOPER_ID_APPLICATION_P12 != '' && secrets.MACOS_DEVELOPER_ID_INSTALLER_P12 != '' && secrets.MACOS_DEVELOPER_ID_P12_PASSWORD != '' && secrets.MACOS_KEYCHAIN_PASSWORD != ''
+        if: matrix.kind == 'macos'
         shell: bash
         env:
           MACOS_DEVELOPER_ID_APPLICATION_P12: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION_P12 }}
@@ -52,6 +52,11 @@ jobs:
           MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
           MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
         run: |
+          if [ -z "${MACOS_DEVELOPER_ID_APPLICATION_P12:-}" ] || [ -z "${MACOS_DEVELOPER_ID_INSTALLER_P12:-}" ] || [ -z "${MACOS_DEVELOPER_ID_P12_PASSWORD:-}" ] || [ -z "${MACOS_KEYCHAIN_PASSWORD:-}" ]; then
+            echo "macOS signing secrets are not configured; building unsigned package"
+            exit 0
+          fi
+
           KEYCHAIN_PATH="$RUNNER_TEMP/connect-signing.keychain-db"
           APP_CERT_PATH="$RUNNER_TEMP/connect-app-cert.p12"
           INSTALLER_CERT_PATH="$RUNNER_TEMP/connect-installer-cert.p12"
