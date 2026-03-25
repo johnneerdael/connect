@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crossterm::terminal;
 use filetime::{set_file_mtime, FileTime};
 use russh::{
     client::{self, Handle},
@@ -394,6 +395,20 @@ mod tests {
         assert!(progress.contains("upload test: 0/19 bytes\n"));
         assert!(progress.contains("upload test: 19/19 bytes\n"));
         assert!(!progress.contains('\r'));
+    }
+
+    #[test]
+    fn interactive_progress_line_truncates_long_labels_to_terminal_width() {
+        let line = format_interactive_progress_line(
+            "download npa_publisher_wizard/npa_publisher_wizard <-> /home/jneerdael/npa_publisher_wizard/npa_publisher_wizard",
+            42,
+            Some(1024),
+            40,
+        );
+
+        assert!(line.chars().count() <= 39);
+        assert!(line.contains("..."));
+        assert!(line.ends_with(": 42/1024 bytes"));
     }
 }
 
@@ -964,23 +979,86 @@ async fn print_progress<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let line = match total_bytes {
-        Some(total) if total > 0 => format!("{label}: {copied}/{total} bytes"),
-        _ => format!("{label}: {copied} bytes"),
-    };
     match progress_mode {
         ProgressMode::Hidden => {}
         ProgressMode::Interactive => {
+            let line = format_interactive_progress_line(
+                label,
+                copied,
+                total_bytes,
+                interactive_progress_columns(),
+            );
             stderr.write_all(b"\r\x1b[2K").await?;
             stderr.write_all(line.as_bytes()).await?;
         }
         ProgressMode::LogLines => {
+            let line = format_progress_line(label, copied, total_bytes);
             stderr.write_all(line.as_bytes()).await?;
             stderr.write_all(b"\n").await?;
         }
     }
     stderr.flush().await?;
     Ok(())
+}
+
+fn format_progress_line(label: &str, copied: u64, total_bytes: Option<u64>) -> String {
+    let progress = match total_bytes {
+        Some(total) if total > 0 => format!("{copied}/{total} bytes"),
+        _ => format!("{copied} bytes"),
+    };
+    format!("{label}: {progress}")
+}
+
+fn format_interactive_progress_line(
+    label: &str,
+    copied: u64,
+    total_bytes: Option<u64>,
+    terminal_columns: usize,
+) -> String {
+    let progress = match total_bytes {
+        Some(total) if total > 0 => format!("{copied}/{total} bytes"),
+        _ => format!("{copied} bytes"),
+    };
+    let available_width = terminal_columns.saturating_sub(1);
+    let reserved_width = progress.chars().count() + 2;
+    if available_width <= reserved_width {
+        return progress;
+    }
+
+    let truncated_label = truncate_middle(label, available_width - reserved_width);
+    format!("{truncated_label}: {progress}")
+}
+
+fn interactive_progress_columns() -> usize {
+    terminal::size()
+        .ok()
+        .map(|(columns, _)| usize::from(columns))
+        .filter(|columns| *columns > 0)
+        .unwrap_or(80)
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let prefix_len = (max_chars - 3) / 2;
+    let suffix_len = max_chars - 3 - prefix_len;
+    let prefix: String = value.chars().take(prefix_len).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(suffix_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn apply_local_metadata(local_path: &Path, metadata: &SftpMetadata) -> Result<()> {
