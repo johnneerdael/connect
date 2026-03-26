@@ -31,6 +31,10 @@ fn packaging_assets_exist() {
             "GITHUB_REF_NAME",
             "MACOS_DEVELOPER_ID_APPLICATION_P12",
             "MACOS_DEVELOPER_ID_INSTALLER_P12",
+            "MACOS_NOTARY_API_KEY_P8",
+            "MACOS_NOTARY_KEY_ID",
+            "xcrun notarytool submit",
+            "xcrun stapler staple",
             "security create-keychain",
             "codesign",
             "productsign",
@@ -46,7 +50,9 @@ fn packaging_assets_exist() {
             "hostkeys",
             "install",
             "MACOS_DEVELOPER_ID_APPLICATION_P12",
+            "MACOS_NOTARY_API_KEY_P8",
             "Developer ID Application",
+            "notarytool",
         ],
     );
     assert_file_contains(&repo_root.join("Cargo.toml"), ["readme = \"README.md\""]);

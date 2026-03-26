@@ -49,8 +49,11 @@ Tagged macOS releases can be signed in GitHub Actions when these repository secr
 - `MACOS_DEVELOPER_ID_INSTALLER_P12`
 - `MACOS_DEVELOPER_ID_P12_PASSWORD`
 - `MACOS_KEYCHAIN_PASSWORD`
+- `MACOS_NOTARY_API_KEY_P8`
+- `MACOS_NOTARY_KEY_ID`
+- `MACOS_NOTARY_ISSUER_ID` (optional for team keys only)
 
-The certificate payload secrets should contain base64-encoded `.p12` files for your `Developer ID Application` and `Developer ID Installer` certificates. When the secrets are absent, the workflow still produces an unsigned `.pkg` so local development and forks do not break.
+The certificate payload secrets should contain base64-encoded `.p12` files for your `Developer ID Application` and `Developer ID Installer` certificates. `MACOS_NOTARY_API_KEY_P8` should contain the base64-encoded contents of your App Store Connect API `.p8` key, and `MACOS_NOTARY_KEY_ID` should be the matching key ID. When notarization secrets are present, the workflow notarizes and staples the generated `.pkg`. When they are absent, the workflow still produces a signed-but-unstapled package so local development and forks do not break.
 
 ### Windows
 
@@ -270,7 +273,7 @@ cargo test
 
 ## Release Signing
 
-The GitHub Actions release workflow supports optional macOS signing for tagged releases.
+The GitHub Actions release workflow supports optional macOS signing and notarization for tagged releases.
 
 When signing secrets are present, the macOS job will:
 
@@ -278,5 +281,14 @@ When signing secrets are present, the macOS job will:
 - import the `Developer ID Installer` certificate into a temporary keychain
 - codesign the `connect` binary before packaging
 - sign the generated `.pkg` with `productsign`
+- submit the signed `.pkg` to Apple with `notarytool` when notarization secrets are present
+- staple the notarization ticket back onto the `.pkg`
+- validate the stapled installer with `stapler` and `spctl`
 
-When the secrets are not configured, the workflow falls back to unsigned macOS packaging automatically.
+Notarization uses an App Store Connect API key:
+
+- `MACOS_NOTARY_API_KEY_P8`
+- `MACOS_NOTARY_KEY_ID`
+- `MACOS_NOTARY_ISSUER_ID` only when the key is a team key
+
+When signing secrets are missing, the workflow falls back to unsigned macOS packaging. When signing secrets are present but notarization secrets are missing, the workflow still produces a signed package without notarization.

@@ -42,6 +42,7 @@ jobs:
         shell: bash
         run: |
           echo "MACOS_SIGNING_ENABLED=false" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARIZATION_ENABLED=false" >> "$GITHUB_ENV"
 
       - name: Import macOS signing certificates
         if: matrix.kind == 'macos'
@@ -85,6 +86,30 @@ jobs:
           echo "MACOS_CODESIGN_IDENTITY=$APP_IDENTITY" >> "$GITHUB_ENV"
           echo "MACOS_INSTALLER_IDENTITY=$INSTALLER_IDENTITY" >> "$GITHUB_ENV"
 
+      - name: Prepare macOS notarization credentials
+        if: matrix.kind == 'macos'
+        shell: bash
+        env:
+          MACOS_NOTARY_API_KEY_P8: ${{ secrets.MACOS_NOTARY_API_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          if [ -z "${MACOS_NOTARY_API_KEY_P8:-}" ] || [ -z "${MACOS_NOTARY_KEY_ID:-}" ]; then
+            echo "macOS notarization secrets are not configured; skipping notarization"
+            exit 0
+          fi
+
+          NOTARY_KEY_PATH="$RUNNER_TEMP/connect-notary-authkey.p8"
+          echo "$MACOS_NOTARY_API_KEY_P8" | base64 --decode > "$NOTARY_KEY_PATH"
+          chmod 600 "$NOTARY_KEY_PATH"
+
+          echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_PATH=$NOTARY_KEY_PATH" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
+          if [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
+            echo "MACOS_NOTARY_ISSUER_ID=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
+          fi
+
       - name: Package Linux tarball
         if: matrix.kind == 'linux'
         shell: bash
@@ -120,6 +145,16 @@ jobs:
             productsign --sign "$MACOS_INSTALLER_IDENTITY" dist/${{ matrix.package_name }} dist/connect-macos-signed.pkg
             mv dist/connect-macos-signed.pkg dist/${{ matrix.package_name }}
           fi
+          if [ "${MACOS_NOTARIZATION_ENABLED:-false}" = "true" ]; then
+            notary_args=(--key "$MACOS_NOTARY_KEY_PATH" --key-id "$MACOS_NOTARY_KEY_ID")
+            if [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
+              notary_args+=(--issuer "$MACOS_NOTARY_ISSUER_ID")
+            fi
+            xcrun notarytool submit dist/${{ matrix.package_name }} "${notary_args[@]}" --wait
+            xcrun stapler staple dist/${{ matrix.package_name }}
+            xcrun stapler validate dist/${{ matrix.package_name }}
+            spctl -a -vvv -t install dist/${{ matrix.package_name }}
+          fi
 
       - name: Install WiX
         if: matrix.kind == 'windows'
@@ -154,6 +189,10 @@ jobs:
         shell: bash
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/connect-signing.keychain-db"
+          NOTARY_KEY_PATH="$RUNNER_TEMP/connect-notary-authkey.p8"
           if [ -f "$KEYCHAIN_PATH" ]; then
             security delete-keychain "$KEYCHAIN_PATH"
+          fi
+          if [ -f "$NOTARY_KEY_PATH" ]; then
+            rm -f "$NOTARY_KEY_PATH"
           fi
