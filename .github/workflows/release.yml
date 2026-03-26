@@ -32,6 +32,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select latest stable Xcode
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          latest_xcode="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' ! -name '*beta*.app' | sort -V | tail -n 1)"
+          if [ -z "$latest_xcode" ]; then
+            echo "No stable Xcode installation found" >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$latest_xcode/Contents/Developer"
+          xcode-select -p
+          xcrun notarytool --version
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
@@ -116,10 +129,10 @@ jobs:
               --issuer "$MACOS_NOTARY_ISSUER_ID" \
               --keychain "$KEYCHAIN_PATH"
           else
-            xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            printf '\n' | xcrun notarytool store-credentials "$NOTARY_PROFILE" \
               --key "$NOTARY_KEY_PATH" \
               --key-id "$MACOS_NOTARY_KEY_ID" \
-              --keychain "$KEYCHAIN_PATH" <<< ""
+              --keychain "$KEYCHAIN_PATH"
           fi
 
           echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
