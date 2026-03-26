@@ -33,6 +33,8 @@ fn packaging_assets_exist() {
             "MACOS_DEVELOPER_ID_INSTALLER_P12",
             "MACOS_NOTARY_API_KEY_P8",
             "MACOS_NOTARY_KEY_ID",
+            "xcrun notarytool store-credentials",
+            "--keychain-profile",
             "xcrun notarytool submit",
             "xcrun stapler staple",
             "security create-keychain",

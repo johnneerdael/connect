@@ -53,7 +53,7 @@ Tagged macOS releases can be signed in GitHub Actions when these repository secr
 - `MACOS_NOTARY_KEY_ID`
 - `MACOS_NOTARY_ISSUER_ID` (optional for team keys only)
 
-The certificate payload secrets should contain base64-encoded `.p12` files for your `Developer ID Application` and `Developer ID Installer` certificates. `MACOS_NOTARY_API_KEY_P8` should contain the base64-encoded contents of your App Store Connect API `.p8` key, and `MACOS_NOTARY_KEY_ID` should be the matching key ID. When notarization secrets are present, the workflow notarizes and staples the generated `.pkg`. When they are absent, the workflow still produces a signed-but-unstapled package so local development and forks do not break.
+The certificate payload secrets should contain base64-encoded `.p12` files for your `Developer ID Application` and `Developer ID Installer` certificates. `MACOS_NOTARY_API_KEY_P8` should contain the base64-encoded contents of your App Store Connect API `.p8` key, and `MACOS_NOTARY_KEY_ID` should be the matching key ID. The workflow stores notarization credentials in a temporary keychain profile before submitting the package, which allows both individual keys without an issuer and team keys with `MACOS_NOTARY_ISSUER_ID`. When notarization secrets are present, the workflow notarizes and staples the generated `.pkg`. When they are absent, the workflow still produces a signed-but-unstapled package so local development and forks do not break.
 
 ### Windows
 
@@ -281,6 +281,7 @@ When signing secrets are present, the macOS job will:
 - import the `Developer ID Installer` certificate into a temporary keychain
 - codesign the `connect` binary before packaging
 - sign the generated `.pkg` with `productsign`
+- store notarization credentials in the same temporary keychain with `notarytool store-credentials`
 - submit the signed `.pkg` to Apple with `notarytool` when notarization secrets are present
 - staple the notarization ticket back onto the `.pkg`
 - validate the stapled installer with `stapler` and `spctl`

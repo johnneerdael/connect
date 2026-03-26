@@ -98,17 +98,33 @@ jobs:
             echo "macOS notarization secrets are not configured; skipping notarization"
             exit 0
           fi
+          if [ "${MACOS_SIGNING_ENABLED:-false}" != "true" ]; then
+            echo "macOS signing is not configured; skipping notarization"
+            exit 0
+          fi
 
+          KEYCHAIN_PATH="$RUNNER_TEMP/connect-signing.keychain-db"
           NOTARY_KEY_PATH="$RUNNER_TEMP/connect-notary-authkey.p8"
+          NOTARY_PROFILE="connect-notary-profile"
           echo "$MACOS_NOTARY_API_KEY_P8" | base64 --decode > "$NOTARY_KEY_PATH"
           chmod 600 "$NOTARY_KEY_PATH"
 
-          echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
-          echo "MACOS_NOTARY_KEY_PATH=$NOTARY_KEY_PATH" >> "$GITHUB_ENV"
-          echo "MACOS_NOTARY_KEY_ID=$MACOS_NOTARY_KEY_ID" >> "$GITHUB_ENV"
           if [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
-            echo "MACOS_NOTARY_ISSUER_ID=$MACOS_NOTARY_ISSUER_ID" >> "$GITHUB_ENV"
+            xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+              --key "$NOTARY_KEY_PATH" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" \
+              --keychain "$KEYCHAIN_PATH"
+          else
+            xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+              --key "$NOTARY_KEY_PATH" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --keychain "$KEYCHAIN_PATH" <<< ""
           fi
+
+          echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "MACOS_NOTARY_PROFILE=$NOTARY_PROFILE" >> "$GITHUB_ENV"
 
       - name: Package Linux tarball
         if: matrix.kind == 'linux'
@@ -146,11 +162,11 @@ jobs:
             mv dist/connect-macos-signed.pkg dist/${{ matrix.package_name }}
           fi
           if [ "${MACOS_NOTARIZATION_ENABLED:-false}" = "true" ]; then
-            notary_args=(--key "$MACOS_NOTARY_KEY_PATH" --key-id "$MACOS_NOTARY_KEY_ID")
-            if [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
-              notary_args+=(--issuer "$MACOS_NOTARY_ISSUER_ID")
-            fi
-            xcrun notarytool submit dist/${{ matrix.package_name }} "${notary_args[@]}" --wait
+            xcrun notarytool submit \
+              --keychain-profile "$MACOS_NOTARY_PROFILE" \
+              --keychain "$MACOS_NOTARY_KEYCHAIN_PATH" \
+              --wait \
+              dist/${{ matrix.package_name }}
             xcrun stapler staple dist/${{ matrix.package_name }}
             xcrun stapler validate dist/${{ matrix.package_name }}
             spctl -a -vvv -t install dist/${{ matrix.package_name }}
