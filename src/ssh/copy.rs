@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     convert::TryFrom,
     fmt, fs,
     path::{Path, PathBuf},
@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
+use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
 use crate::{
     error::{Error, Result},
@@ -16,9 +16,11 @@ use crate::{
 };
 
 use super::{
-    connect_authenticated_session, establish_transfer_sessions, CheckpointFileIdentity, ChunkRange,
-    CopyCheckpointIdentity, CopyCheckpointState, CopyCheckpointStore, CopyFileMetadata,
-    CopyTransferMode, SshClient, SshConnectionContext, SshSession,
+    connect_authenticated_session, establish_transfer_sessions,
+    progress::{AggregateProgressSnapshot, ProgressMode, ThreadedProgressReporter},
+    CheckpointFileIdentity, ChunkRange, CopyCheckpointIdentity, CopyCheckpointState,
+    CopyCheckpointStore, CopyFileMetadata, CopyTransferMode, SshClient, SshConnectionContext,
+    SshSession,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,7 +282,7 @@ pub fn plan_copy(
                                 size,
                                 chunks,
                                 policy: CopyJobPolicy {
-                                    resume: CopyResumeStrategy::Disabled,
+                                    resume: striped_resume_strategy(&spec, &checkpoint),
                                     retry: striped_retry_strategy(config.retry),
                                 },
                                 checkpoint,
@@ -291,7 +293,7 @@ pub fn plan_copy(
                                 destination_path,
                                 size,
                                 policy: CopyJobPolicy {
-                                    resume: CopyResumeStrategy::Disabled,
+                                    resume: whole_file_resume_strategy(&spec),
                                     retry: whole_file_retry_strategy(config.retry),
                                 },
                                 checkpoint,
@@ -597,6 +599,7 @@ pub struct CopySummary {
     pub resumed_bytes: u64,
     pub destination: String,
     pub effective_threads: usize,
+    pub failed_files: usize,
     pub warnings: Vec<String>,
 }
 
@@ -610,7 +613,11 @@ impl fmt::Display for CopySummary {
             self.resumed_bytes,
             self.destination,
             self.effective_threads
-        )
+        )?;
+        if self.failed_files > 0 {
+            write!(f, ", failed files: {}", self.failed_files)?;
+        }
+        Ok(())
     }
 }
 
@@ -644,12 +651,6 @@ pub fn parse_copy_spec(
                 "copy requires exactly one remote path in profile:/path format",
             ))
         }
-    }
-
-    if recursive && resume {
-        return Err(Error::new(
-            "--resume is only supported for single-file copy operations",
-        ));
     }
 
     Ok(CopySpec {
@@ -687,9 +688,9 @@ pub async fn copy_profile(
             CopyPlanMode::StripedFile { .. } => {
                 execute_threaded_striped_copy(prepared, &checkpoint_root).await
             }
-            CopyPlanMode::QueuedTree => Err(Error::new(
-                "threaded recursive copy is not implemented yet; queued tree plans are handled in Task 6",
-            )),
+            CopyPlanMode::QueuedTree => {
+                execute_threaded_recursive_copy(prepared, &checkpoint_root).await
+            }
         }
     } else {
         let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
@@ -701,6 +702,7 @@ pub async fn copy_profile(
 }
 
 const MAX_THREADED_CHUNK_ATTEMPTS: usize = 3;
+const MAX_THREADED_WHOLE_FILE_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct ThreadedStripedJob {
@@ -719,12 +721,62 @@ struct ChunkWork {
     attempt: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ThreadedWholeFileJob {
+    direction: CopyDirection,
+    local_path: PathBuf,
+    remote_path: String,
+    size: u64,
+    resume_offset: u64,
+    retry: CopyRetryStrategy,
+}
+
+#[derive(Debug, Clone)]
+enum ThreadedTreeWork {
+    WholeFile {
+        job: ThreadedWholeFileJob,
+        attempt: usize,
+    },
+    StripedChunk {
+        state: Arc<Mutex<ThreadedRecursiveStripedState>>,
+        range: ChunkRange,
+        attempt: usize,
+    },
+}
+
+#[derive(Debug)]
+struct ThreadedRecursiveStripedState {
+    job: ThreadedStripedJob,
+    remaining_chunks: usize,
+    checkpoint_state: CopyCheckpointState,
+    failed: bool,
+    finalized: bool,
+}
+
+#[derive(Debug, Default)]
+struct ThreadedRecursiveStats {
+    bytes_copied: u64,
+    resumed_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct ThreadedRecursiveFailures {
+    failed_keys: HashSet<String>,
+    messages: Vec<String>,
+}
+
 async fn execute_threaded_striped_copy(
     prepared: super::PreparedTransferPlan,
     checkpoint_root: &Path,
 ) -> Result<CopySummary> {
-    let (mut sessions, plan, effective_threads, warnings) = prepared.into_parts();
+    let (mut sessions, plan, effective_threads, warnings, show_progress) = prepared.into_parts();
     let job = threaded_striped_job(&plan)?;
+    let total_bytes = job.size;
+    let progress_label = threaded_progress_label(job.direction, &threaded_destination_label(&job));
+    let progress = Arc::new(AsyncMutex::new(ThreadedProgressReporter::new(
+        tokio::io::stderr(),
+        ProgressMode::from_stderr(show_progress),
+    )));
     let checkpoint_store = CopyCheckpointStore::new(checkpoint_root.to_path_buf());
     let primary = sessions
         .first_mut()
@@ -732,16 +784,28 @@ async fn execute_threaded_striped_copy(
     let (initial_state, missing_ranges, resume_from_checkpoint) =
         load_threaded_checkpoint(primary.as_mut(), &job, &checkpoint_store).await?;
     let resumed_bytes = initial_state.resumed_bytes();
+    render_threaded_progress(
+        progress.as_ref(),
+        &progress_label,
+        resumed_bytes,
+        total_bytes,
+        resumed_bytes,
+        effective_threads,
+        0,
+    )
+    .await?;
 
     if missing_ranges.is_empty() {
         apply_threaded_metadata(primary.as_mut(), &job).await?;
         checkpoint_store.delete(&job.checkpoint)?;
+        progress.lock().await.finish().await?;
         return Ok(CopySummary {
             direction: job.direction,
             bytes_copied: 0,
             resumed_bytes,
             destination: threaded_destination_label(&job),
             effective_threads,
+            failed_files: 0,
             warnings,
         });
     }
@@ -757,6 +821,7 @@ async fn execute_threaded_striped_copy(
     let checkpoint_state = Arc::new(Mutex::new(initial_state));
     let checkpoint_store = Arc::new(checkpoint_store);
     let shared_error = Arc::new(Mutex::new(None));
+    let copied_bytes = Arc::new(Mutex::new(0_u64));
     let retry_enabled = matches!(job.policy.retry, CopyRetryStrategy::RetryStripedChunks);
     let mut join_set: JoinSet<Result<(Box<dyn SshSession + Send>, u64)>> = JoinSet::new();
 
@@ -765,6 +830,9 @@ async fn execute_threaded_striped_copy(
         let checkpoint_state = Arc::clone(&checkpoint_state);
         let checkpoint_store = Arc::clone(&checkpoint_store);
         let shared_error = Arc::clone(&shared_error);
+        let copied_bytes = Arc::clone(&copied_bytes);
+        let progress = Arc::clone(&progress);
+        let progress_label = progress_label.clone();
         let job = job.clone();
 
         join_set.spawn(async move {
@@ -790,6 +858,21 @@ async fn execute_threaded_striped_copy(
                             checkpoint_store.save(&job.checkpoint, &state)?;
                         }
                         copied = copied.saturating_add(bytes);
+                        let aggregate_copied = {
+                            let mut guard = copied_bytes.lock().unwrap();
+                            *guard = guard.saturating_add(bytes);
+                            *guard
+                        };
+                        render_threaded_progress(
+                            progress.as_ref(),
+                            &progress_label,
+                            resumed_bytes.saturating_add(aggregate_copied),
+                            total_bytes,
+                            resumed_bytes,
+                            effective_threads,
+                            0,
+                        )
+                        .await?;
                     }
                     Err(error)
                         if retry_enabled
@@ -813,15 +896,20 @@ async fn execute_threaded_striped_copy(
     let mut bytes_copied = 0_u64;
     let mut metadata_session: Option<Box<dyn SshSession + Send>> = None;
     while let Some(result) = join_set.join_next().await {
-        let (session, copied) =
-            result.map_err(|error| Error::new(format!("threaded copy worker failed: {error}")))??;
+        let (session, copied) = result
+            .map_err(|error| Error::new(format!("threaded copy worker failed: {error}")))??;
         if metadata_session.is_none() {
             metadata_session = Some(session);
         }
         bytes_copied = bytes_copied.saturating_add(copied);
     }
 
-    if let Some(error) = shared_error.lock().unwrap().take() {
+    let shared_error = {
+        let mut guard = shared_error.lock().unwrap();
+        guard.take()
+    };
+    if let Some(error) = shared_error {
+        progress.lock().await.finish().await?;
         return Err(error);
     }
 
@@ -829,12 +917,294 @@ async fn execute_threaded_striped_copy(
         .ok_or_else(|| Error::new("threaded copy finished without a transfer session"))?;
     apply_threaded_metadata(metadata_session.as_mut(), &job).await?;
     checkpoint_store.delete(&job.checkpoint)?;
+    progress.lock().await.finish().await?;
     Ok(CopySummary {
         direction: job.direction,
         bytes_copied,
         resumed_bytes,
         destination: threaded_destination_label(&job),
         effective_threads,
+        failed_files: 0,
+        warnings,
+    })
+}
+
+async fn execute_threaded_recursive_copy(
+    prepared: super::PreparedTransferPlan,
+    checkpoint_root: &Path,
+) -> Result<CopySummary> {
+    let (mut sessions, plan, effective_threads, warnings, show_progress) = prepared.into_parts();
+    let direction = recursive_plan_direction(&plan)?;
+    let destination = recursive_plan_destination(&plan)?;
+    let progress_label = threaded_progress_label(direction, &destination);
+    let total_bytes = plan_total_bytes(&plan);
+    let progress = Arc::new(AsyncMutex::new(ThreadedProgressReporter::new(
+        tokio::io::stderr(),
+        ProgressMode::from_stderr(show_progress),
+    )));
+    let checkpoint_store = Arc::new(CopyCheckpointStore::new(checkpoint_root.to_path_buf()));
+    let primary = sessions.first_mut().ok_or_else(|| {
+        Error::new("threaded recursive copy prepared without any transfer sessions")
+    })?;
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let stats = Arc::new(Mutex::new(ThreadedRecursiveStats::default()));
+    let failures = Arc::new(Mutex::new(ThreadedRecursiveFailures::default()));
+
+    prepare_recursive_tree_work(
+        primary.as_mut(),
+        &plan,
+        checkpoint_store.as_ref(),
+        queue.as_ref(),
+        stats.as_ref(),
+        failures.as_ref(),
+    )
+    .await?;
+    {
+        let (copied, resumed) = {
+            let guard = stats.lock().unwrap();
+            (guard.bytes_copied, guard.resumed_bytes)
+        };
+        render_threaded_progress(
+            progress.as_ref(),
+            &progress_label,
+            copied.saturating_add(resumed),
+            total_bytes,
+            resumed,
+            effective_threads,
+            0,
+        )
+        .await?;
+    }
+
+    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+    for session in sessions {
+        let queue = Arc::clone(&queue);
+        let stats = Arc::clone(&stats);
+        let failures = Arc::clone(&failures);
+        let checkpoint_store = Arc::clone(&checkpoint_store);
+        let progress = Arc::clone(&progress);
+        let progress_label = progress_label.clone();
+
+        join_set.spawn(async move {
+            let mut session = session;
+            loop {
+                let Some(work) = queue.lock().unwrap().pop_front() else {
+                    break Ok(());
+                };
+
+                match work {
+                    ThreadedTreeWork::WholeFile { job, attempt } => {
+                        if recursive_failure_recorded(failures.as_ref(), &job.remote_path) {
+                            continue;
+                        }
+
+                        match execute_threaded_whole_file(session.as_mut(), &job).await {
+                            Ok(result) => {
+                                let (copied, resumed) = {
+                                    let mut guard = stats.lock().unwrap();
+                                    guard.bytes_copied =
+                                        guard.bytes_copied.saturating_add(result.bytes_copied);
+                                    guard.resumed_bytes =
+                                        guard.resumed_bytes.saturating_add(result.resumed_bytes);
+                                    (guard.bytes_copied, guard.resumed_bytes)
+                                };
+                                render_threaded_progress(
+                                    progress.as_ref(),
+                                    &progress_label,
+                                    copied.saturating_add(resumed),
+                                    total_bytes,
+                                    resumed,
+                                    effective_threads,
+                                    {
+                                        let guard = failures.lock().unwrap();
+                                        guard.failed_keys.len()
+                                    },
+                                )
+                                .await?;
+                            }
+                            Err(error)
+                                if matches!(job.retry, CopyRetryStrategy::RetryWholeFile)
+                                    && attempt < MAX_THREADED_WHOLE_FILE_ATTEMPTS
+                                    && is_transient_copy_error(&error) =>
+                            {
+                                queue
+                                    .lock()
+                                    .unwrap()
+                                    .push_back(ThreadedTreeWork::WholeFile {
+                                        job,
+                                        attempt: attempt + 1,
+                                    });
+                            }
+                            Err(error) => {
+                                record_recursive_failure(
+                                    failures.as_ref(),
+                                    &job.remote_path,
+                                    format!("{}: {}", job.remote_path, error),
+                                );
+                                let failed_files = {
+                                    let guard = failures.lock().unwrap();
+                                    guard.failed_keys.len()
+                                };
+                                let (copied, resumed) = {
+                                    let guard = stats.lock().unwrap();
+                                    (guard.bytes_copied, guard.resumed_bytes)
+                                };
+                                render_threaded_progress(
+                                    progress.as_ref(),
+                                    &progress_label,
+                                    copied.saturating_add(resumed),
+                                    total_bytes,
+                                    resumed,
+                                    effective_threads,
+                                    failed_files,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    ThreadedTreeWork::StripedChunk {
+                        state,
+                        range,
+                        attempt,
+                    } => {
+                        let job = {
+                            let guard = state.lock().unwrap();
+                            if guard.failed {
+                                continue;
+                            }
+                            guard.job.clone()
+                        };
+
+                        match execute_threaded_chunk(session.as_mut(), &job, range).await {
+                            Ok(bytes) => {
+                                let destination_identity =
+                                    threaded_destination_identity(session.as_mut(), &job).await?;
+                                let should_finalize = {
+                                    let mut guard = state.lock().unwrap();
+                                    if guard.failed {
+                                        let snapshot = stats.lock().unwrap();
+                                        (false, snapshot.bytes_copied, snapshot.resumed_bytes)
+                                    } else {
+                                        guard.checkpoint_state.mark_completed(range);
+                                        guard
+                                            .checkpoint_state
+                                            .set_destination(destination_identity);
+                                        checkpoint_store
+                                            .save(&job.checkpoint, &guard.checkpoint_state)?;
+                                        guard.remaining_chunks =
+                                            guard.remaining_chunks.saturating_sub(1);
+                                        let mut stats = stats.lock().unwrap();
+                                        stats.bytes_copied =
+                                            stats.bytes_copied.saturating_add(bytes);
+                                        (
+                                            guard.remaining_chunks == 0 && !guard.finalized,
+                                            stats.bytes_copied,
+                                            stats.resumed_bytes,
+                                        )
+                                    }
+                                };
+                                render_threaded_progress(
+                                    progress.as_ref(),
+                                    &progress_label,
+                                    should_finalize.1.saturating_add(should_finalize.2),
+                                    total_bytes,
+                                    should_finalize.2,
+                                    effective_threads,
+                                    {
+                                        let guard = failures.lock().unwrap();
+                                        guard.failed_keys.len()
+                                    },
+                                )
+                                .await?;
+
+                                if should_finalize.0 {
+                                    apply_threaded_metadata(session.as_mut(), &job).await?;
+                                    checkpoint_store.delete(&job.checkpoint)?;
+                                    let mut guard = state.lock().unwrap();
+                                    guard.finalized = true;
+                                }
+                            }
+                            Err(error)
+                                if matches!(
+                                    job.policy.retry,
+                                    CopyRetryStrategy::RetryStripedChunks
+                                ) && attempt < MAX_THREADED_CHUNK_ATTEMPTS
+                                    && is_transient_copy_error(&error) =>
+                            {
+                                queue
+                                    .lock()
+                                    .unwrap()
+                                    .push_back(ThreadedTreeWork::StripedChunk {
+                                        state,
+                                        range,
+                                        attempt: attempt + 1,
+                                    });
+                            }
+                            Err(error) => {
+                                {
+                                    let mut guard = state.lock().unwrap();
+                                    guard.failed = true;
+                                }
+                                record_recursive_failure(
+                                    failures.as_ref(),
+                                    &job.remote_path,
+                                    format!("{}: {}", job.remote_path, error),
+                                );
+                                let failed_files = {
+                                    let guard = failures.lock().unwrap();
+                                    guard.failed_keys.len()
+                                };
+                                let (copied, resumed) = {
+                                    let guard = stats.lock().unwrap();
+                                    (guard.bytes_copied, guard.resumed_bytes)
+                                };
+                                render_threaded_progress(
+                                    progress.as_ref(),
+                                    &progress_label,
+                                    copied.saturating_add(resumed),
+                                    total_bytes,
+                                    resumed,
+                                    effective_threads,
+                                    failed_files,
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        result
+            .map_err(|error| Error::new(format!("threaded recursive worker failed: {error}")))??;
+    }
+
+    let (failure_count, failure_message) = {
+        let guard = failures.lock().unwrap();
+        (guard.messages.len(), guard.messages.join("; "))
+    };
+    if failure_count > 0 {
+        progress.lock().await.finish().await?;
+        return Err(Error::new(format!(
+            "threaded recursive copy failed for {} file(s): {}",
+            failure_count, failure_message
+        )));
+    }
+
+    let (bytes_copied, resumed_bytes) = {
+        let guard = stats.lock().unwrap();
+        (guard.bytes_copied, guard.resumed_bytes)
+    };
+    progress.lock().await.finish().await?;
+    Ok(CopySummary {
+        direction,
+        bytes_copied,
+        resumed_bytes,
+        destination,
+        effective_threads,
+        failed_files: 0,
         warnings,
     })
 }
@@ -874,6 +1244,191 @@ fn threaded_striped_job(plan: &CopyPlan) -> Result<ThreadedStripedJob> {
     }
 }
 
+async fn prepare_recursive_tree_work(
+    session: &mut dyn SshSession,
+    plan: &CopyPlan,
+    checkpoint_store: &CopyCheckpointStore,
+    queue: &Mutex<VecDeque<ThreadedTreeWork>>,
+    stats: &Mutex<ThreadedRecursiveStats>,
+    failures: &Mutex<ThreadedRecursiveFailures>,
+) -> Result<()> {
+    for job in &plan.jobs {
+        match job {
+            CopyJob::CreateDirectory {
+                destination_path,
+                checkpoint,
+                ..
+            } => match checkpoint.direction {
+                CopyDirection::Upload => session.create_remote_dir_all(destination_path).await?,
+                CopyDirection::Download => fs::create_dir_all(destination_path)?,
+            },
+            CopyJob::WholeFile {
+                source_path,
+                destination_path,
+                size,
+                policy,
+                ..
+            } => {
+                let job = threaded_whole_file_job(
+                    session,
+                    plan,
+                    source_path,
+                    destination_path,
+                    *size,
+                    policy,
+                )
+                .await?;
+
+                if job.resume_offset >= job.size {
+                    let mut guard = stats.lock().unwrap();
+                    guard.resumed_bytes = guard.resumed_bytes.saturating_add(job.size);
+                } else {
+                    queue
+                        .lock()
+                        .unwrap()
+                        .push_back(ThreadedTreeWork::WholeFile { job, attempt: 1 });
+                }
+            }
+            CopyJob::StripedFile {
+                source_path,
+                destination_path,
+                size,
+                chunks,
+                policy,
+                checkpoint,
+            } => {
+                let job = threaded_striped_tree_job(
+                    plan,
+                    source_path,
+                    destination_path,
+                    *size,
+                    chunks,
+                    policy,
+                    checkpoint,
+                )?;
+                let (initial_state, missing_ranges, resume_from_checkpoint) =
+                    load_threaded_checkpoint(session, &job, checkpoint_store).await?;
+                {
+                    let mut guard = stats.lock().unwrap();
+                    guard.resumed_bytes = guard
+                        .resumed_bytes
+                        .saturating_add(initial_state.resumed_bytes());
+                }
+
+                if missing_ranges.is_empty() {
+                    apply_threaded_metadata(session, &job).await?;
+                    checkpoint_store.delete(&job.checkpoint)?;
+                    continue;
+                }
+
+                prepare_threaded_destination(session, &job, resume_from_checkpoint).await?;
+                let state = Arc::new(Mutex::new(ThreadedRecursiveStripedState {
+                    job,
+                    remaining_chunks: missing_ranges.len(),
+                    checkpoint_state: initial_state,
+                    failed: false,
+                    finalized: false,
+                }));
+
+                for range in missing_ranges {
+                    queue
+                        .lock()
+                        .unwrap()
+                        .push_back(ThreadedTreeWork::StripedChunk {
+                            state: Arc::clone(&state),
+                            range,
+                            attempt: 1,
+                        });
+                }
+            }
+        }
+    }
+
+    let queued = !queue.lock().unwrap().is_empty();
+    if !queued && !failures.lock().unwrap().messages.is_empty() {
+        return Err(Error::new(
+            "threaded recursive copy could not schedule any transferable work",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn threaded_whole_file_job(
+    session: &mut dyn SshSession,
+    plan: &CopyPlan,
+    source_path: &str,
+    destination_path: &str,
+    size: u64,
+    policy: &CopyJobPolicy,
+) -> Result<ThreadedWholeFileJob> {
+    let direction = recursive_plan_direction(plan)?;
+    let (local_path, remote_path, resume_offset) = match direction {
+        CopyDirection::Upload => {
+            let local_path = PathBuf::from(source_path);
+            let resume_offset = match policy.resume {
+                CopyResumeStrategy::DestinationSizeResume => {
+                    resolve_upload_resume_offset(session, &local_path, destination_path, true)
+                        .await?
+                }
+                CopyResumeStrategy::Disabled | CopyResumeStrategy::Checkpointed { .. } => 0,
+            };
+            (local_path, destination_path.to_string(), resume_offset)
+        }
+        CopyDirection::Download => {
+            let local_path = PathBuf::from(destination_path);
+            let resume_offset = match policy.resume {
+                CopyResumeStrategy::DestinationSizeResume => {
+                    resolve_download_resume_offset(session, source_path, &local_path, true).await?
+                }
+                CopyResumeStrategy::Disabled | CopyResumeStrategy::Checkpointed { .. } => 0,
+            };
+            (local_path, source_path.to_string(), resume_offset)
+        }
+    };
+
+    Ok(ThreadedWholeFileJob {
+        direction,
+        local_path,
+        remote_path,
+        size,
+        resume_offset,
+        retry: policy.retry,
+    })
+}
+
+fn threaded_striped_tree_job(
+    plan: &CopyPlan,
+    source_path: &str,
+    destination_path: &str,
+    size: u64,
+    chunks: &[ChunkRange],
+    policy: &CopyJobPolicy,
+    checkpoint: &CopyCheckpointIdentity,
+) -> Result<ThreadedStripedJob> {
+    let direction = recursive_plan_direction(plan)?;
+    Ok(match direction {
+        CopyDirection::Upload => ThreadedStripedJob {
+            direction,
+            local_path: PathBuf::from(source_path),
+            remote_path: destination_path.to_string(),
+            size,
+            chunks: chunks.to_vec(),
+            policy: policy.clone(),
+            checkpoint: checkpoint.clone(),
+        },
+        CopyDirection::Download => ThreadedStripedJob {
+            direction,
+            local_path: PathBuf::from(destination_path),
+            remote_path: source_path.to_string(),
+            size,
+            chunks: chunks.to_vec(),
+            policy: policy.clone(),
+            checkpoint: checkpoint.clone(),
+        },
+    })
+}
+
 async fn load_threaded_checkpoint(
     session: &mut dyn SshSession,
     job: &ThreadedStripedJob,
@@ -903,6 +1458,40 @@ async fn load_threaded_checkpoint(
                 job.chunks.clone(),
                 false,
             ))
+        }
+    }
+}
+
+async fn execute_threaded_whole_file(
+    session: &mut dyn SshSession,
+    job: &ThreadedWholeFileJob,
+) -> Result<CopyTransferResult> {
+    match job.direction {
+        CopyDirection::Upload => {
+            session
+                .upload_file(
+                    &job.local_path,
+                    &job.remote_path,
+                    CopyTransferOptions {
+                        resume_offset: job.resume_offset,
+                        show_progress: false,
+                        finish_progress_line: false,
+                    },
+                )
+                .await
+        }
+        CopyDirection::Download => {
+            session
+                .download_file(
+                    &job.remote_path,
+                    &job.local_path,
+                    CopyTransferOptions {
+                        resume_offset: job.resume_offset,
+                        show_progress: false,
+                        finish_progress_line: false,
+                    },
+                )
+                .await
         }
     }
 }
@@ -943,10 +1532,9 @@ async fn prepare_threaded_destination(
                     .await?;
             }
         }
-        CopyDirection::Download => prepare_local_file_destination(
-            &job.local_path,
-            !resume_from_checkpoint,
-        )?,
+        CopyDirection::Download => {
+            prepare_local_file_destination(&job.local_path, !resume_from_checkpoint)?
+        }
     }
     Ok(())
 }
@@ -1040,6 +1628,49 @@ fn set_shared_copy_error(shared_error: &Arc<Mutex<Option<Error>>>, error: Error)
     }
 }
 
+fn recursive_plan_direction(plan: &CopyPlan) -> Result<CopyDirection> {
+    match plan.jobs.first() {
+        Some(CopyJob::CreateDirectory { checkpoint, .. })
+        | Some(CopyJob::WholeFile { checkpoint, .. })
+        | Some(CopyJob::StripedFile { checkpoint, .. }) => Ok(checkpoint.direction),
+        None => Err(Error::new(
+            "threaded recursive copy plan did not contain any jobs",
+        )),
+    }
+}
+
+fn recursive_plan_destination(plan: &CopyPlan) -> Result<String> {
+    match plan.jobs.first() {
+        Some(CopyJob::CreateDirectory {
+            destination_path, ..
+        })
+        | Some(CopyJob::WholeFile {
+            destination_path, ..
+        })
+        | Some(CopyJob::StripedFile {
+            destination_path, ..
+        }) => Ok(destination_path.clone()),
+        None => Err(Error::new(
+            "threaded recursive copy plan did not contain any jobs",
+        )),
+    }
+}
+
+fn recursive_failure_recorded(failures: &Mutex<ThreadedRecursiveFailures>, key: &str) -> bool {
+    failures.lock().unwrap().failed_keys.contains(key)
+}
+
+fn record_recursive_failure(
+    failures: &Mutex<ThreadedRecursiveFailures>,
+    key: &str,
+    message: String,
+) {
+    let mut guard = failures.lock().unwrap();
+    if guard.failed_keys.insert(key.to_string()) {
+        guard.messages.push(message);
+    }
+}
+
 fn threaded_destination_label(job: &ThreadedStripedJob) -> String {
     match job.direction {
         CopyDirection::Upload => job.remote_path.clone(),
@@ -1047,14 +1678,58 @@ fn threaded_destination_label(job: &ThreadedStripedJob) -> String {
     }
 }
 
-async fn apply_threaded_metadata(session: &mut dyn SshSession, job: &ThreadedStripedJob) -> Result<()> {
+fn threaded_progress_label(direction: CopyDirection, destination: &str) -> String {
+    format!("threaded {direction} {destination}")
+}
+
+fn plan_total_bytes(plan: &CopyPlan) -> u64 {
+    plan.jobs
+        .iter()
+        .map(|job| match job {
+            CopyJob::WholeFile { size, .. } | CopyJob::StripedFile { size, .. } => *size,
+            CopyJob::CreateDirectory { .. } => 0,
+        })
+        .sum()
+}
+
+async fn render_threaded_progress(
+    progress: &AsyncMutex<ThreadedProgressReporter<tokio::io::Stderr>>,
+    label: &str,
+    copied_bytes: u64,
+    total_bytes: u64,
+    resumed_bytes: u64,
+    effective_threads: usize,
+    failed_files: usize,
+) -> Result<()> {
+    progress
+        .lock()
+        .await
+        .render(&AggregateProgressSnapshot {
+            label: label.to_string(),
+            copied_bytes,
+            total_bytes,
+            resumed_bytes,
+            effective_threads,
+            failed_files,
+        })
+        .await
+}
+
+async fn apply_threaded_metadata(
+    session: &mut dyn SshSession,
+    job: &ThreadedStripedJob,
+) -> Result<()> {
     match job.direction {
-        CopyDirection::Upload => session
-            .apply_uploaded_file_metadata(&job.local_path, &job.remote_path)
-            .await,
-        CopyDirection::Download => session
-            .apply_downloaded_file_metadata(&job.remote_path, &job.local_path)
-            .await,
+        CopyDirection::Upload => {
+            session
+                .apply_uploaded_file_metadata(&job.local_path, &job.remote_path)
+                .await
+        }
+        CopyDirection::Download => {
+            session
+                .apply_downloaded_file_metadata(&job.remote_path, &job.local_path)
+                .await
+        }
     }
 }
 
@@ -1243,6 +1918,7 @@ async fn upload(
             resumed_bytes: result.resumed_bytes,
             destination: root,
             effective_threads: 1,
+            failed_files: 0,
             warnings: Vec::new(),
         })
     } else if metadata.is_file() {
@@ -1268,6 +1944,7 @@ async fn upload(
             resumed_bytes: result.resumed_bytes,
             destination: target,
             effective_threads: 1,
+            failed_files: 0,
             warnings: Vec::new(),
         })
     } else {
@@ -1307,6 +1984,7 @@ async fn download(
                 resumed_bytes: result.resumed_bytes,
                 destination: root.display().to_string(),
                 effective_threads: 1,
+                failed_files: 0,
                 warnings: Vec::new(),
             })
         }
@@ -1333,6 +2011,7 @@ async fn download(
                 resumed_bytes: result.resumed_bytes,
                 destination: target.display().to_string(),
                 effective_threads: 1,
+                failed_files: 0,
                 warnings: Vec::new(),
             })
         }

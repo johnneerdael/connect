@@ -38,6 +38,7 @@ impl TransferSessionPool {
         source: PlannedCopySource,
     ) -> Result<PreparedTransferPlan> {
         let retry = spec.retry;
+        let show_progress = spec.progress;
         let plan = plan_copy(
             spec,
             CopyPlannerConfig {
@@ -48,13 +49,18 @@ impl TransferSessionPool {
             source,
         )?;
 
-        Ok(PreparedTransferPlan { pool: self, plan })
+        Ok(PreparedTransferPlan {
+            pool: self,
+            plan,
+            show_progress,
+        })
     }
 }
 
 pub struct PreparedTransferPlan {
     pool: TransferSessionPool,
     plan: CopyPlan,
+    show_progress: bool,
 }
 
 impl PreparedTransferPlan {
@@ -70,11 +76,15 @@ impl PreparedTransferPlan {
         &self.plan
     }
 
+    pub fn show_progress(&self) -> bool {
+        self.show_progress
+    }
+
     pub fn primary_session_mut(&mut self) -> &mut dyn SshSession {
         self.pool.primary_session_mut()
     }
 
-    pub fn into_parts(self) -> (Vec<DynSshSession>, CopyPlan, usize, Vec<String>) {
+    pub fn into_parts(self) -> (Vec<DynSshSession>, CopyPlan, usize, Vec<String>, bool) {
         let mut sessions = Vec::with_capacity(1 + self.pool.extra_sessions.len());
         sessions.push(self.pool.primary);
         sessions.extend(self.pool.extra_sessions);
@@ -83,6 +93,7 @@ impl PreparedTransferPlan {
             self.plan,
             self.pool.effective_threads,
             self.pool.warnings,
+            self.show_progress,
         )
     }
 }

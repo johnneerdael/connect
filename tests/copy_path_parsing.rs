@@ -170,24 +170,21 @@ fn parse_copy_spec_rejects_remote_to_remote_invocations() {
 }
 
 #[test]
-fn parse_copy_spec_rejects_resume_for_recursive_copy() {
+fn parse_copy_spec_accepts_resume_for_recursive_copy() {
     let tree = temp_dir("connect-copy-resume-tree");
     std::fs::create_dir(tree.join("nested")).unwrap();
     std::fs::write(tree.join("nested/file.txt"), "hello").unwrap();
 
-    let error = parse_copy_spec(
+    let spec = parse_copy_spec(
         tree.to_string_lossy().as_ref(),
         "prod:/tmp/tree",
         true,
         true,
         false,
     )
-    .unwrap_err();
-
-    assert_eq!(
-        error.to_string(),
-        "--resume is only supported for single-file copy operations"
-    );
+    .unwrap();
+    assert!(spec.recursive);
+    assert!(spec.resume);
 
     let _ = std::fs::remove_dir_all(tree);
 }

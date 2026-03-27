@@ -293,11 +293,9 @@ async fn openssh_threaded_upload_resumes_from_checkpoint_after_interruption() {
         .copy(&first_spec, &failing_ssh, &prompt)
         .await
         .expect_err("first threaded upload should fail");
-    assert!(
-        error
-            .to_string()
-            .contains("injected fatal threaded upload failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected fatal threaded upload failure"));
     assert!(
         harness
             .app_checkpoint_dir("threaded-upload-resume")
@@ -374,11 +372,9 @@ async fn openssh_threaded_download_resumes_from_checkpoint_after_interruption() 
         .copy(&first_spec, &failing_ssh, &prompt)
         .await
         .expect_err("first threaded download should fail");
-    assert!(
-        error
-            .to_string()
-            .contains("injected fatal threaded download failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected fatal threaded download failure"));
     assert!(local.exists(), "partial local file should be preserved");
 
     let mut resume_spec = parse_copy_spec(
@@ -449,6 +445,189 @@ async fn openssh_threaded_upload_retries_transient_chunk_failures() {
     assert_eq!(summary.bytes_copied, 96 * 1024 * 1024);
     assert_files_equal(&source, &remote);
     assert_checkpoint_dir_empty(harness.app_checkpoint_dir("threaded-upload-retry"));
+}
+
+#[tokio::test]
+async fn openssh_threaded_recursive_upload_and_download_succeeds() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let ssh = RusshClient::new();
+    let app = harness.app_with_profile("threaded-recursive", AuthMode::StoredOnly, true);
+
+    let source_root = harness.root().join("threaded-recursive-source");
+    let nested = source_root.join("nested");
+    fs::create_dir_all(&nested).expect("nested source directory should exist");
+    fs::write(source_root.join("small.txt"), "small threaded payload\n")
+        .expect("small source file should exist");
+    write_pattern_file(&source_root.join("large.bin"), 96 * 1024 * 1024);
+    fs::write(nested.join("child.txt"), "nested threaded payload\n")
+        .expect("nested source file should exist");
+
+    let remote_root = harness.root().join("threaded-recursive-remote");
+    let mut upload_spec = parse_copy_spec(
+        source_root.to_str().expect("source root should be utf-8"),
+        &format!("threaded-recursive:{}", remote_root.display()),
+        true,
+        false,
+        false,
+    )
+    .expect("recursive threaded upload spec should parse");
+    upload_spec.effective_threads = 4;
+
+    app.copy(&upload_spec, &ssh, &prompt)
+        .await
+        .expect("threaded recursive upload should succeed");
+
+    let download_root = harness.root().join("threaded-recursive-download");
+    let mut download_spec = parse_copy_spec(
+        &format!("threaded-recursive:{}", remote_root.display()),
+        download_root
+            .to_str()
+            .expect("download root should be utf-8"),
+        true,
+        false,
+        false,
+    )
+    .expect("recursive threaded download spec should parse");
+    download_spec.effective_threads = 4;
+
+    app.copy(&download_spec, &ssh, &prompt)
+        .await
+        .expect("threaded recursive download should succeed");
+
+    assert_eq!(
+        fs::read_to_string(download_root.join("small.txt")).expect("small file should download"),
+        "small threaded payload\n"
+    );
+    assert_eq!(
+        fs::read_to_string(download_root.join("nested").join("child.txt"))
+            .expect("nested file should download"),
+        "nested threaded payload\n"
+    );
+    assert_files_equal(
+        &source_root.join("large.bin"),
+        &download_root.join("large.bin"),
+    );
+}
+
+#[tokio::test]
+async fn openssh_threaded_recursive_upload_resumes_from_checkpoint_after_interruption() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let app = harness.app_with_profile("threaded-recursive-resume", AuthMode::StoredOnly, true);
+
+    let source_root = harness.root().join("threaded-recursive-resume-source");
+    fs::create_dir_all(&source_root).expect("source root should exist");
+    fs::write(source_root.join("small.txt"), "resume tree payload\n")
+        .expect("small source file should exist");
+    write_pattern_file(&source_root.join("large.bin"), 96 * 1024 * 1024);
+
+    let remote_root = harness.root().join("threaded-recursive-resume-remote");
+    let failing_ssh = FaultInjectingSshClient::new(
+        RusshClient::new(),
+        RangeFailureSpec::fatal_upload_once(remote_root.join("large.bin").display().to_string()),
+    );
+    let mut first_spec = parse_copy_spec(
+        source_root.to_str().expect("source root should be utf-8"),
+        &format!("threaded-recursive-resume:{}", remote_root.display()),
+        true,
+        false,
+        false,
+    )
+    .expect("first recursive threaded upload spec should parse");
+    first_spec.effective_threads = 4;
+
+    let error = app
+        .copy(&first_spec, &failing_ssh, &prompt)
+        .await
+        .expect_err("first recursive threaded upload should fail");
+    assert!(error
+        .to_string()
+        .contains("injected fatal threaded upload failure"));
+    assert!(
+        harness
+            .app_checkpoint_dir("threaded-recursive-resume")
+            .read_dir()
+            .is_ok(),
+        "checkpoint directory should exist after interrupted recursive threaded upload"
+    );
+
+    let mut resume_spec = parse_copy_spec(
+        source_root.to_str().expect("source root should be utf-8"),
+        &format!("threaded-recursive-resume:{}", remote_root.display()),
+        true,
+        true,
+        false,
+    )
+    .expect("resume recursive threaded upload spec should parse");
+    resume_spec.effective_threads = 4;
+
+    let summary = app
+        .copy(&resume_spec, &RusshClient::new(), &prompt)
+        .await
+        .expect("recursive threaded upload resume should succeed");
+
+    assert!(summary.resumed_bytes > 0);
+    assert_eq!(
+        fs::read_to_string(&remote_root.join("small.txt")).expect("small remote file should exist"),
+        "resume tree payload\n"
+    );
+    assert_files_equal(
+        &source_root.join("large.bin"),
+        &remote_root.join("large.bin"),
+    );
+    assert_checkpoint_dir_empty(harness.app_checkpoint_dir("threaded-recursive-resume"));
+}
+
+#[tokio::test]
+async fn openssh_threaded_recursive_upload_retries_transient_failures() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let app = harness.app_with_profile("threaded-recursive-retry", AuthMode::StoredOnly, true);
+
+    let source_root = harness.root().join("threaded-recursive-retry-source");
+    fs::create_dir_all(&source_root).expect("source root should exist");
+    fs::write(source_root.join("small.txt"), "retry tree payload\n")
+        .expect("small source file should exist");
+    write_pattern_file(&source_root.join("large.bin"), 96 * 1024 * 1024);
+
+    let remote_root = harness.root().join("threaded-recursive-retry-remote");
+    let retrying_ssh = FaultInjectingSshClient::new(
+        RusshClient::new(),
+        RangeFailureSpec::transient_upload_once(
+            remote_root.join("large.bin").display().to_string(),
+        ),
+    );
+    let mut spec = parse_copy_spec(
+        source_root.to_str().expect("source root should be utf-8"),
+        &format!("threaded-recursive-retry:{}", remote_root.display()),
+        true,
+        false,
+        false,
+    )
+    .expect("recursive threaded retry spec should parse");
+    spec.effective_threads = 4;
+    spec.retry = true;
+
+    let summary = app
+        .copy(&spec, &retrying_ssh, &prompt)
+        .await
+        .expect("recursive threaded retry should succeed");
+
+    assert_eq!(
+        summary.bytes_copied,
+        u64::try_from(fs::metadata(source_root.join("small.txt")).unwrap().len()).unwrap()
+            + 96 * 1024 * 1024
+    );
+    assert_eq!(
+        fs::read_to_string(&remote_root.join("small.txt")).expect("small remote file should exist"),
+        "retry tree payload\n"
+    );
+    assert_files_equal(
+        &source_root.join("large.bin"),
+        &remote_root.join("large.bin"),
+    );
+    assert_checkpoint_dir_empty(harness.app_checkpoint_dir("threaded-recursive-retry"));
 }
 
 #[tokio::test]
@@ -854,7 +1033,10 @@ impl SshClient for FaultInjectingSshClient {
         let failure = Arc::clone(&self.failure);
         Box::pin(async move {
             let session = self.inner.connect(profile, expected_host_key).await?;
-            Ok(Box::new(FaultInjectingSshSession { inner: session, failure }) as Box<dyn SshSession + Send>)
+            Ok(Box::new(FaultInjectingSshSession {
+                inner: session,
+                failure,
+            }) as Box<dyn SshSession + Send>)
         })
     }
 }
@@ -945,8 +1127,9 @@ impl FaultInjectingSshSession {
 impl SshSession for FaultInjectingSshSession {
     fn observe_host_key<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<connect::ssh::ObservedHostKey>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<dyn Future<Output = connect::error::Result<connect::ssh::ObservedHostKey>> + Send + 'a>,
+    > {
         self.inner.observe_host_key()
     }
 
@@ -994,8 +1177,16 @@ impl SshSession for FaultInjectingSshSession {
         target_port: u16,
         originator_host: &'a str,
         originator_port: u16,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Box<dyn connect::ssh::DirectTcpipStream + Send + Unpin + 'static>>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = connect::error::Result<
+                        Box<dyn connect::ssh::DirectTcpipStream + Send + Unpin + 'static>,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         self.inner
             .open_direct_tcpip(target_host, target_port, originator_host, originator_port)
     }
@@ -1032,24 +1223,39 @@ impl SshSession for FaultInjectingSshSession {
     fn remote_file_type<'a>(
         &'a mut self,
         path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<connect::ssh::RemoteFileType>>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Option<connect::ssh::RemoteFileType>>>
+                + Send
+                + 'a,
+        >,
+    > {
         self.inner.remote_file_type(path)
     }
 
     fn remote_file_metadata<'a>(
         &'a mut self,
         path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<connect::ssh::CopyFileMetadata>>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Option<connect::ssh::CopyFileMetadata>>>
+                + Send
+                + 'a,
+        >,
+    > {
         self.inner.remote_file_metadata(path)
     }
 
     fn read_remote_dir<'a>(
         &'a mut self,
         path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Vec<connect::ssh::RemoteDirectoryEntry>>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Vec<connect::ssh::RemoteDirectoryEntry>>>
+                + Send
+                + 'a,
+        >,
+    > {
         self.inner.read_remote_dir(path)
     }
 
@@ -1073,8 +1279,13 @@ impl SshSession for FaultInjectingSshSession {
         local_path: &'a Path,
         remote_path: &'a str,
         options: connect::ssh::CopyTransferOptions,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>>
+                + Send
+                + 'a,
+        >,
+    > {
         self.inner.upload_file(local_path, remote_path, options)
     }
 
@@ -1083,8 +1294,13 @@ impl SshSession for FaultInjectingSshSession {
         remote_path: &'a str,
         local_path: &'a Path,
         options: connect::ssh::CopyTransferOptions,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>>
+                + Send
+                + 'a,
+        >,
+    > {
         self.inner.download_file(remote_path, local_path, options)
     }
 
@@ -1133,7 +1349,8 @@ impl SshSession for FaultInjectingSshSession {
             });
         }
 
-        self.inner.download_file_range(remote_path, local_path, range)
+        self.inner
+            .download_file_range(remote_path, local_path, range)
     }
 
     fn apply_uploaded_file_metadata<'a>(
@@ -1141,7 +1358,8 @@ impl SshSession for FaultInjectingSshSession {
         local_path: &'a Path,
         remote_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
-        self.inner.apply_uploaded_file_metadata(local_path, remote_path)
+        self.inner
+            .apply_uploaded_file_metadata(local_path, remote_path)
     }
 
     fn apply_downloaded_file_metadata<'a>(

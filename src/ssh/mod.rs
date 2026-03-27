@@ -4,6 +4,7 @@ mod client;
 mod copy;
 mod hostkeys;
 mod parallel;
+mod progress;
 
 pub(crate) use auth::connect_authenticated_session;
 pub use auth::{

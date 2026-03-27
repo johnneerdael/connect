@@ -33,6 +33,7 @@ use crate::{
 };
 
 use super::{
+    progress::{print_progress, progress_label, ProgressMode, ProgressRenderOptions},
     verify_observed_host_key, ChunkRange, CopyFileMetadata, CopyTransferOptions,
     CopyTransferResult, ExecSpec, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
 };
@@ -144,6 +145,7 @@ pub trait SshSession: Send {
             ))
         })
     }
+
     fn remote_file_type<'a>(
         &'a mut self,
         _path: &'a str,
@@ -362,6 +364,7 @@ mod tests {
             Some(std::fs::metadata(&source_path).unwrap().len()),
             false,
             6,
+            true,
         )
         .await
         .expect("resume copy should succeed");
@@ -419,7 +422,10 @@ mod tests {
             "resume test".into(),
             Some(std::fs::metadata(&source_path).unwrap().len()),
             ProgressMode::Interactive,
-            6,
+            ProgressRenderOptions {
+                initial_copied: 6,
+                finish_line: true,
+            },
         )
         .await
         .expect("copy should succeed");
@@ -462,7 +468,10 @@ mod tests {
             "upload test".into(),
             Some(std::fs::metadata(&source_path).unwrap().len()),
             ProgressMode::LogLines,
-            0,
+            ProgressRenderOptions {
+                initial_copied: 0,
+                finish_line: true,
+            },
         )
         .await
         .expect("copy should succeed");
@@ -482,7 +491,7 @@ mod tests {
 
     #[test]
     fn interactive_progress_line_truncates_long_labels_to_terminal_width() {
-        let line = format_interactive_progress_line(
+        let line = crate::ssh::progress::format_interactive_progress_line(
             "download npa_publisher_wizard/npa_publisher_wizard <-> /home/jneerdael/npa_publisher_wizard/npa_publisher_wizard",
             42,
             Some(1024),
@@ -492,6 +501,50 @@ mod tests {
         assert!(line.chars().count() <= 39);
         assert!(line.contains("..."));
         assert!(line.ends_with(": 42/1024 bytes"));
+    }
+
+    #[tokio::test]
+    async fn interactive_progress_can_leave_the_line_open_for_recursive_copy() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        let source_path = dir.path().join("source.txt");
+        let destination_path = dir.path().join("destination.txt");
+
+        std::fs::write(&source_path, "hello").expect("source should be written");
+        std::fs::write(&destination_path, "").expect("destination should exist");
+
+        let mut source = File::open(&source_path).await.expect("source should open");
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .open(&destination_path)
+            .await
+            .expect("destination should open");
+
+        let (mut progress_reader, mut progress_writer) = duplex(1024);
+        let bytes_copied = copy_stream_with_progress(
+            &mut source,
+            &mut destination,
+            &mut progress_writer,
+            "upload test".into(),
+            Some(5),
+            ProgressMode::Interactive,
+            ProgressRenderOptions {
+                initial_copied: 0,
+                finish_line: false,
+            },
+        )
+        .await
+        .expect("copy should succeed");
+        drop(progress_writer);
+
+        let mut progress = String::new();
+        progress_reader
+            .read_to_string(&mut progress)
+            .await
+            .expect("progress should be readable");
+
+        assert_eq!(bytes_copied, 5);
+        assert!(progress.contains("\r\x1b[2Kupload test: 5/5 bytes"));
+        assert!(!progress.ends_with('\n'));
     }
 }
 
@@ -669,6 +722,42 @@ impl SshSession for RusshSession {
         })
     }
 
+    fn resolve_remote_path<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            if path == "~" || path.starts_with("~/") {
+                let home = self
+                    .sftp()
+                    .await?
+                    .canonicalize(".")
+                    .await
+                    .map_err(map_sftp_error)?;
+                if path == "~" || path == "~/" {
+                    return Ok(home);
+                }
+
+                return Ok(join_remote_path(&home, path.trim_start_matches("~/")));
+            }
+
+            Ok(path.to_string())
+        })
+    }
+
+    fn finish_progress_line<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if std::io::stderr().is_terminal() {
+                let mut stderr = tokio::io::stderr();
+                stderr.write_all(b"\n").await?;
+                stderr.flush().await?;
+            }
+            Ok(())
+        })
+    }
+
     fn open_direct_tcpip<'a>(
         &'a mut self,
         target_host: &'a str,
@@ -843,6 +932,7 @@ impl SshSession for RusshSession {
                 Some(total_bytes),
                 options.show_progress,
                 options.resume_offset,
+                options.finish_progress_line,
             )
             .await?;
             remote.shutdown().await?;
@@ -885,6 +975,7 @@ impl SshSession for RusshSession {
                 total_bytes,
                 options.show_progress,
                 options.resume_offset,
+                options.finish_progress_line,
             )
             .await?;
             local.flush().await?;
@@ -1061,6 +1152,20 @@ fn map_remote_file_type(file_type: russh_sftp::protocol::FileType) -> RemoteFile
     }
 }
 
+fn join_remote_path(base: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        base.trim_end_matches('/').to_string()
+    } else if base == "/" {
+        format!("/{suffix}")
+    } else {
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            suffix.trim_start_matches('/')
+        )
+    }
+}
+
 #[cfg(unix)]
 async fn connect_agent() -> Result<AgentClient<tokio::net::UnixStream>> {
     AgentClient::connect_env()
@@ -1086,29 +1191,6 @@ async fn connect_agent() -> Result<()> {
     Err(Error::new("ssh agent is not supported on this platform"))
 }
 
-fn progress_label(direction: &str, local_path: &Path, remote_path: &str) -> String {
-    format!("{direction} {} <-> {remote_path}", local_path.display())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProgressMode {
-    Hidden,
-    Interactive,
-    LogLines,
-}
-
-impl ProgressMode {
-    fn from_stderr(show_progress_override: bool) -> Self {
-        if std::io::stderr().is_terminal() {
-            Self::Interactive
-        } else if show_progress_override {
-            Self::LogLines
-        } else {
-            Self::Hidden
-        }
-    }
-}
-
 async fn copy_stream_with_progress<R, W, P>(
     reader: &mut R,
     writer: &mut W,
@@ -1116,7 +1198,7 @@ async fn copy_stream_with_progress<R, W, P>(
     label: String,
     total_bytes: Option<u64>,
     progress_mode: ProgressMode,
-    initial_copied: u64,
+    options: ProgressRenderOptions,
 ) -> Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -1124,10 +1206,22 @@ where
     P: AsyncWrite + Unpin,
 {
     if progress_mode != ProgressMode::Hidden {
-        print_progress(progress, &label, initial_copied, total_bytes, progress_mode).await?;
+        print_progress(
+            progress,
+            &label,
+            options.initial_copied,
+            total_bytes,
+            progress_mode,
+            terminal::size()
+                .ok()
+                .map(|(columns, _)| usize::from(columns))
+                .filter(|columns| *columns > 0)
+                .unwrap_or(80),
+        )
+        .await?;
     }
 
-    let mut copied = initial_copied;
+    let mut copied = options.initial_copied;
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer).await?;
@@ -1137,11 +1231,23 @@ where
         writer.write_all(&buffer[..read]).await?;
         copied += u64::try_from(read).unwrap_or(u64::MAX);
         if progress_mode != ProgressMode::Hidden {
-            print_progress(progress, &label, copied, total_bytes, progress_mode).await?;
+            print_progress(
+                progress,
+                &label,
+                copied,
+                total_bytes,
+                progress_mode,
+                terminal::size()
+                    .ok()
+                    .map(|(columns, _)| usize::from(columns))
+                    .filter(|columns| *columns > 0)
+                    .unwrap_or(80),
+            )
+            .await?;
         }
     }
     writer.flush().await?;
-    if progress_mode == ProgressMode::Interactive {
+    if progress_mode == ProgressMode::Interactive && options.finish_line {
         progress.write_all(b"\n").await?;
         progress.flush().await?;
     }
@@ -1155,6 +1261,7 @@ async fn copy_stream_from_offsets<R, W>(
     total_bytes: Option<u64>,
     show_progress: bool,
     resume_offset: u64,
+    finish_progress_line: bool,
 ) -> Result<u64>
 where
     R: AsyncRead + tokio::io::AsyncSeek + Unpin,
@@ -1174,7 +1281,10 @@ where
         label,
         total_bytes,
         progress_mode,
-        resume_offset,
+        ProgressRenderOptions {
+            initial_copied: resume_offset,
+            finish_line: finish_progress_line,
+        },
     )
     .await
 }
@@ -1194,7 +1304,10 @@ async fn copy_local_to_remote_range(
         if read == 0 {
             return Err(Error::new("unexpected EOF while uploading chunk"));
         }
-        remote.write_at(offset, &buffer[..read]).await.map_err(map_sftp_error)?;
+        remote
+            .write_at(offset, &buffer[..read])
+            .await
+            .map_err(map_sftp_error)?;
         offset = offset.saturating_add(u64::try_from(read).unwrap_or(0));
         remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(0));
     }
@@ -1226,98 +1339,6 @@ async fn copy_remote_to_local_range(
     }
 
     Ok(range.len())
-}
-
-async fn print_progress<W>(
-    stderr: &mut W,
-    label: &str,
-    copied: u64,
-    total_bytes: Option<u64>,
-    progress_mode: ProgressMode,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    match progress_mode {
-        ProgressMode::Hidden => {}
-        ProgressMode::Interactive => {
-            let line = format_interactive_progress_line(
-                label,
-                copied,
-                total_bytes,
-                interactive_progress_columns(),
-            );
-            stderr.write_all(b"\r\x1b[2K").await?;
-            stderr.write_all(line.as_bytes()).await?;
-        }
-        ProgressMode::LogLines => {
-            let line = format_progress_line(label, copied, total_bytes);
-            stderr.write_all(line.as_bytes()).await?;
-            stderr.write_all(b"\n").await?;
-        }
-    }
-    stderr.flush().await?;
-    Ok(())
-}
-
-fn format_progress_line(label: &str, copied: u64, total_bytes: Option<u64>) -> String {
-    let progress = match total_bytes {
-        Some(total) if total > 0 => format!("{copied}/{total} bytes"),
-        _ => format!("{copied} bytes"),
-    };
-    format!("{label}: {progress}")
-}
-
-fn format_interactive_progress_line(
-    label: &str,
-    copied: u64,
-    total_bytes: Option<u64>,
-    terminal_columns: usize,
-) -> String {
-    let progress = match total_bytes {
-        Some(total) if total > 0 => format!("{copied}/{total} bytes"),
-        _ => format!("{copied} bytes"),
-    };
-    let available_width = terminal_columns.saturating_sub(1);
-    let reserved_width = progress.chars().count() + 2;
-    if available_width <= reserved_width {
-        return progress;
-    }
-
-    let truncated_label = truncate_middle(label, available_width - reserved_width);
-    format!("{truncated_label}: {progress}")
-}
-
-fn interactive_progress_columns() -> usize {
-    terminal::size()
-        .ok()
-        .map(|(columns, _)| usize::from(columns))
-        .filter(|columns| *columns > 0)
-        .unwrap_or(80)
-}
-
-fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let char_count = value.chars().count();
-    if char_count <= max_chars {
-        return value.to_string();
-    }
-
-    if max_chars <= 3 {
-        return ".".repeat(max_chars);
-    }
-
-    let prefix_len = (max_chars - 3) / 2;
-    let suffix_len = max_chars - 3 - prefix_len;
-    let prefix: String = value.chars().take(prefix_len).collect();
-    let suffix: String = value
-        .chars()
-        .rev()
-        .take(suffix_len)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}...{suffix}")
 }
 
 fn apply_local_metadata(local_path: &Path, metadata: &SftpMetadata) -> Result<()> {

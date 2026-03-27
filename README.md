@@ -11,7 +11,9 @@ It is built for Windows, macOS, and Linux, stores secrets in the OS-native keych
 - non-interactive remote command execution with exact exit-code propagation
 - local-to-remote and remote-to-local copy support
 - recursive directory copy with `--recursive`
-- resumable single-file copy with `--resume`
+- resumable single-file and recursive copy with `--resume`
+- opt-in threaded copy with `--threads`
+- in-run transient retry support with `--retry`
 - optional copy progress reporting with `--progress`
 - OS-native secret storage for passwords, imported private keys, and key passphrases
 - SSH agent support with configurable auth precedence
@@ -137,8 +139,9 @@ Rules:
 
 - exactly one side must be remote
 - directory copy requires `--recursive`
-- `--resume` is supported for single-file transfers only
 - remote paths must use absolute paths
+- threaded copy is opt-in and only activates when `--threads` is greater than `1`
+- when the server cannot sustain the requested thread count, `connect` degrades to fewer transfer sessions and reports a warning
 
 To force a remote interpretation for ambiguous names, prefix the profile with `@`:
 
@@ -147,11 +150,12 @@ connect copy @p:/tmp/file.txt ./file.txt
 connect copy @@prod:/tmp/file.txt ./file.txt
 ```
 
-Resume a partial single-file transfer:
+Resume a partial transfer:
 
 ```bash
 connect copy --resume ./artifact.tgz prod:/tmp/artifact.tgz
 connect copy --resume prod:/tmp/artifact.tgz ./downloads/artifact.tgz
+connect copy --recursive --resume ./site prod:/var/www/site
 ```
 
 Force progress output on a TTY-aware copy:
@@ -159,6 +163,29 @@ Force progress output on a TTY-aware copy:
 ```bash
 connect copy --progress ./artifact.tgz prod:/tmp/artifact.tgz
 ```
+
+Enable threaded copy explicitly:
+
+```bash
+connect copy --threads 4 ./artifact.tgz prod:/tmp/artifact.tgz
+connect copy --recursive --threads 4 ./site prod:/var/www/site
+```
+
+Retry transient threaded copy failures in-run:
+
+```bash
+connect copy --threads 4 --retry ./artifact.tgz prod:/tmp/artifact.tgz
+connect copy --recursive --threads 4 --retry --resume ./site prod:/var/www/site
+```
+
+Threaded copy behavior:
+
+- `--threads 1` preserves the existing single-stream copy path
+- `--threads > 1` enables parallel transfer for both large single files and recursive trees
+- large files are striped across multiple random-access-capable SFTP sessions
+- recursive trees use a shared work queue, and large files inside the tree can also be striped
+- `--resume` preserves and reuses partial threaded transfer state where safe
+- `--retry` retries transient failures during the current run and cooperates with `--resume`
 
 ## Diagnostics
 
