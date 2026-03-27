@@ -204,19 +204,24 @@ impl CopyCheckpointStore {
     pub fn load(&self, identity: &CopyCheckpointIdentity) -> Result<Option<CopyCheckpointState>> {
         let path = self.checkpoint_path(identity);
         match fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)
-                .map(Some)
-                .map_err(|error| crate::error::Error::new(format!("invalid checkpoint file: {error}"))),
+            Ok(contents) => serde_json::from_str(&contents).map(Some).map_err(|error| {
+                crate::error::Error::new(format!("invalid checkpoint file: {error}"))
+            }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
-    pub fn save(&self, identity: &CopyCheckpointIdentity, state: &CopyCheckpointState) -> Result<()> {
+    pub fn save(
+        &self,
+        identity: &CopyCheckpointIdentity,
+        state: &CopyCheckpointState,
+    ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
         let path = self.checkpoint_path(identity);
-        let encoded = serde_json::to_vec_pretty(state)
-            .map_err(|error| crate::error::Error::new(format!("failed to encode checkpoint: {error}")))?;
+        let encoded = serde_json::to_vec_pretty(state).map_err(|error| {
+            crate::error::Error::new(format!("failed to encode checkpoint: {error}"))
+        })?;
         fs::write(path, encoded)?;
         Ok(())
     }
