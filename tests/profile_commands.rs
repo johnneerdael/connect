@@ -1216,6 +1216,7 @@ fn database_initialize_defaults_legacy_profiles_without_copy_threads_column() {
                 port INTEGER NOT NULL,
                 username TEXT NOT NULL,
                 auth_mode TEXT NOT NULL DEFAULT 'auto',
+                copy_threads INTEGER,
                 has_password INTEGER NOT NULL DEFAULT 0,
                 has_private_key INTEGER NOT NULL DEFAULT 0,
                 has_key_passphrase INTEGER NOT NULL DEFAULT 0,
@@ -1224,9 +1225,9 @@ fn database_initialize_defaults_legacy_profiles_without_copy_threads_column() {
             );
 
             INSERT INTO profiles (
-                name, host, port, username, auth_mode, has_password, has_private_key, has_key_passphrase
+                name, host, port, username, auth_mode, copy_threads, has_password, has_private_key, has_key_passphrase
             ) VALUES (
-                'prod', 'prod.example.com', 22, 'deploy', 'auto', 0, 0, 0
+                'prod', 'prod.example.com', 22, 'deploy', 'auto', NULL, 0, 0, 0
             );
             ",
         )
@@ -1236,16 +1237,33 @@ fn database_initialize_defaults_legacy_profiles_without_copy_threads_column() {
     let paths = AppPaths::from_root(&root);
     let app = App::new(paths, Arc::new(MemorySecretStore::default())).unwrap();
 
-    let stored_threads: i64 = Connection::open(&legacy_db)
-        .unwrap()
+    let connection = Connection::open(&legacy_db).unwrap();
+    let stored_threads: i64 = connection
         .query_row(
             "SELECT copy_threads FROM profiles WHERE name = 'prod'",
             [],
             |row| row.get(0),
         )
         .unwrap();
+    let mut statement = connection.prepare("PRAGMA table_info(profiles)").unwrap();
+    let (notnull, default_value): (i64, Option<String>) = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .unwrap()
+        .find_map(|result| {
+            let (name, notnull, default_value) = result.unwrap();
+            (name == "copy_threads").then_some((notnull, default_value))
+        })
+        .unwrap();
 
     assert_eq!(stored_threads, 1);
+    assert_eq!(notnull, 1);
+    assert_eq!(default_value.as_deref(), Some("1"));
     assert_eq!(app.get_profile("prod").unwrap().copy_threads, 1);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1285,13 +1303,8 @@ fn profile_store_rejects_malformed_persisted_copy_threads() {
         .unwrap();
     drop(connection);
 
-    let app = App::new(
-        AppPaths::from_root(&root),
-        Arc::new(MemorySecretStore::default()),
-    )
-    .unwrap();
-
-    let error = app.get_profile("prod").unwrap_err();
+    let store = connect::store::ProfileStore::new(Database::new(legacy_db.clone()));
+    let error = store.get("prod").unwrap_err();
     assert!(error.to_string().contains("copy_threads"));
 
     let _ = std::fs::remove_dir_all(&root);

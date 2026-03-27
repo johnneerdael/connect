@@ -87,25 +87,109 @@ fn add_profiles_auth_mode_column_if_missing(connection: &Connection) -> Result<(
 }
 
 fn add_profiles_copy_threads_column_if_missing(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(profiles)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "copy_threads" {
+    let columns = profiles_table_columns(connection)?;
+    match columns.iter().find(|column| column.name == "copy_threads") {
+        None => {
             connection.execute(
-                "UPDATE profiles SET copy_threads = 1 WHERE copy_threads IS NULL",
+                "ALTER TABLE profiles ADD COLUMN copy_threads INTEGER NOT NULL DEFAULT 1",
                 [],
             )?;
-            return Ok(());
+        }
+        Some(column) if column.is_concrete_copy_threads() => {}
+        Some(_) => {
+            rebuild_profiles_copy_threads_column(connection)?;
         }
     }
 
     connection.execute(
-        "ALTER TABLE profiles ADD COLUMN copy_threads INTEGER NOT NULL DEFAULT 1",
-        [],
-    )?;
-    connection.execute(
-        "UPDATE profiles SET copy_threads = 1 WHERE copy_threads IS NULL",
+        "UPDATE profiles SET copy_threads = 1 WHERE copy_threads IS NULL OR copy_threads < 1",
         [],
     )?;
     Ok(())
+}
+
+fn rebuild_profiles_copy_threads_column(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE profiles_new (
+            name TEXT PRIMARY KEY,
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            auth_mode TEXT NOT NULL DEFAULT 'auto',
+            copy_threads INTEGER NOT NULL DEFAULT 1,
+            has_password INTEGER NOT NULL DEFAULT 0,
+            has_private_key INTEGER NOT NULL DEFAULT 0,
+            has_key_passphrase INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO profiles_new (
+            name,
+            host,
+            port,
+            username,
+            auth_mode,
+            copy_threads,
+            has_password,
+            has_private_key,
+            has_key_passphrase,
+            created_at,
+            updated_at
+        )
+        SELECT
+            name,
+            host,
+            port,
+            username,
+            auth_mode,
+            CASE
+                WHEN copy_threads IS NULL OR copy_threads < 1 THEN 1
+                ELSE copy_threads
+            END,
+            has_password,
+            has_private_key,
+            has_key_passphrase,
+            created_at,
+            updated_at
+        FROM profiles;
+
+        DROP TABLE profiles;
+        ALTER TABLE profiles_new RENAME TO profiles;
+
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        ",
+    )?;
+    Ok(())
+}
+
+fn profiles_table_columns(connection: &Connection) -> Result<Vec<ProfileTableColumn>> {
+    let mut statement = connection.prepare("PRAGMA table_info(profiles)")?;
+    let columns = statement.query_map([], |row| {
+        Ok(ProfileTableColumn {
+            name: row.get(1)?,
+            notnull: row.get::<_, i64>(3)? != 0,
+            default_value: row.get(4)?,
+        })
+    })?;
+
+    Ok(columns.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+#[derive(Debug)]
+struct ProfileTableColumn {
+    name: String,
+    notnull: bool,
+    default_value: Option<String>,
+}
+
+impl ProfileTableColumn {
+    fn is_concrete_copy_threads(&self) -> bool {
+        self.notnull && self.default_value.as_deref() == Some("1")
+    }
 }
