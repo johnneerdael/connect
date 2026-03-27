@@ -67,6 +67,13 @@ fn recursive_tree_source() -> PlannedCopySource {
     }
 }
 
+fn recursive_empty_tree_source() -> PlannedCopySource {
+    PlannedCopySource::Tree {
+        root: "/tmp/source-root".into(),
+        entries: vec![],
+    }
+}
+
 #[test]
 fn planner_keeps_single_session_mode_when_effective_threads_is_one() {
     let mut spec = single_file_spec(true);
@@ -288,4 +295,41 @@ fn plan_copy_returns_error_for_invalid_remote_remote_specs() {
     );
 
     assert!(result.is_err());
+}
+
+#[test]
+fn planner_creates_work_for_an_empty_recursive_root_directory() {
+    let plan = plan_copy(
+        recursive_tree_spec(),
+        CopyPlannerConfig {
+            effective_threads: 8,
+            retry: false,
+        },
+        recursive_destination(true),
+        recursive_empty_tree_source(),
+    )
+    .unwrap();
+
+    assert!(plan.jobs.iter().any(|job| matches!(
+        job,
+        CopyJob::CreateDirectory {
+            destination_path,
+            ..
+        } if destination_path == "/tmp/destination-root/source-root"
+    )));
+}
+
+#[test]
+fn copy_spec_direction_and_remote_profile_are_checked_for_malformed_specs() {
+    let spec = CopySpec {
+        source: CopyEndpoint::Local(PathBuf::from("/tmp/source.bin")),
+        destination: CopyEndpoint::Local(PathBuf::from("/tmp/destination.bin")),
+        recursive: false,
+        resume: false,
+        progress: false,
+        effective_threads: 1,
+    };
+
+    assert!(spec.direction().is_err());
+    assert!(spec.remote_profile().is_err());
 }

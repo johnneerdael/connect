@@ -37,6 +37,7 @@ pub fn prepare_copy_spec(app: &App, args: &CopyArgs) -> Result<CopySpec> {
         args.resume,
         args.progress,
     )?;
-    spec.effective_threads = app.effective_copy_threads(spec.remote_profile(), args.threads)?;
+    let profile = spec.remote_profile()?;
+    spec.effective_threads = app.effective_copy_threads(profile, args.threads)?;
     Ok(spec)
 }

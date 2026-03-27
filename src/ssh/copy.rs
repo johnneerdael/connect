@@ -55,20 +55,24 @@ pub struct CopySpec {
 }
 
 impl CopySpec {
-    pub fn direction(&self) -> CopyDirection {
+    pub fn direction(&self) -> Result<CopyDirection> {
         match (&self.source, &self.destination) {
-            (CopyEndpoint::Local(_), CopyEndpoint::Remote(_)) => CopyDirection::Upload,
-            (CopyEndpoint::Remote(_), CopyEndpoint::Local(_)) => CopyDirection::Download,
-            _ => unreachable!("copy specs must have exactly one remote endpoint"),
+            (CopyEndpoint::Local(_), CopyEndpoint::Remote(_)) => Ok(CopyDirection::Upload),
+            (CopyEndpoint::Remote(_), CopyEndpoint::Local(_)) => Ok(CopyDirection::Download),
+            _ => Err(Error::new(
+                "copy requires exactly one remote path in profile:/path format",
+            )),
         }
     }
 
-    pub fn remote_profile(&self) -> &str {
+    pub fn remote_profile(&self) -> Result<&str> {
         match (&self.source, &self.destination) {
             (CopyEndpoint::Remote(remote), _) | (_, CopyEndpoint::Remote(remote)) => {
-                &remote.profile
+                Ok(&remote.profile)
             }
-            _ => unreachable!("copy specs must have exactly one remote endpoint"),
+            _ => Err(Error::new(
+                "copy requires exactly one remote path in profile:/path format",
+            )),
         }
     }
 }
@@ -247,6 +251,11 @@ pub fn plan_copy(
             let destination_root =
                 recursive_destination_root(&spec.destination, &root, destination_shape);
             let mut jobs = Vec::new();
+            jobs.push(copy_directory_job(
+                direction,
+                root.clone(),
+                destination_root.clone(),
+            ));
             for entry in entries {
                 match entry {
                     PlannedCopyTreeEntry::File { path, size } => {
@@ -397,6 +406,25 @@ fn recursive_job_destination_path(
             .join(relative_path)
             .display()
             .to_string(),
+    }
+}
+
+fn copy_directory_job(
+    direction: CopyDirection,
+    source_path: String,
+    destination_path: String,
+) -> CopyJob {
+    let checkpoint = CopyCheckpointIdentity {
+        direction,
+        source_path: source_path.clone(),
+        destination_path: destination_path.clone(),
+        recursive: true,
+    };
+
+    CopyJob::CreateDirectory {
+        checkpoint,
+        source_path,
+        destination_path,
     }
 }
 
