@@ -149,6 +149,9 @@ fn planner_mixes_file_queue_and_striped_large_files_for_recursive_trees() {
             }
             | CopyJob::StripedFile {
                 destination_path, ..
+            }
+            | CopyJob::CreateDirectory {
+                destination_path, ..
             } => destination_path.as_str(),
         })
         .collect();
@@ -199,6 +202,9 @@ fn planner_targets_direct_destination_when_recursive_destination_is_not_an_exist
             }
             | CopyJob::StripedFile {
                 destination_path, ..
+            }
+            | CopyJob::CreateDirectory {
+                destination_path, ..
             } => destination_path.as_str(),
         })
         .collect();
@@ -206,4 +212,80 @@ fn planner_targets_direct_destination_when_recursive_destination_is_not_an_exist
     assert!(destinations.contains(&"/tmp/destination-root/small.txt"));
     assert!(destinations.contains(&"/tmp/destination-root/large.bin"));
     assert!(destinations.contains(&"/tmp/destination-root/nested/nested.bin"));
+}
+
+#[test]
+fn planner_preserves_empty_directories_in_recursive_trees() {
+    let plan = plan_copy(
+        recursive_tree_spec(),
+        CopyPlannerConfig {
+            effective_threads: 8,
+            retry: false,
+        },
+        recursive_destination(true),
+        recursive_tree_source(),
+    )
+    .unwrap();
+
+    assert!(plan.jobs.iter().any(|job| matches!(
+        job,
+        CopyJob::CreateDirectory {
+            destination_path,
+            ..
+        } if destination_path == "/tmp/destination-root/source-root/nested"
+    )));
+}
+
+#[test]
+fn plan_copy_returns_error_for_invalid_local_local_specs() {
+    let spec = CopySpec {
+        source: CopyEndpoint::Local(PathBuf::from("/tmp/source.bin")),
+        destination: CopyEndpoint::Local(PathBuf::from("/tmp/destination.bin")),
+        recursive: false,
+        resume: false,
+        progress: false,
+        effective_threads: 1,
+    };
+
+    let result = plan_copy(
+        spec,
+        CopyPlannerConfig {
+            effective_threads: 1,
+            retry: false,
+        },
+        recursive_destination(false),
+        single_file_source(1),
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn plan_copy_returns_error_for_invalid_remote_remote_specs() {
+    let spec = CopySpec {
+        source: CopyEndpoint::Remote(RemotePath {
+            profile: "prod".into(),
+            path: "/tmp/source.bin".into(),
+        }),
+        destination: CopyEndpoint::Remote(RemotePath {
+            profile: "prod".into(),
+            path: "/tmp/destination.bin".into(),
+        }),
+        recursive: false,
+        resume: false,
+        progress: false,
+        effective_threads: 1,
+    };
+
+    let result = plan_copy(
+        spec,
+        CopyPlannerConfig {
+            effective_threads: 1,
+            retry: false,
+        },
+        recursive_destination(false),
+        single_file_source(1),
+    );
+
+    assert!(result.is_err());
 }

@@ -119,6 +119,11 @@ pub enum CopyJob {
         policy: CopyJobPolicy,
         checkpoint: CopyCheckpointIdentity,
     },
+    CreateDirectory {
+        source_path: String,
+        destination_path: String,
+        checkpoint: CopyCheckpointIdentity,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,9 +135,8 @@ pub struct ChunkRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyCheckpointIdentity {
     pub direction: CopyDirection,
-    pub source: String,
-    pub destination: String,
-    pub path: String,
+    pub source_path: String,
+    pub destination_path: String,
     pub recursive: bool,
 }
 
@@ -181,9 +185,7 @@ pub struct CopyDestinationShape {
 
 impl CopyDestinationShape {
     pub fn new(existing_directory: bool) -> Self {
-        Self {
-            existing_directory,
-        }
+        Self { existing_directory }
     }
 }
 
@@ -193,17 +195,15 @@ pub fn plan_copy(
     destination_shape: CopyDestinationShape,
     source: PlannedCopySource,
 ) -> Result<CopyPlan> {
-    let destination = endpoint_to_string(&spec.destination);
-    let source_label = endpoint_to_string(&spec.source);
+    let direction = validate_planning_endpoints(&spec)?;
     let effective_threads = config.effective_threads;
 
     match (spec.recursive, source) {
         (false, PlannedCopySource::File { path, size }) => {
             let checkpoint = CopyCheckpointIdentity {
-                direction: spec.direction(),
-                source: source_label,
-                destination: destination.clone(),
-                path: path.clone(),
+                direction,
+                source_path: path.clone(),
+                destination_path: endpoint_destination_path(&spec.destination),
                 recursive: false,
             };
 
@@ -215,7 +215,7 @@ pub fn plan_copy(
                     },
                     jobs: vec![CopyJob::StripedFile {
                         source_path: path,
-                        destination_path: destination,
+                        destination_path: endpoint_destination_path(&spec.destination),
                         size,
                         chunks,
                         policy: CopyJobPolicy {
@@ -231,7 +231,7 @@ pub fn plan_copy(
                     mode: CopyPlanMode::SingleStream,
                     jobs: vec![CopyJob::WholeFile {
                         source_path: path,
-                        destination_path: destination,
+                        destination_path: endpoint_destination_path(&spec.destination),
                         size,
                         policy: CopyJobPolicy {
                             resume: whole_file_resume_strategy(&spec),
@@ -257,10 +257,9 @@ pub fn plan_copy(
                             &path,
                         );
                         let checkpoint = CopyCheckpointIdentity {
-                            direction: spec.direction(),
-                            source: source_label.clone(),
-                            destination: destination_path.clone(),
-                            path: source_path.clone(),
+                            direction,
+                            source_path: source_path.clone(),
+                            destination_path: destination_path.clone(),
                             recursive: true,
                         };
 
@@ -290,7 +289,26 @@ pub fn plan_copy(
                             });
                         }
                     }
-                    PlannedCopyTreeEntry::Directory { .. } => {}
+                    PlannedCopyTreeEntry::Directory { path } => {
+                        let source_path = format!("{root}/{path}");
+                        let destination_path = recursive_job_destination_path(
+                            &spec.destination,
+                            &destination_root,
+                            &path,
+                        );
+                        let checkpoint = CopyCheckpointIdentity {
+                            direction,
+                            source_path: source_path.clone(),
+                            destination_path: destination_path.clone(),
+                            recursive: true,
+                        };
+
+                        jobs.push(CopyJob::CreateDirectory {
+                            source_path,
+                            destination_path,
+                            checkpoint,
+                        });
+                    }
                 }
             }
 
@@ -382,6 +400,16 @@ fn recursive_job_destination_path(
     }
 }
 
+fn validate_planning_endpoints(spec: &CopySpec) -> Result<CopyDirection> {
+    match (&spec.source, &spec.destination) {
+        (CopyEndpoint::Local(_), CopyEndpoint::Remote(_)) => Ok(CopyDirection::Upload),
+        (CopyEndpoint::Remote(_), CopyEndpoint::Local(_)) => Ok(CopyDirection::Download),
+        _ => Err(Error::new(
+            "copy requires exactly one remote path in profile:/path format",
+        )),
+    }
+}
+
 fn build_chunk_ranges(size: u64, effective_threads: usize) -> Vec<ChunkRange> {
     let chunk_count = effective_threads
         .min(usize::try_from(size.div_ceil(STRIPE_THRESHOLD_BYTES)).unwrap_or(usize::MAX));
@@ -404,13 +432,6 @@ fn build_chunk_ranges(size: u64, effective_threads: usize) -> Vec<ChunkRange> {
     }
 
     chunks
-}
-
-fn endpoint_to_string(endpoint: &CopyEndpoint) -> String {
-    match endpoint {
-        CopyEndpoint::Local(path) => path.display().to_string(),
-        CopyEndpoint::Remote(remote) => format!("{}:{}", remote.profile, remote.path),
-    }
 }
 
 fn endpoint_destination_path(endpoint: &CopyEndpoint) -> String {
