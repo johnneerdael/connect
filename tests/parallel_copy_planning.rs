@@ -14,6 +14,7 @@ fn single_file_spec(resume: bool) -> CopySpec {
         }),
         recursive: false,
         resume,
+        retry: false,
         progress: false,
         effective_threads: 1,
     }
@@ -28,6 +29,7 @@ fn recursive_tree_spec() -> CopySpec {
         }),
         recursive: true,
         resume: false,
+        retry: false,
         progress: false,
         effective_threads: 8,
     }
@@ -250,6 +252,7 @@ fn plan_copy_returns_error_for_invalid_local_local_specs() {
         destination: CopyEndpoint::Local(PathBuf::from("/tmp/destination.bin")),
         recursive: false,
         resume: false,
+        retry: false,
         progress: false,
         effective_threads: 1,
     };
@@ -280,6 +283,7 @@ fn plan_copy_returns_error_for_invalid_remote_remote_specs() {
         }),
         recursive: false,
         resume: false,
+        retry: false,
         progress: false,
         effective_threads: 1,
     };
@@ -326,6 +330,7 @@ fn copy_spec_direction_and_remote_profile_are_checked_for_malformed_specs() {
         destination: CopyEndpoint::Local(PathBuf::from("/tmp/destination.bin")),
         recursive: false,
         resume: false,
+        retry: false,
         progress: false,
         effective_threads: 1,
     };

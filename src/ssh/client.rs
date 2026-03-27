@@ -115,6 +115,24 @@ pub trait SshSession: Send {
         Box::pin(async { Ok(()) })
     }
 
+    fn resolve_remote_path<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move { Ok(path.to_string()) })
+    }
+
+    fn finish_progress_line<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn supports_parallel_random_access<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async { Ok(true) })
+    }
     fn remote_file_type<'a>(
         &'a mut self,
         _path: &'a str,
@@ -627,6 +645,12 @@ impl SshSession for RusshSession {
                 Err(error) => Err(map_sftp_error(error)),
             }
         })
+    }
+
+    fn supports_parallel_random_access<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async { Ok(true) })
     }
 
     fn remote_file_size<'a>(

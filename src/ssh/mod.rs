@@ -22,3 +22,4 @@ pub use copy::{
 pub use hostkeys::{
     verify_observed_host_key, HostKeyVerification, ObservedHostKey, ObservedHostKeySource,
 };
+pub use parallel::{establish_transfer_sessions, TransferSessionPool};

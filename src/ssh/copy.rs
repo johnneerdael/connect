@@ -10,7 +10,8 @@ use crate::{
     terminal::prompt::Prompt,
 };
 
-use super::{auth::connect_authenticated_session, SshClient, SshConnectionContext, SshSession};
+use super::establish_transfer_sessions;
+use super::{SshClient, SshConnectionContext, SshSession};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePath {
@@ -50,6 +51,7 @@ pub struct CopySpec {
     pub destination: CopyEndpoint,
     pub recursive: bool,
     pub resume: bool,
+    pub retry: bool,
     pub progress: bool,
     pub effective_threads: usize,
 }
@@ -494,14 +496,20 @@ pub struct CopySummary {
     pub bytes_copied: u64,
     pub resumed_bytes: u64,
     pub destination: String,
+    pub effective_threads: usize,
+    pub warnings: Vec<String>,
 }
 
 impl fmt::Display for CopySummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "copy {} complete: {} bytes copied ({} resumed) to {}",
-            self.direction, self.bytes_copied, self.resumed_bytes, self.destination
+            "copy {} complete: {} bytes copied ({} resumed) to {} (effective threads: {})",
+            self.direction,
+            self.bytes_copied,
+            self.resumed_bytes,
+            self.destination,
+            self.effective_threads
         )
     }
 }
@@ -549,6 +557,7 @@ pub fn parse_copy_spec(
         destination,
         recursive,
         resume,
+        retry: false,
         progress,
         effective_threads: 1,
     })
@@ -561,8 +570,39 @@ pub async fn copy_profile(
     context: &dyn SshConnectionContext,
     prompt: &dyn Prompt,
 ) -> Result<CopySummary> {
-    let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
-    execute_copy(&mut *session, spec).await
+    let mut pool =
+        establish_transfer_sessions(ssh, profile, context, prompt, spec.effective_threads).await?;
+    let effective_threads = pool.effective_threads();
+    let warnings = pool.warnings().to_vec();
+    let mut summary = execute_copy_with_retry(pool.primary_session_mut(), spec).await?;
+    summary.effective_threads = effective_threads;
+    summary.warnings = warnings;
+    Ok(summary)
+}
+
+async fn execute_copy_with_retry(
+    session: &mut dyn SshSession,
+    spec: &CopySpec,
+) -> Result<CopySummary> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    let attempts = if spec.retry { MAX_ATTEMPTS } else { 1 };
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match execute_copy(session, spec).await {
+            Ok(summary) => return Ok(summary),
+            Err(error) if spec.retry && is_transient_copy_error(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::new("copy failed after retry attempts")))
+}
+
+fn is_transient_copy_error(error: &Error) -> bool {
+    matches!(error, Error::Message(message) if message.to_ascii_lowercase().contains("transient"))
 }
 
 async fn execute_copy(session: &mut dyn SshSession, spec: &CopySpec) -> Result<CopySummary> {
@@ -607,6 +647,8 @@ async fn upload(
             bytes_copied: result.bytes_copied,
             resumed_bytes: result.resumed_bytes,
             destination: root,
+            effective_threads: 1,
+            warnings: Vec::new(),
         })
     } else if metadata.is_file() {
         let target = resolve_remote_file_target(session, source, destination).await?;
@@ -630,6 +672,8 @@ async fn upload(
             bytes_copied: result.bytes_copied,
             resumed_bytes: result.resumed_bytes,
             destination: target,
+            effective_threads: 1,
+            warnings: Vec::new(),
         })
     } else {
         Err(Error::new(format!(
@@ -667,6 +711,8 @@ async fn download(
                 bytes_copied: result.bytes_copied,
                 resumed_bytes: result.resumed_bytes,
                 destination: root.display().to_string(),
+                effective_threads: 1,
+                warnings: Vec::new(),
             })
         }
         Some(RemoteFileType::File) | Some(RemoteFileType::Symlink) => {
@@ -691,6 +737,8 @@ async fn download(
                 bytes_copied: result.bytes_copied,
                 resumed_bytes: result.resumed_bytes,
                 destination: target.display().to_string(),
+                effective_threads: 1,
+                warnings: Vec::new(),
             })
         }
         Some(RemoteFileType::Other) => Err(Error::new(format!(

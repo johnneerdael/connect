@@ -1688,6 +1688,8 @@ fn copy_summary_is_emitted_by_the_cli_boundary() {
         bytes_copied: 12,
         resumed_bytes: 4,
         destination: "prod:/tmp/artifact.txt".into(),
+        effective_threads: 2,
+        warnings: vec!["parallel copy degraded".into()],
     };
     let mut output = Vec::new();
 
@@ -1695,7 +1697,7 @@ fn copy_summary_is_emitted_by_the_cli_boundary() {
 
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "copy upload complete: 12 bytes copied (4 resumed) to prod:/tmp/artifact.txt\n"
+        "copy upload complete: 12 bytes copied (4 resumed) to prod:/tmp/artifact.txt (effective threads: 2)\nwarning: parallel copy degraded\n"
     );
 }
 
@@ -1831,6 +1833,155 @@ async fn copy_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
     );
 
     let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn threaded_copy_warns_and_degrades_when_only_subset_of_sessions_connect() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-degrade.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-degrade.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::with_connect_limit(2);
+
+    let result = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.effective_threads, 2);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("degraded")),
+        "{result:?}"
+    );
+    assert_eq!(ssh.connect_attempts(), 4);
+}
+
+#[tokio::test]
+async fn threaded_copy_fails_when_requested_parallelism_degrades_to_one_session() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-one-session.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-one-session.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::with_connect_limit(1);
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("could not establish threaded mode"));
+}
+
+#[tokio::test]
+async fn threaded_copy_fails_clearly_when_random_access_support_is_unavailable() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-random-access.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-random-access.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::without_random_access_support();
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("random-access sftp support is unavailable"));
+}
+
+#[tokio::test]
+async fn single_session_retry_retries_transient_copy_failures() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-retry.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-retry.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 1;
+    spec.retry = true;
+    let ssh = FakeCopySshClient::single_session_with_transient_failure();
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.upload_attempts(), 2);
 }
 
 fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -2049,6 +2200,12 @@ struct FakeCopyState {
     agent_result: bool,
     key_result: bool,
     password_result: bool,
+    connect_limit: Option<usize>,
+    connect_attempts: usize,
+    random_access_supported: bool,
+    upload_failures_remaining: usize,
+    upload_attempts: usize,
+    remote_home: String,
     remote_paths: HashMap<String, RemoteFileType>,
     remote_sizes: HashMap<String, u64>,
     remote_directories: HashMap<String, Vec<RemoteDirectoryEntry>>,
@@ -2071,6 +2228,12 @@ impl FakeCopySshClient {
                 agent_result: false,
                 key_result: true,
                 password_result: true,
+                connect_limit: None,
+                connect_attempts: 0,
+                random_access_supported: true,
+                upload_failures_remaining: 0,
+                upload_attempts: 0,
+                remote_home: "/home/deploy".into(),
                 remote_paths: HashMap::new(),
                 remote_sizes: HashMap::new(),
                 remote_directories: HashMap::new(),
@@ -2083,6 +2246,27 @@ impl FakeCopySshClient {
     fn key_rejected_then_password_succeeds() -> Self {
         let client = Self::with_hostkey("fp-123");
         client.state.lock().unwrap().key_result = false;
+        client
+    }
+
+    fn with_connect_limit(limit: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().connect_limit = Some(limit);
+        client
+    }
+
+    fn without_random_access_support() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().random_access_supported = false;
+        client
+    }
+
+    fn single_session_with_transient_failure() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        let mut state = client.state.lock().unwrap();
+        state.connect_limit = Some(1);
+        state.upload_failures_remaining = 1;
+        drop(state);
         client
     }
 
@@ -2109,6 +2293,14 @@ impl FakeCopySshClient {
         self.state.lock().unwrap().transfer_options.clone()
     }
 
+    fn connect_attempts(&self) -> usize {
+        self.state.lock().unwrap().connect_attempts
+    }
+
+    fn upload_attempts(&self) -> usize {
+        self.state.lock().unwrap().upload_attempts
+    }
+
     fn with_remote_file(self, path: &str, file_type: RemoteFileType, size: u64) -> Self {
         let client = self;
         {
@@ -2132,10 +2324,20 @@ impl SshClient for FakeCopySshClient {
                 + 'a,
         >,
     > {
-        let state = Arc::clone(&self.state);
-        Box::pin(
-            async move { Ok(Box::new(FakeCopySession { state }) as Box<dyn SshSession + Send>) },
-        )
+        let outcome = {
+            let mut state = self.state.lock().unwrap();
+            state.connect_attempts += 1;
+            match state.connect_limit {
+                Some(limit) if state.connect_attempts > limit => {
+                    Err(Error::new("ssh error: too many concurrent sessions"))
+                }
+                _ => Ok(Arc::clone(&self.state)),
+            }
+        };
+        Box::pin(async move {
+            let state = outcome?;
+            Ok(Box::new(FakeCopySession { state }) as Box<dyn SshSession + Send>)
+        })
     }
 }
 
@@ -2205,6 +2407,32 @@ impl SshSession for FakeCopySession {
         Box::pin(async move { Ok(file_type) })
     }
 
+    fn resolve_remote_path<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<String>> + Send + 'a>> {
+        let remote_home = self.state.lock().unwrap().remote_home.clone();
+        Box::pin(async move {
+            if path == "~" || path == "~/" {
+                Ok(remote_home)
+            } else if let Some(suffix) = path.strip_prefix("~/") {
+                Ok(format!(
+                    "{}/{}",
+                    remote_home.trim_end_matches('/'),
+                    suffix.trim_start_matches('/')
+                ))
+            } else {
+                Ok(path.to_string())
+            }
+        })
+    }
+
+    fn supports_parallel_random_access<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let supported = self.state.lock().unwrap().random_access_supported;
+        Box::pin(async move { Ok(supported) })
+    }
     fn remote_file_size<'a>(
         &'a mut self,
         path: &'a str,
@@ -2248,17 +2476,27 @@ impl SshSession for FakeCopySession {
                 + 'a,
         >,
     > {
-        let mut state = self.state.lock().unwrap();
-        state.transfers.push((
-            CopyDirection::Upload,
-            local_path.to_path_buf(),
-            remote_path.into(),
-        ));
-        state.transfer_options.push(options);
-        let bytes_copied = std::fs::metadata(local_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let outcome = {
+            let mut state = self.state.lock().unwrap();
+            state.upload_attempts += 1;
+            state.transfers.push((
+                CopyDirection::Upload,
+                local_path.to_path_buf(),
+                remote_path.into(),
+            ));
+            state.transfer_options.push(options);
+            if state.upload_failures_remaining > 0 {
+                state.upload_failures_remaining -= 1;
+                Err(Error::new("ssh error: transient upload failure"))
+            } else {
+                let bytes_copied = std::fs::metadata(local_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                Ok(bytes_copied)
+            }
+        };
         Box::pin(async move {
+            let bytes_copied = outcome?;
             Ok(connect::ssh::CopyTransferResult {
                 bytes_copied: bytes_copied.saturating_sub(options.resume_offset),
                 resumed_bytes: options.resume_offset,

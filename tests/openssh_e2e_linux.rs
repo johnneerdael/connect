@@ -1,12 +1,15 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    env, fs, io,
+    env, fs,
+    future::Future,
+    io,
     net::TcpListener,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Child, Command, Output, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime},
 };
@@ -16,8 +19,8 @@ use connect::{
     doctor::checks::{collect_profile_checks, DoctorEnvironment, LocalDoctorCheckStatus},
     error::Error,
     secrets::MemorySecretStore,
-    ssh::{parse_copy_spec, ExecSpec, RusshClient},
-    store::{AuthMode, ProfileInput},
+    ssh::{parse_copy_spec, ExecSpec, RusshClient, SshClient, SshSession},
+    store::{AuthMode, HostKeyRecord, Profile, ProfileInput},
     terminal::prompt::Prompt,
 };
 use filetime::{set_file_mtime, FileTime};
@@ -225,6 +228,37 @@ async fn openssh_end_to_end_supports_resumable_upload_and_download() {
         fs::read_to_string(&download_local).expect("downloaded file should exist"),
         "download-resume"
     );
+}
+
+#[tokio::test]
+async fn openssh_parallel_copy_degrades_when_server_session_budget_is_limited() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let ssh = LimitedConnectSshClient::new(RusshClient::new(), 2);
+    let app = harness.app_with_profile("degraded", AuthMode::StoredOnly, true);
+
+    let source = harness.root().join("parallel-degrade.txt");
+    fs::write(&source, "hello-parallel-degrade").expect("source file should exist");
+    let mut spec = parse_copy_spec(
+        source.to_str().expect("source path should be utf-8"),
+        &format!("degraded:{}/parallel-degrade.txt", harness.root().display()),
+        false,
+        false,
+        false,
+    )
+    .expect("copy spec should parse");
+    spec.effective_threads = 4;
+
+    let summary = app
+        .copy(&spec, &ssh, &prompt)
+        .await
+        .expect("copy should degrade rather than fail");
+
+    assert_eq!(summary.effective_threads, 2);
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("degraded")));
 }
 
 #[tokio::test]
@@ -582,6 +616,48 @@ Subsystem sftp internal-sftp
 
     fn user_key_path(&self) -> &Path {
         &self.user_key_path
+    }
+}
+
+#[derive(Clone)]
+struct LimitedConnectSshClient {
+    inner: RusshClient,
+    limit: usize,
+    attempts: Arc<Mutex<usize>>,
+}
+
+impl LimitedConnectSshClient {
+    fn new(inner: RusshClient, limit: usize) -> Self {
+        Self {
+            inner,
+            limit,
+            attempts: Arc::new(Mutex::new(0)),
+        }
+    }
+}
+
+impl SshClient for LimitedConnectSshClient {
+    fn connect<'a>(
+        &'a self,
+        profile: &'a Profile,
+        expected_host_key: Option<&'a HostKeyRecord>,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Box<dyn SshSession + Send>>> + Send + 'a>>
+    {
+        let attempt = {
+            let mut attempts = self.attempts.lock().expect("attempt counter should lock");
+            *attempts += 1;
+            *attempts
+        };
+
+        if attempt > self.limit {
+            return Box::pin(async {
+                Err(Error::new(
+                    "ssh error: too many concurrent sessions (controlled test limit)",
+                ))
+            });
+        }
+
+        self.inner.connect(profile, expected_host_key)
     }
 }
 

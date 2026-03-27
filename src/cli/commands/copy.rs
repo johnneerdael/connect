@@ -26,6 +26,9 @@ pub fn emit_summary(summary: &CopySummary) -> Result<()> {
 
 pub fn emit_summary_to(summary: &CopySummary, out: &mut impl Write) -> Result<()> {
     writeln!(out, "{summary}")?;
+    for warning in &summary.warnings {
+        writeln!(out, "warning: {warning}")?;
+    }
     Ok(())
 }
 
@@ -37,6 +40,7 @@ pub fn prepare_copy_spec(app: &App, args: &CopyArgs) -> Result<CopySpec> {
         args.resume,
         args.progress,
     )?;
+    spec.retry = args.retry;
     let profile = spec.remote_profile()?;
     spec.effective_threads = app.effective_copy_threads(profile, args.threads)?;
     Ok(spec)
