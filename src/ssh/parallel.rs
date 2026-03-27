@@ -115,13 +115,13 @@ pub async fn establish_transfer_sessions(
 
     if sessions.is_empty() {
         return Err(first_degradable_error.unwrap_or_else(|| {
-            Error::new("failed to establish any authenticated transfer sessions")
+            Error::new("failed to establish any random-access-capable transfer sessions")
         }));
     }
 
     if requested_threads > 1 && sessions.len() == 1 {
         return Err(Error::new(format!(
-            "could not establish threaded mode: requested {requested_threads} sessions but only 1 authenticated transfer session was available"
+            "could not establish threaded mode: requested {requested_threads} sessions but only 1 random-access-capable transfer session was available"
         )));
     }
 
