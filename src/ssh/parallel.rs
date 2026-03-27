@@ -4,7 +4,10 @@ use crate::{
     terminal::prompt::Prompt,
 };
 
-use super::{connect_authenticated_session, SshClient, SshConnectionContext, SshSession};
+use super::{
+    connect_authenticated_session, plan_copy, CopyDestinationShape, CopyPlan, CopyPlannerConfig,
+    CopySpec, PlannedCopySource, SshClient, SshConnectionContext, SshSession,
+};
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
 
@@ -27,6 +30,49 @@ impl TransferSessionPool {
     pub fn primary_session_mut(&mut self) -> &mut dyn SshSession {
         &mut *self.primary
     }
+
+    pub fn prepare_plan(
+        self,
+        spec: CopySpec,
+        destination_shape: CopyDestinationShape,
+        source: PlannedCopySource,
+    ) -> Result<PreparedTransferPlan> {
+        let retry = spec.retry;
+        let plan = plan_copy(
+            spec,
+            CopyPlannerConfig {
+                effective_threads: self.effective_threads,
+                retry,
+            },
+            destination_shape,
+            source,
+        )?;
+
+        Ok(PreparedTransferPlan { pool: self, plan })
+    }
+}
+
+pub struct PreparedTransferPlan {
+    pool: TransferSessionPool,
+    plan: CopyPlan,
+}
+
+impl PreparedTransferPlan {
+    pub fn effective_threads(&self) -> usize {
+        self.pool.effective_threads()
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        self.pool.warnings()
+    }
+
+    pub fn plan(&self) -> &CopyPlan {
+        &self.plan
+    }
+
+    pub fn primary_session_mut(&mut self) -> &mut dyn SshSession {
+        self.pool.primary_session_mut()
+    }
 }
 
 pub async fn establish_transfer_sessions(
@@ -38,7 +84,7 @@ pub async fn establish_transfer_sessions(
 ) -> Result<TransferSessionPool> {
     let requested_threads = requested_threads.max(1);
     let mut sessions = Vec::with_capacity(requested_threads);
-    let mut first_error = None;
+    let mut first_degradable_error = None;
 
     for _ in 0..requested_threads {
         match connect_authenticated_session(ssh, profile, context, prompt).await {
@@ -54,15 +100,19 @@ pub async fn establish_transfer_sessions(
                 sessions.push(session);
             }
             Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
+                if is_degradable_establishment_error(&error) {
+                    if first_degradable_error.is_none() {
+                        first_degradable_error = Some(error);
+                    }
+                    break;
                 }
+                return Err(error);
             }
         }
     }
 
     if sessions.is_empty() {
-        return Err(first_error.unwrap_or_else(|| {
+        return Err(first_degradable_error.unwrap_or_else(|| {
             Error::new("failed to establish any authenticated transfer sessions")
         }));
     }
@@ -90,4 +140,32 @@ pub async fn establish_transfer_sessions(
         primary,
         _extra_sessions: sessions,
     })
+}
+
+fn is_degradable_establishment_error(error: &Error) -> bool {
+    match error {
+        Error::Io(io_error) => matches!(
+            io_error.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        Error::Message(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("too many concurrent sessions")
+                || message.contains("administratively prohibited")
+                || message.contains("resource temporarily unavailable")
+                || message.contains("connection reset")
+                || message.contains("connection refused")
+                || message.contains("connection aborted")
+                || message.contains("timed out")
+                || message.contains("broken pipe")
+                || message.contains("unexpected eof")
+        }
+        _ => false,
+    }
 }

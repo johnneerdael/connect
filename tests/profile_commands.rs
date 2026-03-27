@@ -21,7 +21,8 @@ use connect::{
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
     ssh::{
-        parse_copy_spec, CopyDirection, CopySummary, ExecSpec, ObservedHostKey,
+        establish_transfer_sessions, parse_copy_spec, CopyDestinationShape, CopyDirection,
+        CopyPlanMode, CopySummary, ExecSpec, ObservedHostKey, PlannedCopySource,
         RemoteDirectoryEntry, RemoteFileType, SshClient, SshSession,
     },
     store::{Database, ForwardDefinition, ForwardKind, ForwardStore, ProfileInput},
@@ -1874,7 +1875,7 @@ async fn threaded_copy_warns_and_degrades_when_only_subset_of_sessions_connect()
             .any(|warning| warning.contains("degraded")),
         "{result:?}"
     );
-    assert_eq!(ssh.connect_attempts(), 4);
+    assert_eq!(ssh.connect_attempts(), 3);
 }
 
 #[tokio::test]
@@ -1947,6 +1948,98 @@ async fn threaded_copy_fails_clearly_when_random_access_support_is_unavailable()
     assert!(error
         .to_string()
         .contains("random-access sftp support is unavailable"));
+}
+
+#[tokio::test]
+async fn threaded_copy_does_not_degrade_on_authentication_failures() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-auth-failure.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-auth-failure.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::authentication_fails_on_session(2);
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains("could not establish threaded mode"),
+        "{error}"
+    );
+    assert_eq!(ssh.connect_attempts(), 2);
+}
+
+#[tokio::test]
+async fn threaded_copy_refinalizes_the_plan_against_the_degraded_effective_threads() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-replan.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-replan.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let profile = harness.app().get_profile("prod").unwrap();
+    let ssh = FakeCopySshClient::with_connect_limit(2);
+
+    let pool =
+        establish_transfer_sessions(&ssh, &profile, harness.app(), &FakePrompt::default(), 4)
+            .await
+            .unwrap();
+    let prepared = pool
+        .prepare_plan(
+            spec,
+            CopyDestinationShape::new(false),
+            PlannedCopySource::File {
+                path: source.path().display().to_string(),
+                size: 128 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(prepared.effective_threads(), 2);
+    assert!(prepared
+        .warnings()
+        .iter()
+        .any(|warning| warning.contains("degraded")));
+    match &prepared.plan().mode {
+        CopyPlanMode::StripedFile { chunks } => assert_eq!(chunks.len(), 2),
+        mode => panic!("expected striped plan after refinalization, got {mode:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2202,6 +2295,8 @@ struct FakeCopyState {
     password_result: bool,
     connect_limit: Option<usize>,
     connect_attempts: usize,
+    fail_authentication_on_session: Option<usize>,
+    successful_authentications: usize,
     random_access_supported: bool,
     upload_failures_remaining: usize,
     upload_attempts: usize,
@@ -2230,6 +2325,8 @@ impl FakeCopySshClient {
                 password_result: true,
                 connect_limit: None,
                 connect_attempts: 0,
+                fail_authentication_on_session: None,
+                successful_authentications: 0,
                 random_access_supported: true,
                 upload_failures_remaining: 0,
                 upload_attempts: 0,
@@ -2258,6 +2355,12 @@ impl FakeCopySshClient {
     fn without_random_access_support() -> Self {
         let client = Self::with_hostkey("fp-123");
         client.state.lock().unwrap().random_access_supported = false;
+        client
+    }
+
+    fn authentication_fails_on_session(session: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().fail_authentication_on_session = Some(session);
         client
     }
 
@@ -2387,7 +2490,15 @@ impl SshSession for FakeCopySession {
         let result = {
             let mut state = self.state.lock().unwrap();
             state.auth_attempts.push("password");
-            state.password_result
+            let session_index = state.successful_authentications + 1;
+            if state.fail_authentication_on_session == Some(session_index) {
+                false
+            } else {
+                if state.password_result {
+                    state.successful_authentications += 1;
+                }
+                state.password_result
+            }
         };
         Box::pin(async move { Ok(result) })
     }

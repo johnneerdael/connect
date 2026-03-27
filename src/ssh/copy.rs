@@ -10,8 +10,10 @@ use crate::{
     terminal::prompt::Prompt,
 };
 
-use super::establish_transfer_sessions;
-use super::{SshClient, SshConnectionContext, SshSession};
+use super::{
+    connect_authenticated_session, establish_transfer_sessions, SshClient, SshConnectionContext,
+    SshSession,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePath {
@@ -464,6 +466,105 @@ fn build_chunk_ranges(size: u64, effective_threads: usize) -> Vec<ChunkRange> {
     chunks
 }
 
+fn plan_local_tree(root: &Path) -> Result<Vec<PlannedCopyTreeEntry>> {
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            let relative_path = path
+                .strip_prefix(root)
+                .map_err(|error| Error::new(format!("failed to build local plan entry: {error}")))?
+                .display()
+                .to_string();
+
+            if file_type.is_dir() {
+                entries.push(PlannedCopyTreeEntry::Directory {
+                    path: relative_path.clone(),
+                });
+                stack.push(path);
+            } else if file_type.is_file() {
+                entries.push(PlannedCopyTreeEntry::File {
+                    path: relative_path,
+                    size: entry.metadata()?.len(),
+                });
+            } else if file_type.is_symlink() {
+                let metadata = fs::metadata(&path)?;
+                if metadata.is_file() {
+                    entries.push(PlannedCopyTreeEntry::File {
+                        path: relative_path,
+                        size: metadata.len(),
+                    });
+                } else if metadata.is_dir() {
+                    return Err(Error::new(format!(
+                        "symlinked directories are not supported during recursive copy: {}",
+                        path.display()
+                    )));
+                } else {
+                    return Err(Error::new(format!(
+                        "unsupported local symlink target type: {}",
+                        path.display()
+                    )));
+                }
+            } else {
+                return Err(Error::new(format!(
+                    "unsupported local file type: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+async fn plan_remote_tree(
+    session: &mut dyn SshSession,
+    root: &str,
+) -> Result<Vec<PlannedCopyTreeEntry>> {
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_string()];
+
+    while let Some(current) = stack.pop() {
+        for entry in session.read_remote_dir(&current).await? {
+            let path = join_remote(&current, &entry.name);
+            let relative_path = path
+                .strip_prefix(&format!("{}/", root.trim_end_matches('/')))
+                .or_else(|| path.strip_prefix(root))
+                .unwrap_or(&path)
+                .trim_start_matches('/')
+                .to_string();
+
+            match entry.file_type {
+                RemoteFileType::Directory => {
+                    entries.push(PlannedCopyTreeEntry::Directory {
+                        path: relative_path.clone(),
+                    });
+                    stack.push(path);
+                }
+                RemoteFileType::File | RemoteFileType::Symlink => {
+                    let size = session
+                        .remote_file_size(&path)
+                        .await?
+                        .ok_or_else(|| Error::new(format!("remote path was not found: {path}")))?;
+                    entries.push(PlannedCopyTreeEntry::File {
+                        path: relative_path,
+                        size,
+                    });
+                }
+                RemoteFileType::Other => {
+                    return Err(Error::new(format!("unsupported remote file type: {path}")))
+                }
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
 fn endpoint_destination_path(endpoint: &CopyEndpoint) -> String {
     match endpoint {
         CopyEndpoint::Local(path) => path.display().to_string(),
@@ -570,14 +671,125 @@ pub async fn copy_profile(
     context: &dyn SshConnectionContext,
     prompt: &dyn Prompt,
 ) -> Result<CopySummary> {
+    if spec.effective_threads > 1 {
+        let mut prepared = prepare_threaded_copy(ssh, spec, profile, context, prompt).await?;
+        match &prepared.plan().mode {
+            CopyPlanMode::SingleStream => {
+                let effective_threads = prepared.effective_threads();
+                let warnings = prepared.warnings().to_vec();
+                let mut summary = execute_copy_with_retry(prepared.primary_session_mut(), spec).await?;
+                summary.effective_threads = effective_threads;
+                summary.warnings = warnings;
+                Ok(summary)
+            }
+            CopyPlanMode::StripedFile { .. } | CopyPlanMode::QueuedTree => Err(Error::new(
+                "threaded copy executor is not implemented yet; session pool and plan were prepared successfully",
+            )),
+        }
+    } else {
+        let mut session = connect_authenticated_session(ssh, profile, context, prompt).await?;
+        let mut summary = execute_copy_with_retry(&mut *session, spec).await?;
+        summary.effective_threads = 1;
+        summary.warnings = Vec::new();
+        Ok(summary)
+    }
+}
+
+async fn prepare_threaded_copy(
+    ssh: &dyn SshClient,
+    spec: &CopySpec,
+    profile: &Profile,
+    context: &dyn SshConnectionContext,
+    prompt: &dyn Prompt,
+) -> Result<super::PreparedTransferPlan> {
     let mut pool =
         establish_transfer_sessions(ssh, profile, context, prompt, spec.effective_threads).await?;
-    let effective_threads = pool.effective_threads();
-    let warnings = pool.warnings().to_vec();
-    let mut summary = execute_copy_with_retry(pool.primary_session_mut(), spec).await?;
-    summary.effective_threads = effective_threads;
-    summary.warnings = warnings;
-    Ok(summary)
+    let (planning_spec, destination_shape, source) =
+        inspect_planning_inputs(pool.primary_session_mut(), spec).await?;
+    pool.prepare_plan(planning_spec, destination_shape, source)
+}
+
+async fn inspect_planning_inputs(
+    session: &mut dyn SshSession,
+    spec: &CopySpec,
+) -> Result<(CopySpec, CopyDestinationShape, PlannedCopySource)> {
+    match (&spec.source, &spec.destination) {
+        (CopyEndpoint::Local(source), CopyEndpoint::Remote(destination)) => {
+            let mut planning_spec = spec.clone();
+            let resolved_destination = session.resolve_remote_path(&destination.path).await?;
+            planning_spec.destination = CopyEndpoint::Remote(RemotePath {
+                profile: destination.profile.clone(),
+                path: resolved_destination.clone(),
+            });
+
+            let metadata = fs::metadata(source)?;
+            if metadata.is_dir() {
+                let destination_shape = CopyDestinationShape::new(matches!(
+                    session.remote_file_type(&resolved_destination).await?,
+                    Some(RemoteFileType::Directory)
+                ));
+                Ok((
+                    planning_spec,
+                    destination_shape,
+                    PlannedCopySource::Tree {
+                        root: source.display().to_string(),
+                        entries: plan_local_tree(source)?,
+                    },
+                ))
+            } else {
+                Ok((
+                    planning_spec,
+                    CopyDestinationShape::new(false),
+                    PlannedCopySource::File {
+                        path: source.display().to_string(),
+                        size: metadata.len(),
+                    },
+                ))
+            }
+        }
+        (CopyEndpoint::Remote(source), CopyEndpoint::Local(destination)) => {
+            let mut planning_spec = spec.clone();
+            let resolved_source = session.resolve_remote_path(&source.path).await?;
+            planning_spec.source = CopyEndpoint::Remote(RemotePath {
+                profile: source.profile.clone(),
+                path: resolved_source.clone(),
+            });
+
+            let destination_shape = CopyDestinationShape::new(path_is_directory(destination)?);
+            match session.remote_file_type(&resolved_source).await? {
+                Some(RemoteFileType::Directory) => Ok((
+                    planning_spec,
+                    destination_shape,
+                    PlannedCopySource::Tree {
+                        root: resolved_source.clone(),
+                        entries: plan_remote_tree(session, &resolved_source).await?,
+                    },
+                )),
+                Some(RemoteFileType::File) | Some(RemoteFileType::Symlink) => Ok((
+                    planning_spec,
+                    destination_shape,
+                    PlannedCopySource::File {
+                        path: resolved_source.clone(),
+                        size: session
+                            .remote_file_size(&resolved_source)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::new(format!("remote path was not found: {resolved_source}"))
+                            })?,
+                    },
+                )),
+                Some(RemoteFileType::Other) => Err(Error::new(format!(
+                    "unsupported remote file type: {resolved_source}"
+                ))),
+                None => Err(Error::new(format!(
+                    "remote path was not found: {resolved_source}"
+                ))),
+            }
+        }
+        _ => Err(Error::new(
+            "copy requires exactly one remote path in profile:/path format",
+        )),
+    }
 }
 
 async fn execute_copy_with_retry(

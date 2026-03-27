@@ -22,7 +22,7 @@ use russh_sftp::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::{
@@ -131,7 +131,7 @@ pub trait SshSession: Send {
     fn supports_parallel_random_access<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(async { Ok(true) })
+        Box::pin(async { Ok(false) })
     }
     fn remote_file_type<'a>(
         &'a mut self,
@@ -650,7 +650,10 @@ impl SshSession for RusshSession {
     fn supports_parallel_random_access<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            let _ = self.sftp().await?;
+            Ok(russh_sftp_supports_parallel_random_access())
+        })
     }
 
     fn remote_file_size<'a>(
@@ -902,6 +905,17 @@ async fn connect_agent() -> Result<()> {
 
 fn progress_label(direction: &str, local_path: &Path, remote_path: &str) -> String {
     format!("{direction} {} <-> {remote_path}", local_path.display())
+}
+
+fn russh_sftp_supports_parallel_random_access() -> bool {
+    assert_random_access_handle::<russh_sftp::client::fs::File>();
+    true
+}
+
+fn assert_random_access_handle<T>()
+where
+    T: AsyncRead + AsyncWrite + AsyncSeek + Unpin,
+{
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
