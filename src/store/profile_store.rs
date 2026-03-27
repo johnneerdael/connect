@@ -1,5 +1,6 @@
 use rusqlite::{params, OptionalExtension, Row};
 
+use crate::error::Error;
 use crate::error::Result;
 
 use super::{AuthMode, Database, Profile, ProfileInput};
@@ -15,6 +16,10 @@ impl ProfileStore {
     }
 
     pub fn save(&self, profile: &ProfileInput) -> Result<()> {
+        if profile.copy_threads == 0 {
+            return Err(Error::new("copy_threads must be at least 1"));
+        }
+
         let connection = self.database.connect()?;
         connection.execute(
             "
@@ -38,7 +43,7 @@ impl ProfileStore {
                 i64::from(profile.port),
                 profile.username,
                 profile.auth_mode.as_str(),
-                profile.copy_threads.map(|value| value as i64),
+                i64::try_from(profile.copy_threads).expect("copy_threads should fit in i64"),
                 profile.has_password,
                 profile.has_private_key,
                 profile.has_key_passphrase,
@@ -129,11 +134,32 @@ fn map_profile(row: &Row<'_>) -> rusqlite::Result<Profile> {
         port: row.get::<_, u16>(2)?,
         username: row.get(3)?,
         auth_mode,
-        copy_threads: row.get::<_, Option<i64>>(5)?.map(|value| value as usize),
+        copy_threads: parse_copy_threads(row.get::<_, i64>(5)?)?,
         has_password: row.get(6)?,
         has_private_key: row.get(7)?,
         has_key_passphrase: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+    })
+}
+
+fn parse_copy_threads(value: i64) -> rusqlite::Result<usize> {
+    if value < 1 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("copy_threads must be at least 1, found {value}"),
+            )),
+        ));
+    }
+
+    usize::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
     })
 }

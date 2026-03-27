@@ -24,7 +24,7 @@ impl Database {
                 port INTEGER NOT NULL,
                 username TEXT NOT NULL,
                 auth_mode TEXT NOT NULL DEFAULT 'auto',
-                copy_threads INTEGER,
+                copy_threads INTEGER NOT NULL DEFAULT 1,
                 has_password INTEGER NOT NULL DEFAULT 0,
                 has_private_key INTEGER NOT NULL DEFAULT 0,
                 has_key_passphrase INTEGER NOT NULL DEFAULT 0,
@@ -91,11 +91,18 @@ fn add_profiles_copy_threads_column_if_missing(connection: &Connection) -> Resul
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
     for column in columns {
         if column? == "copy_threads" {
+            connection.execute(
+                "UPDATE profiles SET copy_threads = 1 WHERE copy_threads IS NULL",
+                [],
+            )?;
             return Ok(());
         }
     }
 
-    connection.execute("ALTER TABLE profiles ADD COLUMN copy_threads INTEGER", [])?;
+    connection.execute(
+        "ALTER TABLE profiles ADD COLUMN copy_threads INTEGER NOT NULL DEFAULT 1",
+        [],
+    )?;
     connection.execute(
         "UPDATE profiles SET copy_threads = 1 WHERE copy_threads IS NULL",
         [],

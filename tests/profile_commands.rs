@@ -27,6 +27,7 @@ use connect::{
     store::{Database, ForwardDefinition, ForwardKind, ForwardStore, ProfileInput},
     terminal::prompt::Prompt,
 };
+use rusqlite::Connection;
 
 struct TestHarness {
     root: PathBuf,
@@ -1034,7 +1035,7 @@ fn add_and_show_round_trip_copy_thread_count_default() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
-        copy_threads: Some(4),
+        copy_threads: None,
     };
 
     add::run(
@@ -1045,6 +1046,16 @@ fn add_and_show_round_trip_copy_thread_count_default() {
     )
     .unwrap();
 
+    let stored_threads: i64 = Connection::open(harness.root.join("data").join("connect.db"))
+        .unwrap()
+        .query_row(
+            "SELECT copy_threads FROM profiles WHERE name = 'prod'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_threads, 1);
+
     let args = ShowArgs {
         name: "prod".into(),
     };
@@ -1052,7 +1063,87 @@ fn add_and_show_round_trip_copy_thread_count_default() {
     show::run(harness.app(), &args, &mut output).unwrap();
 
     let stdout = String::from_utf8(output).unwrap();
-    assert!(stdout.contains("Copy threads: 4"));
+    assert!(stdout.contains("Copy threads: 1"));
+}
+
+#[test]
+fn app_save_profile_rejects_zero_copy_threads() {
+    let harness = TestHarness::new();
+
+    let error = harness
+        .app()
+        .save_profile(ProfileInput {
+            name: "prod".into(),
+            host: "prod.example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_mode: AuthMode::Auto,
+            copy_threads: 0,
+            has_password: false,
+            has_private_key: false,
+            has_key_passphrase: false,
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("copy_threads"));
+}
+
+#[test]
+fn edit_command_updates_copy_threads_when_supplied() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy").with_copy_threads(4))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: Some(8),
+    };
+
+    edit::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
+
+    assert_eq!(harness.app().get_profile("prod").unwrap().copy_threads, 8);
+}
+
+#[test]
+fn edit_command_keeps_existing_copy_threads_when_unspecified() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    edit::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
+
+    assert_eq!(harness.app().get_profile("prod").unwrap().copy_threads, 1);
 }
 
 #[test]
@@ -1107,6 +1198,103 @@ fn copy_threads_one_preserves_single_stream_mode() {
 
     let spec = copy_command::prepare_copy_spec(harness.app(), &args).unwrap();
     assert_eq!(spec.effective_threads, 1);
+}
+
+#[test]
+fn database_initialize_defaults_legacy_profiles_without_copy_threads_column() {
+    let root = unique_temp_path("connect-copy-thread-migration");
+    let legacy_db = root.join("data").join("connect.db");
+    std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+
+    let connection = Connection::open(&legacy_db).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE profiles (
+                name TEXT PRIMARY KEY,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                auth_mode TEXT NOT NULL DEFAULT 'auto',
+                has_password INTEGER NOT NULL DEFAULT 0,
+                has_private_key INTEGER NOT NULL DEFAULT 0,
+                has_key_passphrase INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            INSERT INTO profiles (
+                name, host, port, username, auth_mode, has_password, has_private_key, has_key_passphrase
+            ) VALUES (
+                'prod', 'prod.example.com', 22, 'deploy', 'auto', 0, 0, 0
+            );
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let paths = AppPaths::from_root(&root);
+    let app = App::new(paths, Arc::new(MemorySecretStore::default())).unwrap();
+
+    let stored_threads: i64 = Connection::open(&legacy_db)
+        .unwrap()
+        .query_row(
+            "SELECT copy_threads FROM profiles WHERE name = 'prod'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(stored_threads, 1);
+    assert_eq!(app.get_profile("prod").unwrap().copy_threads, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_store_rejects_malformed_persisted_copy_threads() {
+    let root = unique_temp_path("connect-copy-thread-invalid");
+    let legacy_db = root.join("data").join("connect.db");
+    std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+
+    let connection = Connection::open(&legacy_db).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE profiles (
+                name TEXT PRIMARY KEY,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                auth_mode TEXT NOT NULL DEFAULT 'auto',
+                copy_threads INTEGER NOT NULL DEFAULT 1,
+                has_password INTEGER NOT NULL DEFAULT 0,
+                has_private_key INTEGER NOT NULL DEFAULT 0,
+                has_key_passphrase INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            INSERT INTO profiles (
+                name, host, port, username, auth_mode, copy_threads, has_password, has_private_key, has_key_passphrase
+            ) VALUES (
+                'prod', 'prod.example.com', 22, 'deploy', 'auto', 0, 0, 0, 0
+            );
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let app = App::new(
+        AppPaths::from_root(&root),
+        Arc::new(MemorySecretStore::default()),
+    )
+    .unwrap();
+
+    let error = app.get_profile("prod").unwrap_err();
+    assert!(error.to_string().contains("copy_threads"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

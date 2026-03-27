@@ -57,7 +57,7 @@ pub fn run(app: &App, prompt: &dyn Prompt, args: &AddArgs, writer: &mut dyn Writ
         .with_port(port)
         .with_auth_mode(args.auth_mode);
     let mut profile = profile;
-    profile.copy_threads = args.copy_threads;
+    profile.copy_threads = args.copy_threads.unwrap_or(1);
     let _ = app.save_profile_with_secrets(profile, secrets)?;
     writeln!(writer, "Added profile '{name}'.").map_err(Error::from)
 }

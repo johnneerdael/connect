@@ -170,7 +170,7 @@ impl App {
             return Ok(threads);
         }
 
-        Ok(self.get_profile(profile_name)?.copy_threads.unwrap_or(1))
+        Ok(self.get_profile(profile_name)?.copy_threads)
     }
 
     pub fn get_profile(&self, name: &str) -> Result<Profile> {
