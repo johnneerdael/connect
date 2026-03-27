@@ -93,8 +93,6 @@ pub struct CopyPlan {
     pub mode: CopyPlanMode,
     pub jobs: Vec<CopyJob>,
     pub effective_threads: usize,
-    pub resume: bool,
-    pub retry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +108,7 @@ pub enum CopyJob {
         source_path: String,
         destination_path: String,
         size: u64,
+        policy: CopyJobPolicy,
         checkpoint: CopyCheckpointIdentity,
     },
     StripedFile {
@@ -117,6 +116,7 @@ pub enum CopyJob {
         destination_path: String,
         size: u64,
         chunks: Vec<ChunkRange>,
+        policy: CopyJobPolicy,
         checkpoint: CopyCheckpointIdentity,
     },
 }
@@ -134,6 +134,26 @@ pub struct CopyCheckpointIdentity {
     pub destination: String,
     pub path: String,
     pub recursive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyJobPolicy {
+    pub resume: CopyResumeStrategy,
+    pub retry: CopyRetryStrategy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyResumeStrategy {
+    Disabled,
+    DestinationSizeResume,
+    Checkpointed { checkpoint: CopyCheckpointIdentity },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyRetryStrategy {
+    Disabled,
+    RetryWholeFile,
+    RetryStripedChunks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,8 +182,6 @@ pub fn plan_copy(
     let destination = endpoint_to_string(&spec.destination);
     let source_label = endpoint_to_string(&spec.source);
     let effective_threads = config.effective_threads;
-    let resume = spec.resume;
-    let retry = config.retry;
 
     match (spec.recursive, source) {
         (false, PlannedCopySource::File { path, size }) => {
@@ -186,11 +204,13 @@ pub fn plan_copy(
                         destination_path: destination,
                         size,
                         chunks,
+                        policy: CopyJobPolicy {
+                            resume: striped_resume_strategy(&spec, &checkpoint),
+                            retry: striped_retry_strategy(config.retry),
+                        },
                         checkpoint,
                     }],
                     effective_threads,
-                    resume,
-                    retry,
                 })
             } else {
                 Ok(CopyPlan {
@@ -199,41 +219,58 @@ pub fn plan_copy(
                         source_path: path,
                         destination_path: destination,
                         size,
+                        policy: CopyJobPolicy {
+                            resume: whole_file_resume_strategy(&spec),
+                            retry: whole_file_retry_strategy(config.retry),
+                        },
                         checkpoint,
                     }],
                     effective_threads,
-                    resume,
-                    retry,
                 })
             }
         }
         (true, PlannedCopySource::Tree { root, entries }) => {
+            let destination_root = recursive_destination_root(&spec.destination, &root);
             let mut jobs = Vec::new();
             for entry in entries {
                 match entry {
                     PlannedCopyTreeEntry::File { path, size } => {
+                        let source_path = format!("{root}/{path}");
+                        let destination_path = recursive_job_destination_path(
+                            &spec.destination,
+                            &destination_root,
+                            &path,
+                        );
                         let checkpoint = CopyCheckpointIdentity {
                             direction: spec.direction(),
                             source: source_label.clone(),
-                            destination: destination.clone(),
-                            path: format!("{root}/{path}"),
+                            destination: destination_path.clone(),
+                            path: source_path.clone(),
                             recursive: true,
                         };
 
                         if effective_threads > 1 && size > STRIPE_THRESHOLD_BYTES {
                             let chunks = build_chunk_ranges(size, effective_threads);
                             jobs.push(CopyJob::StripedFile {
-                                source_path: format!("{root}/{path}"),
-                                destination_path: destination.clone(),
+                                source_path,
+                                destination_path,
                                 size,
                                 chunks,
+                                policy: CopyJobPolicy {
+                                    resume: CopyResumeStrategy::Disabled,
+                                    retry: striped_retry_strategy(config.retry),
+                                },
                                 checkpoint,
                             });
                         } else {
                             jobs.push(CopyJob::WholeFile {
-                                source_path: format!("{root}/{path}"),
-                                destination_path: destination.clone(),
+                                source_path,
+                                destination_path,
                                 size,
+                                policy: CopyJobPolicy {
+                                    resume: CopyResumeStrategy::Disabled,
+                                    retry: whole_file_retry_strategy(config.retry),
+                                },
                                 checkpoint,
                             });
                         }
@@ -250,8 +287,6 @@ pub fn plan_copy(
                 },
                 jobs,
                 effective_threads,
-                resume,
-                retry,
             })
         }
         (false, PlannedCopySource::Tree { .. }) => Err(Error::new(
@@ -264,6 +299,65 @@ pub fn plan_copy(
 }
 
 const STRIPE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+fn whole_file_resume_strategy(spec: &CopySpec) -> CopyResumeStrategy {
+    if spec.resume {
+        CopyResumeStrategy::DestinationSizeResume
+    } else {
+        CopyResumeStrategy::Disabled
+    }
+}
+
+fn striped_resume_strategy(
+    spec: &CopySpec,
+    checkpoint: &CopyCheckpointIdentity,
+) -> CopyResumeStrategy {
+    if spec.resume {
+        CopyResumeStrategy::Checkpointed {
+            checkpoint: checkpoint.clone(),
+        }
+    } else {
+        CopyResumeStrategy::Disabled
+    }
+}
+
+fn whole_file_retry_strategy(retry: bool) -> CopyRetryStrategy {
+    if retry {
+        CopyRetryStrategy::RetryWholeFile
+    } else {
+        CopyRetryStrategy::Disabled
+    }
+}
+
+fn striped_retry_strategy(retry: bool) -> CopyRetryStrategy {
+    if retry {
+        CopyRetryStrategy::RetryStripedChunks
+    } else {
+        CopyRetryStrategy::Disabled
+    }
+}
+
+fn recursive_destination_root(destination: &CopyEndpoint, source_root: &str) -> String {
+    let source_root_name = path_tail(source_root);
+    match destination {
+        CopyEndpoint::Remote(remote) => join_remote(&remote.path, &source_root_name),
+        CopyEndpoint::Local(path) => path.join(source_root_name).display().to_string(),
+    }
+}
+
+fn recursive_job_destination_path(
+    destination: &CopyEndpoint,
+    destination_root: &str,
+    relative_path: &str,
+) -> String {
+    match destination {
+        CopyEndpoint::Remote(_) => join_remote(destination_root, relative_path),
+        CopyEndpoint::Local(_) => Path::new(destination_root)
+            .join(relative_path)
+            .display()
+            .to_string(),
+    }
+}
 
 fn build_chunk_ranges(size: u64, effective_threads: usize) -> Vec<ChunkRange> {
     let chunk_count = effective_threads
@@ -294,6 +388,13 @@ fn endpoint_to_string(endpoint: &CopyEndpoint) -> String {
         CopyEndpoint::Local(path) => path.display().to_string(),
         CopyEndpoint::Remote(remote) => format!("{}:{}", remote.profile, remote.path),
     }
+}
+
+fn path_tail(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.trim_matches('/').to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

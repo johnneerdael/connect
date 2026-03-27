@@ -14,9 +14,9 @@ pub use client::{
 };
 pub use copy::{
     copy_profile, parse_copy_spec, plan_copy, CopyCheckpointIdentity, CopyDirection, CopyEndpoint,
-    CopyJob, CopyPlan, CopyPlanMode, CopyPlannerConfig, CopySpec, CopySummary, CopyTransferOptions,
-    CopyTransferResult, PlannedCopySource, PlannedCopyTreeEntry, RemoteDirectoryEntry,
-    RemoteFileType, RemotePath,
+    CopyJob, CopyJobPolicy, CopyPlan, CopyPlanMode, CopyPlannerConfig, CopyResumeStrategy,
+    CopyRetryStrategy, CopySpec, CopySummary, CopyTransferOptions, CopyTransferResult,
+    PlannedCopySource, PlannedCopyTreeEntry, RemoteDirectoryEntry, RemoteFileType, RemotePath,
 };
 pub use hostkeys::{
     verify_observed_host_key, HostKeyVerification, ObservedHostKey, ObservedHostKeySource,
