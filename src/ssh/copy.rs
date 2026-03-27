@@ -174,9 +174,23 @@ pub enum PlannedCopyTreeEntry {
     Directory { path: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyDestinationShape {
+    pub existing_directory: bool,
+}
+
+impl CopyDestinationShape {
+    pub fn new(existing_directory: bool) -> Self {
+        Self {
+            existing_directory,
+        }
+    }
+}
+
 pub fn plan_copy(
     spec: CopySpec,
     config: CopyPlannerConfig,
+    destination_shape: CopyDestinationShape,
     source: PlannedCopySource,
 ) -> Result<CopyPlan> {
     let destination = endpoint_to_string(&spec.destination);
@@ -230,7 +244,8 @@ pub fn plan_copy(
             }
         }
         (true, PlannedCopySource::Tree { root, entries }) => {
-            let destination_root = recursive_destination_root(&spec.destination, &root);
+            let destination_root =
+                recursive_destination_root(&spec.destination, &root, destination_shape);
             let mut jobs = Vec::new();
             for entry in entries {
                 match entry {
@@ -337,7 +352,15 @@ fn striped_retry_strategy(retry: bool) -> CopyRetryStrategy {
     }
 }
 
-fn recursive_destination_root(destination: &CopyEndpoint, source_root: &str) -> String {
+fn recursive_destination_root(
+    destination: &CopyEndpoint,
+    source_root: &str,
+    destination_shape: CopyDestinationShape,
+) -> String {
+    if !destination_shape.existing_directory {
+        return endpoint_destination_path(destination);
+    }
+
     let source_root_name = path_tail(source_root);
     match destination {
         CopyEndpoint::Remote(remote) => join_remote(&remote.path, &source_root_name),
@@ -387,6 +410,13 @@ fn endpoint_to_string(endpoint: &CopyEndpoint) -> String {
     match endpoint {
         CopyEndpoint::Local(path) => path.display().to_string(),
         CopyEndpoint::Remote(remote) => format!("{}:{}", remote.profile, remote.path),
+    }
+}
+
+fn endpoint_destination_path(endpoint: &CopyEndpoint) -> String {
+    match endpoint {
+        CopyEndpoint::Local(path) => path.display().to_string(),
+        CopyEndpoint::Remote(remote) => remote.path.clone(),
     }
 }
 
