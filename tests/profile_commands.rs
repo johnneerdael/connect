@@ -1915,7 +1915,7 @@ async fn threaded_copy_fails_when_requested_parallelism_degrades_to_one_session(
 }
 
 #[tokio::test]
-async fn threaded_copy_fails_clearly_when_transfer_readiness_is_unavailable() {
+async fn threaded_copy_fails_clearly_when_random_access_support_is_unavailable() {
     let harness = TestHarness::with_profile("prod");
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
@@ -1945,11 +1945,13 @@ async fn threaded_copy_fails_clearly_when_transfer_readiness_is_unavailable() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("transfer-ready sftp session"));
+    assert!(error
+        .to_string()
+        .contains("random-access-capable sftp session"));
 }
 
 #[tokio::test]
-async fn threaded_copy_does_not_count_sessions_that_fail_transfer_readiness() {
+async fn threaded_copy_fails_when_an_extra_session_lacks_random_access_support() {
     let harness = TestHarness::with_profile("prod");
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
@@ -1961,10 +1963,10 @@ async fn threaded_copy_does_not_count_sessions_that_fail_transfer_readiness() {
         .update_profile_secret_flags("prod", true, false, false)
         .unwrap();
 
-    let source = TestFile::write_temp("parallel-transfer-ready.txt", "payload");
+    let source = TestFile::write_temp("parallel-random-access-extra.txt", "payload");
     let mut spec = parse_copy_spec(
         source.path().to_string_lossy().as_ref(),
-        "prod:/tmp/parallel-transfer-ready.txt",
+        "prod:/tmp/parallel-random-access-extra.txt",
         false,
         false,
         false,
@@ -1974,17 +1976,18 @@ async fn threaded_copy_does_not_count_sessions_that_fail_transfer_readiness() {
     let profile = harness.app().get_profile("prod").unwrap();
     let ssh = FakeCopySshClient::transfer_readiness_fails_on_session(3);
 
-    let pool =
-        establish_transfer_sessions(&ssh, &profile, harness.app(), &FakePrompt::default(), 4)
+    let error =
+        match establish_transfer_sessions(&ssh, &profile, harness.app(), &FakePrompt::default(), 4)
             .await
-            .unwrap();
+        {
+            Ok(_) => panic!("expected random-access probe failure"),
+            Err(error) => error,
+        };
 
-    assert_eq!(pool.effective_threads(), 3);
-    assert!(pool
-        .warnings()
-        .iter()
-        .any(|warning| warning.contains("degraded")));
-    assert_eq!(ssh.connect_attempts(), 4);
+    assert!(error
+        .to_string()
+        .contains("random-access-capable sftp session"));
+    assert_eq!(ssh.connect_attempts(), 3);
 }
 
 #[tokio::test]
@@ -2645,9 +2648,9 @@ impl SshSession for FakeCopySession {
         })
     }
 
-    fn ensure_transfer_ready<'a>(
+    fn supports_parallel_random_access<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
         let supported = {
             let state = self.state.lock().unwrap();
             let session_index = state.successful_authentications;
@@ -2655,7 +2658,7 @@ impl SshSession for FakeCopySession {
         };
         Box::pin(async move {
             if supported {
-                Ok(())
+                Ok(true)
             } else {
                 Err(Error::new("sftp subsystem initialization failed"))
             }

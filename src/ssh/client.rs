@@ -128,16 +128,18 @@ pub trait SshSession: Send {
         Box::pin(async { Ok(()) })
     }
 
-    /// Probes whether this session can initialize its transfer subsystem for copy work.
+    /// Probes whether this session supports random-access-capable SFTP copy work.
     ///
     /// For the current russh backend, the honest production contract is "this
-    /// SSH session can successfully open an SFTP subsystem/session".
-    fn ensure_transfer_ready<'a>(
+    /// SSH session can successfully open an SFTP subsystem/session, and the
+    /// client implementation uses explicit-offset I/O via the underlying
+    /// SFTP file handle's seek/read/write support".
+    fn supports_parallel_random_access<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async {
             Err(Error::new(
-                "ssh session does not support transfer-ready copy operations",
+                "ssh session does not support random-access-capable copy operations",
             ))
         })
     }
@@ -655,12 +657,12 @@ impl SshSession for RusshSession {
         })
     }
 
-    fn ensure_transfer_ready<'a>(
+    fn supports_parallel_random_access<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
             let _ = self.sftp().await?;
-            Ok(())
+            Ok(true)
         })
     }
 

@@ -90,15 +90,12 @@ pub async fn establish_transfer_sessions(
         match connect_authenticated_session(ssh, profile, context, prompt).await {
             Ok(mut session) => {
                 if requested_threads > 1 {
-                    match session.ensure_transfer_ready().await {
-                        Ok(()) => {}
-                        Err(_) if sessions.is_empty() => {
+                    match session.supports_parallel_random_access().await {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => {
                             return Err(Error::new(
-                                "threaded copy requires a transfer-ready sftp session",
+                                "threaded copy requires a random-access-capable sftp session",
                             ));
-                        }
-                        Err(_) => {
-                            continue;
                         }
                     }
                 }
@@ -131,7 +128,7 @@ pub async fn establish_transfer_sessions(
     let effective_threads = sessions.len();
     let warnings = if requested_threads > effective_threads {
         vec![format!(
-            "parallel copy degraded from {requested_threads} requested sessions to {effective_threads} transfer-ready sessions"
+            "parallel copy degraded from {requested_threads} requested sessions to {effective_threads} random-access-capable sessions"
         )]
     } else {
         Vec::new()
