@@ -2,6 +2,7 @@ mod auth;
 mod client;
 mod copy;
 mod hostkeys;
+mod parallel;
 
 pub(crate) use auth::connect_authenticated_session;
 pub use auth::{
@@ -12,8 +13,10 @@ pub use client::{
     SshSession,
 };
 pub use copy::{
-    copy_profile, parse_copy_spec, CopyDirection, CopyEndpoint, CopySpec, CopySummary,
-    CopyTransferOptions, CopyTransferResult, RemoteDirectoryEntry, RemoteFileType, RemotePath,
+    copy_profile, parse_copy_spec, plan_copy, CopyCheckpointIdentity, CopyDirection, CopyEndpoint,
+    CopyJob, CopyPlan, CopyPlanMode, CopyPlannerConfig, CopySpec, CopySummary, CopyTransferOptions,
+    CopyTransferResult, PlannedCopySource, PlannedCopyTreeEntry, RemoteDirectoryEntry,
+    RemoteFileType, RemotePath,
 };
 pub use hostkeys::{
     verify_observed_host_key, HostKeyVerification, ObservedHostKey, ObservedHostKeySource,

@@ -1,4 +1,5 @@
 use std::{
+    convert::TryFrom,
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -69,6 +70,229 @@ impl CopySpec {
             }
             _ => unreachable!("copy specs must have exactly one remote endpoint"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyPlannerConfig {
+    pub effective_threads: usize,
+    pub retry: bool,
+}
+
+impl CopyPlannerConfig {
+    pub fn new(effective_threads: usize) -> Self {
+        Self {
+            effective_threads,
+            retry: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyPlan {
+    pub mode: CopyPlanMode,
+    pub jobs: Vec<CopyJob>,
+    pub effective_threads: usize,
+    pub resume: bool,
+    pub retry: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyPlanMode {
+    SingleStream,
+    StripedFile { chunks: Vec<ChunkRange> },
+    QueuedTree,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyJob {
+    WholeFile {
+        source_path: String,
+        destination_path: String,
+        size: u64,
+        checkpoint: CopyCheckpointIdentity,
+    },
+    StripedFile {
+        source_path: String,
+        destination_path: String,
+        size: u64,
+        chunks: Vec<ChunkRange>,
+        checkpoint: CopyCheckpointIdentity,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyCheckpointIdentity {
+    pub direction: CopyDirection,
+    pub source: String,
+    pub destination: String,
+    pub path: String,
+    pub recursive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedCopySource {
+    File {
+        path: String,
+        size: u64,
+    },
+    Tree {
+        root: String,
+        entries: Vec<PlannedCopyTreeEntry>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedCopyTreeEntry {
+    File { path: String, size: u64 },
+    Directory { path: String },
+}
+
+pub fn plan_copy(
+    spec: CopySpec,
+    config: CopyPlannerConfig,
+    source: PlannedCopySource,
+) -> Result<CopyPlan> {
+    let destination = endpoint_to_string(&spec.destination);
+    let source_label = endpoint_to_string(&spec.source);
+    let effective_threads = config.effective_threads;
+    let resume = spec.resume;
+    let retry = config.retry;
+
+    match (spec.recursive, source) {
+        (false, PlannedCopySource::File { path, size }) => {
+            let checkpoint = CopyCheckpointIdentity {
+                direction: spec.direction(),
+                source: source_label,
+                destination: destination.clone(),
+                path: path.clone(),
+                recursive: false,
+            };
+
+            if effective_threads > 1 && size > STRIPE_THRESHOLD_BYTES {
+                let chunks = build_chunk_ranges(size, effective_threads);
+                Ok(CopyPlan {
+                    mode: CopyPlanMode::StripedFile {
+                        chunks: chunks.clone(),
+                    },
+                    jobs: vec![CopyJob::StripedFile {
+                        source_path: path,
+                        destination_path: destination,
+                        size,
+                        chunks,
+                        checkpoint,
+                    }],
+                    effective_threads,
+                    resume,
+                    retry,
+                })
+            } else {
+                Ok(CopyPlan {
+                    mode: CopyPlanMode::SingleStream,
+                    jobs: vec![CopyJob::WholeFile {
+                        source_path: path,
+                        destination_path: destination,
+                        size,
+                        checkpoint,
+                    }],
+                    effective_threads,
+                    resume,
+                    retry,
+                })
+            }
+        }
+        (true, PlannedCopySource::Tree { root, entries }) => {
+            let mut jobs = Vec::new();
+            for entry in entries {
+                match entry {
+                    PlannedCopyTreeEntry::File { path, size } => {
+                        let checkpoint = CopyCheckpointIdentity {
+                            direction: spec.direction(),
+                            source: source_label.clone(),
+                            destination: destination.clone(),
+                            path: format!("{root}/{path}"),
+                            recursive: true,
+                        };
+
+                        if effective_threads > 1 && size > STRIPE_THRESHOLD_BYTES {
+                            let chunks = build_chunk_ranges(size, effective_threads);
+                            jobs.push(CopyJob::StripedFile {
+                                source_path: format!("{root}/{path}"),
+                                destination_path: destination.clone(),
+                                size,
+                                chunks,
+                                checkpoint,
+                            });
+                        } else {
+                            jobs.push(CopyJob::WholeFile {
+                                source_path: format!("{root}/{path}"),
+                                destination_path: destination.clone(),
+                                size,
+                                checkpoint,
+                            });
+                        }
+                    }
+                    PlannedCopyTreeEntry::Directory { .. } => {}
+                }
+            }
+
+            Ok(CopyPlan {
+                mode: if effective_threads > 1 {
+                    CopyPlanMode::QueuedTree
+                } else {
+                    CopyPlanMode::SingleStream
+                },
+                jobs,
+                effective_threads,
+                resume,
+                retry,
+            })
+        }
+        (false, PlannedCopySource::Tree { .. }) => Err(Error::new(
+            "copy planner received a recursive source description for a non-recursive copy",
+        )),
+        (true, PlannedCopySource::File { .. }) => Err(Error::new(
+            "copy planner received a single-file source description for a recursive copy",
+        )),
+    }
+}
+
+const STRIPE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+fn build_chunk_ranges(size: u64, effective_threads: usize) -> Vec<ChunkRange> {
+    let chunk_count = effective_threads
+        .min(usize::try_from(size.div_ceil(STRIPE_THRESHOLD_BYTES)).unwrap_or(usize::MAX));
+    let chunk_count = chunk_count.max(1);
+    let chunk_count_u64 = chunk_count as u64;
+    let base = size / chunk_count_u64;
+    let remainder = size % chunk_count_u64;
+    let mut start = 0_u64;
+    let mut chunks = Vec::with_capacity(chunk_count);
+
+    for index in 0..chunk_count_u64 {
+        let extra = u64::from(index < remainder);
+        let end = start + base + extra;
+        chunks.push(ChunkRange { start, end });
+        start = end;
+    }
+
+    if let Some(last) = chunks.last_mut() {
+        last.end = size;
+    }
+
+    chunks
+}
+
+fn endpoint_to_string(endpoint: &CopyEndpoint) -> String {
+    match endpoint {
+        CopyEndpoint::Local(path) => path.display().to_string(),
+        CopyEndpoint::Remote(remote) => format!("{}:{}", remote.profile, remote.path),
     }
 }
 
