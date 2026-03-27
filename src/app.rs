@@ -161,6 +161,18 @@ impl App {
         self.get_profile(&profile.name)
     }
 
+    pub fn effective_copy_threads(
+        &self,
+        profile_name: &str,
+        cli_threads: Option<usize>,
+    ) -> Result<usize> {
+        if let Some(threads) = cli_threads {
+            return Ok(threads);
+        }
+
+        Ok(self.get_profile(profile_name)?.copy_threads.unwrap_or(1))
+    }
+
     pub fn get_profile(&self, name: &str) -> Result<Profile> {
         self.profile_store
             .get(name)?
@@ -231,6 +243,7 @@ impl App {
         let mut updated =
             ProfileInput::new(profile.name, profile.host, profile.username).with_port(profile.port);
         updated.auth_mode = profile.auth_mode;
+        updated.copy_threads = profile.copy_threads;
         updated.has_password = has_password;
         updated.has_private_key = has_private_key;
         updated.has_key_passphrase = has_key_passphrase;

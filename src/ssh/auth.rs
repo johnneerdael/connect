@@ -316,6 +316,7 @@ mod tests {
             port: 22,
             username: "deploy".into(),
             auth_mode: AuthMode::PasswordOnly,
+            copy_threads: None,
             has_password: true,
             has_private_key: false,
             has_key_passphrase: false,

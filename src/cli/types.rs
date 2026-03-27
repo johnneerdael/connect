@@ -73,6 +73,8 @@ pub struct AddArgs {
     pub key_passphrase: bool,
     #[arg(long = "key-passphrase-stdin", conflicts_with = "key_passphrase")]
     pub key_passphrase_stdin: bool,
+    #[arg(long = "copy-threads", value_parser = parse_copy_threads)]
+    pub copy_threads: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -97,6 +99,8 @@ pub struct EditArgs {
     pub key_passphrase: bool,
     #[arg(long = "key-passphrase-stdin", conflicts_with = "key_passphrase")]
     pub key_passphrase_stdin: bool,
+    #[arg(long = "copy-threads", value_parser = parse_copy_threads)]
+    pub copy_threads: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -124,6 +128,10 @@ pub struct CopyArgs {
     pub resume: bool,
     #[arg(long)]
     pub progress: bool,
+    #[arg(long, value_name = "COUNT", value_parser = parse_copy_threads)]
+    pub threads: Option<usize>,
+    #[arg(long)]
+    pub retry: bool,
     #[arg(value_name = "SOURCE")]
     pub source: String,
     #[arg(value_name = "DESTINATION")]
@@ -249,4 +257,16 @@ pub struct HostkeysDeleteArgs {
 
 fn parse_auth_mode(value: &str) -> Result<AuthMode, String> {
     value.parse()
+}
+
+fn parse_copy_threads(value: &str) -> Result<usize, String> {
+    let threads = value.parse::<usize>().map_err(|_| {
+        format!("invalid copy thread count '{value}' (expected a positive integer)")
+    })?;
+
+    if threads == 0 {
+        Err("copy thread count must be greater than zero".to_string())
+    } else {
+        Ok(threads)
+    }
 }

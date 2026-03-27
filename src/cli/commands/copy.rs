@@ -15,6 +15,7 @@ pub fn run(app: &App, prompt: &dyn Prompt, args: &CopyArgs) -> Result<()> {
         args.resume,
         args.progress,
     )?;
+    let _effective_threads = app.effective_copy_threads(spec.remote_profile(), args.threads)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

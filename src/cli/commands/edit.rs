@@ -55,6 +55,7 @@ pub fn run(app: &App, prompt: &dyn Prompt, args: &EditArgs, writer: &mut dyn Wri
     let mut profile = ProfileInput::new(name.clone(), host, user)
         .with_port(port)
         .with_auth_mode(auth_mode);
+    profile.copy_threads = args.copy_threads.or(existing.copy_threads);
     profile.has_password = existing.has_password;
     profile.has_private_key = existing.has_private_key;
     profile.has_key_passphrase = existing.has_key_passphrase;

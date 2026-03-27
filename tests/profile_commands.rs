@@ -237,6 +237,7 @@ fn add_command_imports_private_key_and_persists_profile() {
         private_key: Some(temp_key.path().into()),
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     add::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
@@ -270,6 +271,7 @@ fn add_command_prompts_for_missing_required_fields() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     add::run(harness.app(), &prompt, &args, &mut output).unwrap();
@@ -299,6 +301,7 @@ fn add_command_stores_password_and_key_passphrase_from_secret_prompt() {
         private_key: Some(temp_key.path().into()),
         key_passphrase: true,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     add::run(harness.app(), &prompt, &args, &mut output).unwrap();
@@ -331,6 +334,7 @@ fn add_command_persists_selected_auth_mode() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     add::run(
@@ -360,6 +364,7 @@ fn add_command_rejects_invalid_host() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(
@@ -390,6 +395,7 @@ fn add_command_accepts_absolute_fqdn_and_internal_hostname() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     add::run(
@@ -411,6 +417,7 @@ fn add_command_accepts_absolute_fqdn_and_internal_hostname() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     add::run(
@@ -450,6 +457,7 @@ fn add_command_rejects_duplicate_profile_names() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(
@@ -486,6 +494,7 @@ fn add_command_rejects_reserved_profile_name() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(
@@ -517,6 +526,7 @@ fn add_command_rejects_single_letter_profile_name() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(
@@ -557,6 +567,7 @@ fn add_command_rolls_back_secrets_when_secret_write_fails() {
         private_key: None,
         key_passphrase: true,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
@@ -592,6 +603,7 @@ fn add_command_preserves_primary_error_when_rollback_fails() {
         private_key: None,
         key_passphrase: true,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
@@ -620,6 +632,7 @@ fn add_command_rolls_back_new_secrets_when_metadata_save_fails() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = add::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap_err();
@@ -653,6 +666,7 @@ fn edit_command_updates_only_supplied_fields() {
         private_key: Some(temp_key.path().into()),
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     edit::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap();
@@ -692,6 +706,7 @@ fn edit_command_updates_auth_mode_when_supplied() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     edit::run(
@@ -725,6 +740,7 @@ fn edit_command_rejects_invalid_host() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = edit::run(
@@ -759,6 +775,7 @@ fn edit_command_accepts_absolute_fqdn() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     edit::run(
@@ -789,6 +806,7 @@ fn edit_command_rejects_reserved_profile_name() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = edit::run(
@@ -823,6 +841,7 @@ fn edit_command_allows_existing_single_letter_profile_name() {
         private_key: None,
         key_passphrase: false,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     edit::run(
@@ -870,6 +889,7 @@ fn edit_command_rolls_back_overwritten_secrets_when_secret_write_fails() {
         private_key: None,
         key_passphrase: true,
         key_passphrase_stdin: false,
+        copy_threads: None,
     };
 
     let error = edit::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
@@ -996,6 +1016,66 @@ fn show_command_prints_metadata_and_redacted_secret_availability_only() {
     assert!(stdout.contains("Key passphrase: not configured"));
     assert!(!stdout.contains("secret"));
     assert!(!stdout.contains("pem"));
+}
+
+#[test]
+fn show_command_displays_default_copy_threads() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = ShowArgs {
+        name: "prod".into(),
+    };
+
+    show::run(harness.app(), &args, &mut output).unwrap();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("Copy threads: 1"));
+}
+
+#[test]
+fn effective_copy_threads_defaults_to_one_when_profile_is_unset() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    assert_eq!(
+        harness.app().effective_copy_threads("prod", None).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn effective_copy_threads_prefers_cli_override_over_saved_profile_value() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let database = Database::new(harness.root.join("data").join("connect.db"));
+    let connection = database.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE profiles SET copy_threads = 4 WHERE name = ?1",
+            ["prod"],
+        )
+        .unwrap();
+
+    assert_eq!(
+        harness
+            .app()
+            .effective_copy_threads("prod", Some(8))
+            .unwrap(),
+        8
+    );
 }
 
 #[test]

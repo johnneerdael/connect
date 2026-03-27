@@ -186,6 +186,52 @@ fn copy_parses_resume_and_progress_flags() {
 }
 
 #[test]
+fn copy_parses_thread_and_retry_flags() {
+    let cli = parse_cli(&[
+        "connect",
+        "copy",
+        "--threads",
+        "4",
+        "--retry",
+        "artifact.txt",
+        "prod:/tmp/artifact.txt",
+    ]);
+
+    match cli.command {
+        Some(CliCommand::Copy(args)) => {
+            assert_eq!(args.threads, Some(4));
+            assert!(args.retry);
+        }
+        other => panic!("expected copy command, got {other:?}"),
+    }
+}
+
+#[test]
+fn copy_help_lists_thread_and_retry_flags() {
+    let mut cmd = connect_test_bin();
+    cmd.args(["copy", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--threads"))
+        .stdout(predicates::str::contains("--retry"));
+}
+
+#[test]
+fn copy_rejects_zero_threads() {
+    let error = Cli::try_parse_from([
+        "connect",
+        "copy",
+        "--threads",
+        "0",
+        "artifact.txt",
+        "prod:/tmp/artifact.txt",
+    ])
+    .expect_err("copy should reject zero threads");
+
+    assert!(error.to_string().contains("greater than zero"));
+}
+
+#[test]
 fn exec_help_lists_pty_and_command_usage() {
     let mut cmd = connect_test_bin();
     cmd.args(["exec", "--help"])

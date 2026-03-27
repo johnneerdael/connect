@@ -19,13 +19,14 @@ impl ProfileStore {
         connection.execute(
             "
             INSERT INTO profiles (
-                name, host, port, username, auth_mode, has_password, has_private_key, has_key_passphrase
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                name, host, port, username, auth_mode, copy_threads, has_password, has_private_key, has_key_passphrase
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(name) DO UPDATE SET
                 host = excluded.host,
                 port = excluded.port,
                 username = excluded.username,
                 auth_mode = excluded.auth_mode,
+                copy_threads = excluded.copy_threads,
                 has_password = excluded.has_password,
                 has_private_key = excluded.has_private_key,
                 has_key_passphrase = excluded.has_key_passphrase,
@@ -37,6 +38,7 @@ impl ProfileStore {
                 i64::from(profile.port),
                 profile.username,
                 profile.auth_mode.as_str(),
+                profile.copy_threads.map(|value| value as i64),
                 profile.has_password,
                 profile.has_private_key,
                 profile.has_key_passphrase,
@@ -56,6 +58,7 @@ impl ProfileStore {
                     port,
                     username,
                     auth_mode,
+                    copy_threads,
                     has_password,
                     has_private_key,
                     has_key_passphrase,
@@ -82,6 +85,7 @@ impl ProfileStore {
                 port,
                 username,
                 auth_mode,
+                copy_threads,
                 has_password,
                 has_private_key,
                 has_key_passphrase,
@@ -125,10 +129,11 @@ fn map_profile(row: &Row<'_>) -> rusqlite::Result<Profile> {
         port: row.get::<_, u16>(2)?,
         username: row.get(3)?,
         auth_mode,
-        has_password: row.get(5)?,
-        has_private_key: row.get(6)?,
-        has_key_passphrase: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        copy_threads: row.get::<_, Option<i64>>(5)?.map(|value| value as usize),
+        has_password: row.get(6)?,
+        has_private_key: row.get(7)?,
+        has_key_passphrase: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }

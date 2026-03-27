@@ -49,6 +49,7 @@ pub struct ProfileInput {
     pub port: u16,
     pub username: String,
     pub auth_mode: AuthMode,
+    pub copy_threads: Option<usize>,
     pub has_password: bool,
     pub has_private_key: bool,
     pub has_key_passphrase: bool,
@@ -66,6 +67,7 @@ impl ProfileInput {
             port: 22,
             username: username.into(),
             auth_mode: AuthMode::Auto,
+            copy_threads: None,
             has_password: false,
             has_private_key: false,
             has_key_passphrase: false,
@@ -81,6 +83,11 @@ impl ProfileInput {
         self.auth_mode = auth_mode;
         self
     }
+
+    pub fn with_copy_threads(mut self, copy_threads: usize) -> Self {
+        self.copy_threads = Some(copy_threads);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +97,7 @@ pub struct Profile {
     pub port: u16,
     pub username: String,
     pub auth_mode: AuthMode,
+    pub copy_threads: Option<usize>,
     pub has_password: bool,
     pub has_private_key: bool,
     pub has_key_passphrase: bool,
