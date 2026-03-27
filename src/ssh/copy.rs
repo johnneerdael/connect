@@ -580,10 +580,21 @@ fn path_tail(path: &str) -> String {
         .unwrap_or_else(|| path.trim_matches('/').to_string())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyTransferOptions {
     pub resume_offset: u64,
     pub show_progress: bool,
+    pub finish_progress_line: bool,
+}
+
+impl Default for CopyTransferOptions {
+    fn default() -> Self {
+        Self {
+            resume_offset: 0,
+            show_progress: false,
+            finish_progress_line: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1895,13 +1906,14 @@ async fn upload(
     destination: &str,
     spec: &CopySpec,
 ) -> Result<CopySummary> {
+    let resolved_destination = session.resolve_remote_path(destination).await?;
     let metadata = fs::metadata(source)?;
     if metadata.is_dir() {
         if !spec.recursive {
             return Err(Error::new("copying directories requires --recursive"));
         }
 
-        let root = resolve_remote_directory_target(session, source, destination).await?;
+        let root = resolve_remote_directory_target(session, source, &resolved_destination).await?;
         let result = upload_dir_recursive(
             session,
             source,
@@ -1909,6 +1921,7 @@ async fn upload(
             CopyTransferOptions {
                 resume_offset: 0,
                 show_progress: spec.progress,
+                finish_progress_line: true,
             },
         )
         .await?;
@@ -1922,7 +1935,7 @@ async fn upload(
             warnings: Vec::new(),
         })
     } else if metadata.is_file() {
-        let target = resolve_remote_file_target(session, source, destination).await?;
+        let target = resolve_remote_file_target(session, source, &resolved_destination).await?;
         let resume_offset =
             resolve_upload_resume_offset(session, source, &target, spec.resume).await?;
         if let Some(parent) = remote_parent(&target) {
@@ -1935,6 +1948,7 @@ async fn upload(
                 CopyTransferOptions {
                     resume_offset,
                     show_progress: spec.progress,
+                    finish_progress_line: true,
                 },
             )
             .await?;
@@ -1961,20 +1975,22 @@ async fn download(
     destination: &Path,
     spec: &CopySpec,
 ) -> Result<CopySummary> {
-    match session.remote_file_type(source).await? {
+    let resolved_source = session.resolve_remote_path(source).await?;
+    match session.remote_file_type(&resolved_source).await? {
         Some(RemoteFileType::Directory) => {
             if !spec.recursive {
                 return Err(Error::new("copying directories requires --recursive"));
             }
 
-            let root = resolve_local_directory_target(source, destination)?;
+            let root = resolve_local_directory_target(&resolved_source, destination)?;
             let result = download_dir_recursive(
                 session,
-                source,
+                &resolved_source,
                 &root,
                 CopyTransferOptions {
                     resume_offset: 0,
                     show_progress: spec.progress,
+                    finish_progress_line: true,
                 },
             )
             .await?;
@@ -1989,19 +2005,21 @@ async fn download(
             })
         }
         Some(RemoteFileType::File) | Some(RemoteFileType::Symlink) => {
-            let target = resolve_local_file_target(source, destination)?;
+            let target = resolve_local_file_target(&resolved_source, destination)?;
             let resume_offset =
-                resolve_download_resume_offset(session, source, &target, spec.resume).await?;
+                resolve_download_resume_offset(session, &resolved_source, &target, spec.resume)
+                    .await?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             let result = session
                 .download_file(
-                    source,
+                    &resolved_source,
                     &target,
                     CopyTransferOptions {
                         resume_offset,
                         show_progress: spec.progress,
+                        finish_progress_line: true,
                     },
                 )
                 .await?;
@@ -2016,9 +2034,11 @@ async fn download(
             })
         }
         Some(RemoteFileType::Other) => Err(Error::new(format!(
-            "unsupported remote file type: {source}"
+            "unsupported remote file type: {resolved_source}"
         ))),
-        None => Err(Error::new(format!("remote path was not found: {source}"))),
+        None => Err(Error::new(format!(
+            "remote path was not found: {resolved_source}"
+        ))),
     }
 }
 
@@ -2049,6 +2069,24 @@ async fn upload_dir_recursive(
                     .upload_file(&local_path, &remote_path, options)
                     .await?;
                 bytes_copied = bytes_copied.saturating_add(result.bytes_copied);
+            } else if file_type.is_symlink() {
+                let metadata = fs::metadata(&local_path)?;
+                if metadata.is_file() {
+                    let result = session
+                        .upload_file(&local_path, &remote_path, options)
+                        .await?;
+                    bytes_copied = bytes_copied.saturating_add(result.bytes_copied);
+                } else if metadata.is_dir() {
+                    return Err(Error::new(format!(
+                        "symlinked directories are not supported during recursive copy: {}",
+                        local_path.display()
+                    )));
+                } else {
+                    return Err(Error::new(format!(
+                        "unsupported local symlink target type: {}",
+                        local_path.display()
+                    )));
+                }
             } else {
                 return Err(Error::new(format!(
                     "unsupported local file type: {}",
@@ -2218,7 +2256,9 @@ fn parse_remote_path(value: &str) -> Option<RemotePath> {
         Some(profile) => (true, profile.trim()),
         None => (false, raw_profile.trim()),
     };
-    if profile.is_empty() || !path.starts_with('/') {
+    if profile.is_empty()
+        || !(path.starts_with('/') || path == "~" || path == "~/" || path.starts_with("~/"))
+    {
         return None;
     }
 
