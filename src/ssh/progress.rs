@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::time::Instant;
 
 use crossterm::terminal;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -16,6 +17,7 @@ pub(crate) enum ProgressMode {
 pub(crate) struct ProgressRenderOptions {
     pub initial_copied: u64,
     pub finish_line: bool,
+    pub started_at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +34,7 @@ pub(crate) struct ThreadedProgressReporter<W> {
     writer: W,
     mode: ProgressMode,
     terminal_columns: usize,
+    started_at: Instant,
     rendered: bool,
 }
 
@@ -60,16 +63,22 @@ where
             writer,
             mode,
             terminal_columns,
+            started_at: Instant::now(),
             rendered: false,
         }
     }
 
     pub(crate) async fn render(&mut self, snapshot: &AggregateProgressSnapshot) -> Result<()> {
+        let throughput = format_transfer_rate(
+            snapshot.copied_bytes.saturating_sub(snapshot.resumed_bytes),
+            self.started_at,
+        );
         print_progress(
             &mut self.writer,
             &format_aggregate_progress_line(snapshot),
             snapshot.copied_bytes,
             Some(snapshot.total_bytes),
+            throughput.as_deref(),
             self.mode,
             self.terminal_columns,
         )
@@ -100,6 +109,7 @@ pub(crate) async fn print_progress<W>(
     label: &str,
     copied: u64,
     total_bytes: Option<u64>,
+    throughput: Option<&str>,
     progress_mode: ProgressMode,
     terminal_columns: usize,
 ) -> Result<()>
@@ -109,13 +119,18 @@ where
     match progress_mode {
         ProgressMode::Hidden => {}
         ProgressMode::Interactive => {
-            let line =
-                format_interactive_progress_line(label, copied, total_bytes, terminal_columns);
+            let line = format_interactive_progress_line(
+                label,
+                copied,
+                total_bytes,
+                throughput,
+                terminal_columns,
+            );
             writer.write_all(b"\r\x1b[2K").await?;
             writer.write_all(line.as_bytes()).await?;
         }
         ProgressMode::LogLines => {
-            let line = format_progress_line(label, copied, total_bytes);
+            let line = format_progress_line(label, copied, total_bytes, throughput);
             writer.write_all(line.as_bytes()).await?;
             writer.write_all(b"\n").await?;
         }
@@ -124,11 +139,20 @@ where
     Ok(())
 }
 
-pub(crate) fn format_progress_line(label: &str, copied: u64, total_bytes: Option<u64>) -> String {
-    let progress = match total_bytes {
+pub(crate) fn format_progress_line(
+    label: &str,
+    copied: u64,
+    total_bytes: Option<u64>,
+    throughput: Option<&str>,
+) -> String {
+    let mut progress = match total_bytes {
         Some(total) if total > 0 => format!("{copied}/{total} bytes"),
         _ => format!("{copied} bytes"),
     };
+    if let Some(throughput) = throughput {
+        progress.push_str(" at ");
+        progress.push_str(throughput);
+    }
     format!("{label}: {progress}")
 }
 
@@ -136,12 +160,17 @@ pub(crate) fn format_interactive_progress_line(
     label: &str,
     copied: u64,
     total_bytes: Option<u64>,
+    throughput: Option<&str>,
     terminal_columns: usize,
 ) -> String {
-    let progress = match total_bytes {
+    let mut progress = match total_bytes {
         Some(total) if total > 0 => format!("{copied}/{total} bytes"),
         _ => format!("{copied} bytes"),
     };
+    if let Some(throughput) = throughput {
+        progress.push_str(" at ");
+        progress.push_str(throughput);
+    }
     let available_width = terminal_columns.saturating_sub(1);
     let reserved_width = progress.chars().count() + 2;
     if available_width <= reserved_width {
@@ -162,6 +191,37 @@ fn format_aggregate_progress_line(snapshot: &AggregateProgressSnapshot) -> Strin
     }
 
     format!("{} [{}]", snapshot.label, details.join(", "))
+}
+
+pub(crate) fn format_transfer_rate(transferred_bytes: u64, started_at: Instant) -> Option<String> {
+    if transferred_bytes == 0 {
+        return None;
+    }
+
+    let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
+    let bytes_per_second = transferred_bytes as f64 / elapsed_seconds;
+    if !bytes_per_second.is_finite() || bytes_per_second <= 0.0 {
+        return None;
+    }
+
+    Some(format_rate_value(bytes_per_second))
+}
+
+fn format_rate_value(bytes_per_second: f64) -> String {
+    const UNITS: [&str; 5] = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"];
+
+    let mut value = bytes_per_second;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{value:.0} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
 }
 
 fn interactive_progress_columns() -> usize {
@@ -228,7 +288,8 @@ mod tests {
         reader.read_to_string(&mut output).await.unwrap();
         assert!(output.contains('\r'));
         assert_eq!(output.matches('\n').count(), 1);
-        assert!(output.contains("threaded upload /tmp/artifact"));
+        assert!(output.contains("64/256 bytes") || output.contains("256/256 bytes"));
+        assert!(output.contains("/s"));
     }
 
     #[tokio::test]
@@ -255,6 +316,7 @@ mod tests {
             .await
             .unwrap();
         assert!(visible_output.contains('\n'));
+        assert!(visible_output.contains("/s"));
 
         let (mut hidden_reader, hidden_writer) = duplex(1024);
         let mut hidden =
@@ -297,6 +359,7 @@ mod tests {
         reader.read_to_string(&mut output).await.unwrap();
         assert_eq!(output.matches('\n').count(), 1);
         assert!(output.matches('\r').count() >= 4);
+        assert!(output.contains("/s"));
     }
 
     #[test]
@@ -305,11 +368,24 @@ mod tests {
             "download npa_publisher_wizard/npa_publisher_wizard <-> /home/jneerdael/npa_publisher_wizard/npa_publisher_wizard",
             42,
             Some(1024),
+            None,
             40,
         );
 
         assert!(line.chars().count() <= 39);
         assert!(line.contains("..."));
         assert!(line.ends_with(": 42/1024 bytes"));
+    }
+
+    #[test]
+    fn progress_line_can_include_transfer_rate() {
+        let line = format_progress_line(
+            "upload artifact.bin",
+            1024,
+            Some(4096),
+            Some("2.0 MiB/s"),
+        );
+
+        assert_eq!(line, "upload artifact.bin: 1024/4096 bytes at 2.0 MiB/s");
     }
 }

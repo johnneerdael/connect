@@ -5,7 +5,7 @@ use std::{
     path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::terminal;
@@ -425,6 +425,7 @@ mod tests {
             ProgressRenderOptions {
                 initial_copied: 6,
                 finish_line: true,
+                started_at: Instant::now() - Duration::from_secs(1),
             },
         )
         .await
@@ -440,6 +441,7 @@ mod tests {
         assert_eq!(bytes_copied, 19);
         assert!(progress.contains("\r\x1b[2Kresume test: 6/19 bytes"));
         assert!(progress.contains("\r\x1b[2Kresume test: 19/19 bytes"));
+        assert!(progress.contains("/s"));
         assert!(!progress.contains("\r\x1b[2Kresume test: 0/19 bytes"));
         assert!(progress.ends_with('\n'));
     }
@@ -471,6 +473,7 @@ mod tests {
             ProgressRenderOptions {
                 initial_copied: 0,
                 finish_line: true,
+                started_at: Instant::now() - Duration::from_secs(1),
             },
         )
         .await
@@ -485,7 +488,8 @@ mod tests {
 
         assert_eq!(bytes_copied, 19);
         assert!(progress.contains("upload test: 0/19 bytes\n"));
-        assert!(progress.contains("upload test: 19/19 bytes\n"));
+        assert!(progress.contains("upload test: 19/19 bytes at "));
+        assert!(progress.contains("/s\n"));
         assert!(!progress.contains('\r'));
     }
 
@@ -495,6 +499,7 @@ mod tests {
             "download npa_publisher_wizard/npa_publisher_wizard <-> /home/jneerdael/npa_publisher_wizard/npa_publisher_wizard",
             42,
             Some(1024),
+            None,
             40,
         );
 
@@ -530,6 +535,7 @@ mod tests {
             ProgressRenderOptions {
                 initial_copied: 0,
                 finish_line: false,
+                started_at: Instant::now() - Duration::from_secs(1),
             },
         )
         .await
@@ -544,6 +550,7 @@ mod tests {
 
         assert_eq!(bytes_copied, 5);
         assert!(progress.contains("\r\x1b[2Kupload test: 5/5 bytes"));
+        assert!(progress.contains("/s"));
         assert!(!progress.ends_with('\n'));
     }
 }
@@ -1206,11 +1213,13 @@ where
     P: AsyncWrite + Unpin,
 {
     if progress_mode != ProgressMode::Hidden {
+        let throughput = crate::ssh::progress::format_transfer_rate(0, options.started_at);
         print_progress(
             progress,
             &label,
             options.initial_copied,
             total_bytes,
+            throughput.as_deref(),
             progress_mode,
             terminal::size()
                 .ok()
@@ -1231,11 +1240,16 @@ where
         writer.write_all(&buffer[..read]).await?;
         copied += u64::try_from(read).unwrap_or(u64::MAX);
         if progress_mode != ProgressMode::Hidden {
+            let throughput = crate::ssh::progress::format_transfer_rate(
+                copied.saturating_sub(options.initial_copied),
+                options.started_at,
+            );
             print_progress(
                 progress,
                 &label,
                 copied,
                 total_bytes,
+                throughput.as_deref(),
                 progress_mode,
                 terminal::size()
                     .ok()
@@ -1284,6 +1298,7 @@ where
         ProgressRenderOptions {
             initial_copied: resume_offset,
             finish_line: finish_progress_line,
+            started_at: Instant::now(),
         },
     )
     .await
