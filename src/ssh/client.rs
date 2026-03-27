@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io::IsTerminal,
+    io::SeekFrom,
     path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -16,7 +17,7 @@ use russh::{
     Disconnect,
 };
 use russh_sftp::{
-    client::fs::Metadata as SftpMetadata,
+    client::fs::{Metadata as SftpMetadata, RandomAccessFile},
     client::{error::Error as SftpError, SftpSession},
     protocol::{FileAttributes, OpenFlags, StatusCode},
 };
@@ -32,8 +33,8 @@ use crate::{
 };
 
 use super::{
-    verify_observed_host_key, CopyTransferOptions, CopyTransferResult, ExecSpec, ObservedHostKey,
-    RemoteDirectoryEntry, RemoteFileType,
+    verify_observed_host_key, ChunkRange, CopyFileMetadata, CopyTransferOptions,
+    CopyTransferResult, ExecSpec, ObservedHostKey, RemoteDirectoryEntry, RemoteFileType,
 };
 
 type DynSshSession = Box<dyn SshSession + Send + 'static>;
@@ -150,11 +151,23 @@ pub trait SshSession: Send {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
     }
 
-    fn remote_file_size<'a>(
+    fn remote_file_metadata<'a>(
         &'a mut self,
         _path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CopyFileMetadata>>> + Send + 'a>> {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn remote_file_size<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .remote_file_metadata(path)
+                .await?
+                .map(|metadata| metadata.size_bytes()))
+        })
     }
 
     fn read_remote_dir<'a>(
@@ -167,6 +180,14 @@ pub trait SshSession: Send {
     fn create_remote_dir_all<'a>(
         &'a mut self,
         _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn prepare_remote_file_destination<'a>(
+        &'a mut self,
+        _path: &'a str,
+        _truncate: bool,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
     }
@@ -187,6 +208,40 @@ pub trait SshSession: Send {
         _options: CopyTransferOptions,
     ) -> Pin<Box<dyn Future<Output = Result<CopyTransferResult>> + Send + 'a>> {
         Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn upload_file_range<'a>(
+        &'a mut self,
+        _local_path: &'a Path,
+        _remote_path: &'a str,
+        _range: ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn download_file_range<'a>(
+        &'a mut self,
+        _remote_path: &'a str,
+        _local_path: &'a Path,
+        _range: ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async { Err(Error::new("ssh session does not support copy operations")) })
+    }
+
+    fn apply_uploaded_file_metadata<'a>(
+        &'a mut self,
+        _local_path: &'a Path,
+        _remote_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn apply_downloaded_file_metadata<'a>(
+        &'a mut self,
+        _remote_path: &'a str,
+        _local_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -657,6 +712,29 @@ impl SshSession for RusshSession {
         })
     }
 
+    fn remote_file_metadata<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CopyFileMetadata>>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            match sftp.metadata(path).await {
+                Ok(metadata) => Ok(Some(CopyFileMetadata::new(
+                    metadata.size.unwrap_or(0),
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs()),
+                ))),
+                Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                    Ok(None)
+                }
+                Err(error) => Err(map_sftp_error(error)),
+            }
+        })
+    }
+
     fn supports_parallel_random_access<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
@@ -671,14 +749,10 @@ impl SshSession for RusshSession {
         path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send + 'a>> {
         Box::pin(async move {
-            let sftp = self.sftp().await?;
-            match sftp.metadata(path).await {
-                Ok(metadata) => Ok(metadata.size),
-                Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
-                    Ok(None)
-                }
-                Err(error) => Err(map_sftp_error(error)),
-            }
+            Ok(self
+                .remote_file_metadata(path)
+                .await?
+                .map(|metadata| metadata.size_bytes()))
         })
     }
 
@@ -716,6 +790,27 @@ impl SshSession for RusshSession {
                     sftp.create_dir(&current).await.map_err(map_sftp_error)?;
                 }
             }
+            Ok(())
+        })
+    }
+
+    fn prepare_remote_file_destination<'a>(
+        &'a mut self,
+        path: &'a str,
+        truncate: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let flags = if truncate {
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::READ | OpenFlags::WRITE
+            } else {
+                OpenFlags::CREATE | OpenFlags::READ | OpenFlags::WRITE
+            };
+            let file = sftp
+                .open_random_access_with_flags(path, flags)
+                .await
+                .map_err(map_sftp_error)?;
+            file.shutdown().await.map_err(map_sftp_error)?;
             Ok(())
         })
     }
@@ -798,6 +893,84 @@ impl SshSession for RusshSession {
                 bytes_copied,
                 resumed_bytes: options.resume_offset,
             })
+        })
+    }
+
+    fn upload_file_range<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+        range: ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let mut local = File::open(local_path).await?;
+            local.seek(SeekFrom::Start(range.start)).await?;
+            let remote = sftp
+                .open_random_access_with_flags(
+                    remote_path,
+                    OpenFlags::CREATE | OpenFlags::READ | OpenFlags::WRITE,
+                )
+                .await
+                .map_err(map_sftp_error)?;
+
+            let bytes_copied = copy_local_to_remote_range(&mut local, &remote, range).await?;
+            remote.shutdown().await.map_err(map_sftp_error)?;
+            Ok(bytes_copied)
+        })
+    }
+
+    fn download_file_range<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        range: ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let remote = sftp
+                .open_random_access_with_flags(remote_path, OpenFlags::READ)
+                .await
+                .map_err(map_sftp_error)?;
+            let mut local = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(local_path)
+                .await?;
+
+            let bytes_copied =
+                copy_remote_to_local_range(&remote, &mut local, range, remote_path).await?;
+            local.flush().await?;
+            remote.shutdown().await.map_err(map_sftp_error)?;
+            Ok(bytes_copied)
+        })
+    }
+
+    fn apply_uploaded_file_metadata<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            if let Ok(metadata) = std::fs::metadata(local_path) {
+                let attrs = FileAttributes::from(&metadata);
+                let _ = sftp.set_metadata(remote_path, attrs).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn apply_downloaded_file_metadata<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let sftp = self.sftp().await?;
+            let metadata = sftp.metadata(remote_path).await.map_err(map_sftp_error)?;
+            apply_local_metadata(local_path, &metadata)
         })
     }
 }
@@ -1004,6 +1177,55 @@ where
         resume_offset,
     )
     .await
+}
+
+async fn copy_local_to_remote_range(
+    local: &mut File,
+    remote: &RandomAccessFile,
+    range: ChunkRange,
+) -> Result<u64> {
+    let mut offset = range.start;
+    let mut remaining = range.len();
+    let mut buffer = vec![0_u8; 64 * 1024];
+
+    while remaining > 0 {
+        let next = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = local.read(&mut buffer[..next]).await?;
+        if read == 0 {
+            return Err(Error::new("unexpected EOF while uploading chunk"));
+        }
+        remote.write_at(offset, &buffer[..read]).await.map_err(map_sftp_error)?;
+        offset = offset.saturating_add(u64::try_from(read).unwrap_or(0));
+        remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(0));
+    }
+
+    Ok(range.len())
+}
+
+async fn copy_remote_to_local_range(
+    remote: &RandomAccessFile,
+    local: &mut File,
+    range: ChunkRange,
+    remote_path: &str,
+) -> Result<u64> {
+    let mut offset = range.start;
+    let mut remaining = range.len();
+    local.seek(SeekFrom::Start(range.start)).await?;
+
+    while remaining > 0 {
+        let next = u32::try_from(remaining.min(64 * 1024)).unwrap_or(64 * 1024);
+        let bytes = remote.read_at(offset, next).await.map_err(map_sftp_error)?;
+        if bytes.is_empty() {
+            return Err(Error::new(format!(
+                "unexpected EOF while downloading chunk from {remote_path}"
+            )));
+        }
+        local.write_all(&bytes).await?;
+        offset = offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+        remaining = remaining.saturating_sub(u64::try_from(bytes.len()).unwrap_or(0));
+    }
+
+    Ok(range.len())
 }
 
 async fn print_progress<W>(

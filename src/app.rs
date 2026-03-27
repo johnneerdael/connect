@@ -32,6 +32,7 @@ use crate::{
 
 const APP_NAME: &str = "connect";
 const DATABASE_FILE: &str = "connect.db";
+const COPY_CHECKPOINTS_DIR: &str = "copy-checkpoints";
 const APP_ROOT_ENV: &str = "CONNECT_APP_ROOT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +87,14 @@ impl AppPaths {
         fs::create_dir_all(&self.data_dir)?;
         Ok(())
     }
+
+    pub fn copy_checkpoint_dir(&self) -> PathBuf {
+        self.data_dir.join(COPY_CHECKPOINTS_DIR)
+    }
 }
 
 pub struct App {
-    _paths: AppPaths,
+    paths: AppPaths,
     profile_store: ProfileStore,
     forward_store: ForwardStore,
     hostkey_store: HostKeyStore,
@@ -147,7 +152,7 @@ impl App {
         database.initialize()?;
 
         Ok(Self {
-            _paths: paths,
+            paths,
             profile_store: ProfileStore::new(database.clone()),
             forward_store: ForwardStore::new(database.clone()),
             hostkey_store: HostKeyStore::new(database),
@@ -324,7 +329,15 @@ impl App {
         prompt: &dyn crate::terminal::prompt::Prompt,
     ) -> Result<crate::ssh::CopySummary> {
         let profile = self.get_profile(spec.remote_profile()?)?;
-        ssh_copy_profile(ssh, spec, &profile, self, prompt).await
+        ssh_copy_profile(
+            ssh,
+            spec,
+            &profile,
+            self,
+            prompt,
+            &self.paths.copy_checkpoint_dir(),
+        )
+        .await
     }
 
     pub async fn run_saved_forward<F>(

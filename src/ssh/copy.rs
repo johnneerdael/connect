@@ -1,8 +1,13 @@
 use std::{
+    collections::VecDeque,
     convert::TryFrom,
     fmt, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
+
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 
 use crate::{
     error::{Error, Result},
@@ -11,8 +16,9 @@ use crate::{
 };
 
 use super::{
-    connect_authenticated_session, establish_transfer_sessions, SshClient, SshConnectionContext,
-    SshSession,
+    connect_authenticated_session, establish_transfer_sessions, CheckpointFileIdentity, ChunkRange,
+    CopyCheckpointIdentity, CopyCheckpointState, CopyCheckpointStore, CopyFileMetadata,
+    CopyTransferMode, SshClient, SshConnectionContext, SshSession,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +33,7 @@ pub enum CopyEndpoint {
     Remote(RemotePath),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum CopyDirection {
     Upload,
     Download,
@@ -134,20 +140,6 @@ pub enum CopyJob {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkRange {
-    pub start: u64,
-    pub end: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyCheckpointIdentity {
-    pub direction: CopyDirection,
-    pub source_path: String,
-    pub destination_path: String,
-    pub recursive: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyJobPolicy {
     pub resume: CopyResumeStrategy,
@@ -205,14 +197,16 @@ pub fn plan_copy(
 ) -> Result<CopyPlan> {
     let direction = validate_planning_endpoints(&spec)?;
     let effective_threads = config.effective_threads;
+    let profile_name = spec.remote_profile()?.to_string();
 
     match (spec.recursive, source) {
         (false, PlannedCopySource::File { path, size }) => {
             let checkpoint = CopyCheckpointIdentity {
+                profile_name: profile_name.clone(),
                 direction,
                 source_path: path.clone(),
                 destination_path: endpoint_destination_path(&spec.destination),
-                recursive: false,
+                transfer_mode: CopyTransferMode::SingleFile,
             };
 
             if effective_threads > 1 && size > STRIPE_THRESHOLD_BYTES {
@@ -256,6 +250,7 @@ pub fn plan_copy(
                 recursive_destination_root(&spec.destination, &root, destination_shape);
             let mut jobs = Vec::new();
             jobs.push(copy_directory_job(
+                profile_name.clone(),
                 direction,
                 root.clone(),
                 destination_root.clone(),
@@ -270,10 +265,11 @@ pub fn plan_copy(
                             &path,
                         );
                         let checkpoint = CopyCheckpointIdentity {
+                            profile_name: profile_name.clone(),
                             direction,
                             source_path: source_path.clone(),
                             destination_path: destination_path.clone(),
-                            recursive: true,
+                            transfer_mode: CopyTransferMode::RecursiveTree,
                         };
 
                         if effective_threads > 1 && size > STRIPE_THRESHOLD_BYTES {
@@ -310,10 +306,11 @@ pub fn plan_copy(
                             &path,
                         );
                         let checkpoint = CopyCheckpointIdentity {
+                            profile_name: profile_name.clone(),
                             direction,
                             source_path: source_path.clone(),
                             destination_path: destination_path.clone(),
-                            recursive: true,
+                            transfer_mode: CopyTransferMode::RecursiveTree,
                         };
 
                         jobs.push(CopyJob::CreateDirectory {
@@ -414,15 +411,17 @@ fn recursive_job_destination_path(
 }
 
 fn copy_directory_job(
+    profile_name: String,
     direction: CopyDirection,
     source_path: String,
     destination_path: String,
 ) -> CopyJob {
     let checkpoint = CopyCheckpointIdentity {
+        profile_name,
         direction,
         source_path: source_path.clone(),
         destination_path: destination_path.clone(),
-        recursive: true,
+        transfer_mode: CopyTransferMode::RecursiveTree,
     };
 
     CopyJob::CreateDirectory {
@@ -670,20 +669,26 @@ pub async fn copy_profile(
     profile: &Profile,
     context: &dyn SshConnectionContext,
     prompt: &dyn Prompt,
+    checkpoint_root: &Path,
 ) -> Result<CopySummary> {
+    let checkpoint_root = checkpoint_root.join(profile_checkpoint_namespace(profile));
     if spec.effective_threads > 1 {
         let mut prepared = prepare_threaded_copy(ssh, spec, profile, context, prompt).await?;
-        match &prepared.plan().mode {
+        match prepared.plan().mode.clone() {
             CopyPlanMode::SingleStream => {
                 let effective_threads = prepared.effective_threads();
                 let warnings = prepared.warnings().to_vec();
-                let mut summary = execute_copy_with_retry(prepared.primary_session_mut(), spec).await?;
+                let mut summary =
+                    execute_copy_with_retry(prepared.primary_session_mut(), spec).await?;
                 summary.effective_threads = effective_threads;
                 summary.warnings = warnings;
                 Ok(summary)
             }
-            CopyPlanMode::StripedFile { .. } | CopyPlanMode::QueuedTree => Err(Error::new(
-                "threaded copy executor is not implemented yet; session pool and plan were prepared successfully",
+            CopyPlanMode::StripedFile { .. } => {
+                execute_threaded_striped_copy(prepared, &checkpoint_root).await
+            }
+            CopyPlanMode::QueuedTree => Err(Error::new(
+                "threaded recursive copy is not implemented yet; queued tree plans are handled in Task 6",
             )),
         }
     } else {
@@ -693,6 +698,384 @@ pub async fn copy_profile(
         summary.warnings = Vec::new();
         Ok(summary)
     }
+}
+
+const MAX_THREADED_CHUNK_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Clone)]
+struct ThreadedStripedJob {
+    direction: CopyDirection,
+    local_path: PathBuf,
+    remote_path: String,
+    size: u64,
+    chunks: Vec<ChunkRange>,
+    policy: CopyJobPolicy,
+    checkpoint: CopyCheckpointIdentity,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkWork {
+    range: ChunkRange,
+    attempt: usize,
+}
+
+async fn execute_threaded_striped_copy(
+    prepared: super::PreparedTransferPlan,
+    checkpoint_root: &Path,
+) -> Result<CopySummary> {
+    let (mut sessions, plan, effective_threads, warnings) = prepared.into_parts();
+    let job = threaded_striped_job(&plan)?;
+    let checkpoint_store = CopyCheckpointStore::new(checkpoint_root.to_path_buf());
+    let primary = sessions
+        .first_mut()
+        .ok_or_else(|| Error::new("threaded copy prepared without any transfer sessions"))?;
+    let (initial_state, missing_ranges, resume_from_checkpoint) =
+        load_threaded_checkpoint(primary.as_mut(), &job, &checkpoint_store).await?;
+    let resumed_bytes = initial_state.resumed_bytes();
+
+    if missing_ranges.is_empty() {
+        apply_threaded_metadata(primary.as_mut(), &job).await?;
+        checkpoint_store.delete(&job.checkpoint)?;
+        return Ok(CopySummary {
+            direction: job.direction,
+            bytes_copied: 0,
+            resumed_bytes,
+            destination: threaded_destination_label(&job),
+            effective_threads,
+            warnings,
+        });
+    }
+
+    prepare_threaded_destination(primary.as_mut(), &job, resume_from_checkpoint).await?;
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        missing_ranges
+            .into_iter()
+            .map(|range| ChunkWork { range, attempt: 1 })
+            .collect::<Vec<_>>(),
+    )));
+    let checkpoint_state = Arc::new(Mutex::new(initial_state));
+    let checkpoint_store = Arc::new(checkpoint_store);
+    let shared_error = Arc::new(Mutex::new(None));
+    let retry_enabled = matches!(job.policy.retry, CopyRetryStrategy::RetryStripedChunks);
+    let mut join_set: JoinSet<Result<(Box<dyn SshSession + Send>, u64)>> = JoinSet::new();
+
+    for session in sessions {
+        let queue = Arc::clone(&queue);
+        let checkpoint_state = Arc::clone(&checkpoint_state);
+        let checkpoint_store = Arc::clone(&checkpoint_store);
+        let shared_error = Arc::clone(&shared_error);
+        let job = job.clone();
+
+        join_set.spawn(async move {
+            let mut session = session;
+            let mut copied = 0_u64;
+            loop {
+                if shared_error.lock().unwrap().is_some() {
+                    break Ok((session, copied));
+                }
+
+                let Some(work) = queue.lock().unwrap().pop_front() else {
+                    break Ok((session, copied));
+                };
+
+                match execute_threaded_chunk(session.as_mut(), &job, work.range).await {
+                    Ok(bytes) => {
+                        let destination_identity =
+                            threaded_destination_identity(session.as_mut(), &job).await?;
+                        {
+                            let mut state = checkpoint_state.lock().unwrap();
+                            state.mark_completed(work.range);
+                            state.set_destination(destination_identity);
+                            checkpoint_store.save(&job.checkpoint, &state)?;
+                        }
+                        copied = copied.saturating_add(bytes);
+                    }
+                    Err(error)
+                        if retry_enabled
+                            && work.attempt < MAX_THREADED_CHUNK_ATTEMPTS
+                            && is_transient_copy_error(&error) =>
+                    {
+                        queue.lock().unwrap().push_back(ChunkWork {
+                            range: work.range,
+                            attempt: work.attempt + 1,
+                        });
+                    }
+                    Err(error) => {
+                        set_shared_copy_error(&shared_error, error);
+                        break Ok((session, copied));
+                    }
+                }
+            }
+        });
+    }
+
+    let mut bytes_copied = 0_u64;
+    let mut metadata_session: Option<Box<dyn SshSession + Send>> = None;
+    while let Some(result) = join_set.join_next().await {
+        let (session, copied) =
+            result.map_err(|error| Error::new(format!("threaded copy worker failed: {error}")))??;
+        if metadata_session.is_none() {
+            metadata_session = Some(session);
+        }
+        bytes_copied = bytes_copied.saturating_add(copied);
+    }
+
+    if let Some(error) = shared_error.lock().unwrap().take() {
+        return Err(error);
+    }
+
+    let mut metadata_session = metadata_session
+        .ok_or_else(|| Error::new("threaded copy finished without a transfer session"))?;
+    apply_threaded_metadata(metadata_session.as_mut(), &job).await?;
+    checkpoint_store.delete(&job.checkpoint)?;
+    Ok(CopySummary {
+        direction: job.direction,
+        bytes_copied,
+        resumed_bytes,
+        destination: threaded_destination_label(&job),
+        effective_threads,
+        warnings,
+    })
+}
+
+fn threaded_striped_job(plan: &CopyPlan) -> Result<ThreadedStripedJob> {
+    match plan.jobs.as_slice() {
+        [CopyJob::StripedFile {
+            source_path,
+            destination_path,
+            size,
+            chunks,
+            policy,
+            checkpoint,
+        }] => Ok(match checkpoint.direction {
+            CopyDirection::Upload => ThreadedStripedJob {
+                direction: CopyDirection::Upload,
+                local_path: PathBuf::from(source_path),
+                remote_path: destination_path.clone(),
+                size: *size,
+                chunks: chunks.clone(),
+                policy: policy.clone(),
+                checkpoint: checkpoint.clone(),
+            },
+            CopyDirection::Download => ThreadedStripedJob {
+                direction: CopyDirection::Download,
+                local_path: PathBuf::from(destination_path),
+                remote_path: source_path.clone(),
+                size: *size,
+                chunks: chunks.clone(),
+                policy: policy.clone(),
+                checkpoint: checkpoint.clone(),
+            },
+        }),
+        _ => Err(Error::new(
+            "threaded striped copy expected exactly one striped single-file job",
+        )),
+    }
+}
+
+async fn load_threaded_checkpoint(
+    session: &mut dyn SshSession,
+    job: &ThreadedStripedJob,
+    checkpoint_store: &CopyCheckpointStore,
+) -> Result<(CopyCheckpointState, Vec<ChunkRange>, bool)> {
+    let source_identity = threaded_source_identity(session, job).await?;
+    let current_destination = threaded_destination_identity(session, job).await?;
+
+    match &job.policy.resume {
+        CopyResumeStrategy::Checkpointed { checkpoint } => {
+            if let Some(state) = checkpoint_store.load(checkpoint)? {
+                validate_threaded_checkpoint(job, &state, source_identity, current_destination)?;
+                let missing = state.incomplete_ranges(&job.chunks);
+                Ok((state, missing, true))
+            } else {
+                Ok((
+                    CopyCheckpointState::new(job.size, source_identity, current_destination),
+                    job.chunks.clone(),
+                    false,
+                ))
+            }
+        }
+        CopyResumeStrategy::Disabled | CopyResumeStrategy::DestinationSizeResume => {
+            checkpoint_store.delete(&job.checkpoint)?;
+            Ok((
+                CopyCheckpointState::new(job.size, source_identity, current_destination),
+                job.chunks.clone(),
+                false,
+            ))
+        }
+    }
+}
+
+fn validate_threaded_checkpoint(
+    job: &ThreadedStripedJob,
+    state: &CopyCheckpointState,
+    source_identity: CheckpointFileIdentity,
+    destination_identity: Option<CheckpointFileIdentity>,
+) -> Result<()> {
+    let destination_size = destination_identity.map(|identity| identity.size_bytes());
+    if state.total_bytes() != job.size
+        || state.source() != source_identity
+        || state.destination().map(|identity| identity.size_bytes()) != destination_size
+    {
+        return Err(Error::new(format!(
+            "incompatible checkpoint state for {} -> {}",
+            job.checkpoint.source_path, job.checkpoint.destination_path
+        )));
+    }
+
+    Ok(())
+}
+
+async fn prepare_threaded_destination(
+    session: &mut dyn SshSession,
+    job: &ThreadedStripedJob,
+    resume_from_checkpoint: bool,
+) -> Result<()> {
+    match job.direction {
+        CopyDirection::Upload => {
+            if let Some(parent) = remote_parent(&job.remote_path) {
+                session.create_remote_dir_all(&parent).await?;
+            }
+            if !resume_from_checkpoint {
+                session
+                    .prepare_remote_file_destination(&job.remote_path, true)
+                    .await?;
+            }
+        }
+        CopyDirection::Download => prepare_local_file_destination(
+            &job.local_path,
+            !resume_from_checkpoint,
+        )?,
+    }
+    Ok(())
+}
+
+async fn execute_threaded_chunk(
+    session: &mut dyn SshSession,
+    job: &ThreadedStripedJob,
+    range: ChunkRange,
+) -> Result<u64> {
+    match job.direction {
+        CopyDirection::Upload => {
+            session
+                .upload_file_range(&job.local_path, &job.remote_path, range)
+                .await
+        }
+        CopyDirection::Download => {
+            session
+                .download_file_range(&job.remote_path, &job.local_path, range)
+                .await
+        }
+    }
+}
+
+async fn threaded_source_identity(
+    session: &mut dyn SshSession,
+    job: &ThreadedStripedJob,
+) -> Result<CheckpointFileIdentity> {
+    match job.direction {
+        CopyDirection::Upload => local_file_identity(&job.local_path),
+        CopyDirection::Download => session
+            .remote_file_metadata(&job.remote_path)
+            .await?
+            .map(Into::into)
+            .ok_or_else(|| Error::new(format!("remote path was not found: {}", job.remote_path))),
+    }
+}
+
+async fn threaded_destination_identity(
+    session: &mut dyn SshSession,
+    job: &ThreadedStripedJob,
+) -> Result<Option<CheckpointFileIdentity>> {
+    match job.direction {
+        CopyDirection::Upload => Ok(session
+            .remote_file_metadata(&job.remote_path)
+            .await?
+            .map(Into::into)),
+        CopyDirection::Download => Ok(local_file_metadata(&job.local_path)?.map(Into::into)),
+    }
+}
+
+fn local_file_identity(path: &Path) -> Result<CheckpointFileIdentity> {
+    local_file_metadata(path)?
+        .map(Into::into)
+        .ok_or_else(|| Error::new(format!("local path was not found: {}", path.display())))
+}
+
+fn local_file_metadata(path: &Path) -> Result<Option<CopyFileMetadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(CopyFileMetadata::new(
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs()),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prepare_local_file_destination(path: &Path, truncate: bool) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(truncate)
+        .open(path)?;
+    if truncate {
+        file.set_len(0)?;
+    }
+    Ok(())
+}
+
+fn set_shared_copy_error(shared_error: &Arc<Mutex<Option<Error>>>, error: Error) {
+    let mut guard = shared_error.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(error);
+    }
+}
+
+fn threaded_destination_label(job: &ThreadedStripedJob) -> String {
+    match job.direction {
+        CopyDirection::Upload => job.remote_path.clone(),
+        CopyDirection::Download => job.local_path.display().to_string(),
+    }
+}
+
+async fn apply_threaded_metadata(session: &mut dyn SshSession, job: &ThreadedStripedJob) -> Result<()> {
+    match job.direction {
+        CopyDirection::Upload => session
+            .apply_uploaded_file_metadata(&job.local_path, &job.remote_path)
+            .await,
+        CopyDirection::Download => session
+            .apply_downloaded_file_metadata(&job.remote_path, &job.local_path)
+            .await,
+    }
+}
+
+fn profile_checkpoint_namespace(profile: &Profile) -> String {
+    let payload = format!(
+        "v1\0{}\0{}\0{}\0{}",
+        profile.name, profile.host, profile.port, profile.username
+    );
+    format!("{:016x}", fnv1a64(payload.as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 async fn prepare_threaded_copy(

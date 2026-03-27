@@ -15,7 +15,7 @@ pub struct TransferSessionPool {
     effective_threads: usize,
     warnings: Vec<String>,
     primary: DynSshSession,
-    _extra_sessions: Vec<DynSshSession>,
+    extra_sessions: Vec<DynSshSession>,
 }
 
 impl TransferSessionPool {
@@ -72,6 +72,18 @@ impl PreparedTransferPlan {
 
     pub fn primary_session_mut(&mut self) -> &mut dyn SshSession {
         self.pool.primary_session_mut()
+    }
+
+    pub fn into_parts(self) -> (Vec<DynSshSession>, CopyPlan, usize, Vec<String>) {
+        let mut sessions = Vec::with_capacity(1 + self.pool.extra_sessions.len());
+        sessions.push(self.pool.primary);
+        sessions.extend(self.pool.extra_sessions);
+        (
+            sessions,
+            self.plan,
+            self.pool.effective_threads,
+            self.pool.warnings,
+        )
     }
 }
 
@@ -140,7 +152,7 @@ pub async fn establish_transfer_sessions(
         effective_threads,
         warnings,
         primary,
-        _extra_sessions: sessions,
+        extra_sessions: sessions,
     })
 }
 

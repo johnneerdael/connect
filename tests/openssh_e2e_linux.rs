@@ -3,7 +3,7 @@
 use std::{
     env, fs,
     future::Future,
-    io,
+    io::{self, Read, Write},
     net::TcpListener,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -259,6 +259,196 @@ async fn openssh_parallel_copy_degrades_when_server_session_budget_is_limited() 
         .warnings
         .iter()
         .any(|warning| warning.contains("degraded")));
+}
+
+#[tokio::test]
+async fn openssh_threaded_upload_resumes_from_checkpoint_after_interruption() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let app = harness.app_with_profile("threaded-upload-resume", AuthMode::StoredOnly, true);
+    let source = harness.root().join("threaded-upload-source.bin");
+    let remote = harness.root().join("threaded-upload-remote.bin");
+    write_pattern_file(&source, 96 * 1024 * 1024);
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o640))
+        .expect("source mode should be set");
+    let source_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_100_000);
+    set_file_mtime(&source, FileTime::from_system_time(source_mtime))
+        .expect("source mtime should be set");
+
+    let failing_ssh = FaultInjectingSshClient::new(
+        RusshClient::new(),
+        RangeFailureSpec::fatal_upload_once(remote.display().to_string()),
+    );
+    let mut first_spec = parse_copy_spec(
+        source.to_str().expect("source path should be utf-8"),
+        &format!("threaded-upload-resume:{}", remote.display()),
+        false,
+        false,
+        false,
+    )
+    .expect("copy spec should parse");
+    first_spec.effective_threads = 4;
+
+    let error = app
+        .copy(&first_spec, &failing_ssh, &prompt)
+        .await
+        .expect_err("first threaded upload should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("injected fatal threaded upload failure")
+    );
+    assert!(
+        harness
+            .app_checkpoint_dir("threaded-upload-resume")
+            .read_dir()
+            .is_ok(),
+        "checkpoint directory should exist after interrupted threaded upload"
+    );
+
+    let mut resume_spec = parse_copy_spec(
+        source.to_str().expect("source path should be utf-8"),
+        &format!("threaded-upload-resume:{}", remote.display()),
+        false,
+        true,
+        false,
+    )
+    .expect("resume copy spec should parse");
+    resume_spec.effective_threads = 4;
+
+    let summary = app
+        .copy(&resume_spec, &RusshClient::new(), &prompt)
+        .await
+        .expect("threaded upload resume should succeed");
+
+    assert!(summary.resumed_bytes > 0);
+    assert_files_equal(&source, &remote);
+    assert_eq!(
+        fs::metadata(&remote)
+            .expect("remote metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    assert_eq!(
+        fs::metadata(&remote)
+            .expect("remote metadata should exist")
+            .mtime(),
+        fs::metadata(&source)
+            .expect("source metadata should exist")
+            .mtime()
+    );
+    assert_checkpoint_dir_empty(harness.app_checkpoint_dir("threaded-upload-resume"));
+}
+
+#[tokio::test]
+async fn openssh_threaded_download_resumes_from_checkpoint_after_interruption() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let app = harness.app_with_profile("threaded-download-resume", AuthMode::StoredOnly, true);
+    let remote = harness.root().join("threaded-download-source.bin");
+    let local = harness.root().join("threaded-download-local.bin");
+    write_pattern_file(&remote, 96 * 1024 * 1024);
+    fs::set_permissions(&remote, fs::Permissions::from_mode(0o600))
+        .expect("remote mode should be set");
+    let remote_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_200_000);
+    set_file_mtime(&remote, FileTime::from_system_time(remote_mtime))
+        .expect("remote mtime should be set");
+
+    let failing_ssh = FaultInjectingSshClient::new(
+        RusshClient::new(),
+        RangeFailureSpec::fatal_download_once(remote.display().to_string()),
+    );
+    let mut first_spec = parse_copy_spec(
+        &format!("threaded-download-resume:{}", remote.display()),
+        local.to_str().expect("local path should be utf-8"),
+        false,
+        false,
+        false,
+    )
+    .expect("copy spec should parse");
+    first_spec.effective_threads = 4;
+
+    let error = app
+        .copy(&first_spec, &failing_ssh, &prompt)
+        .await
+        .expect_err("first threaded download should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("injected fatal threaded download failure")
+    );
+    assert!(local.exists(), "partial local file should be preserved");
+
+    let mut resume_spec = parse_copy_spec(
+        &format!("threaded-download-resume:{}", remote.display()),
+        local.to_str().expect("local path should be utf-8"),
+        false,
+        true,
+        false,
+    )
+    .expect("resume copy spec should parse");
+    resume_spec.effective_threads = 4;
+
+    let summary = app
+        .copy(&resume_spec, &RusshClient::new(), &prompt)
+        .await
+        .expect("threaded download resume should succeed");
+
+    assert!(summary.resumed_bytes > 0);
+    assert_files_equal(&remote, &local);
+    assert_eq!(
+        fs::metadata(&local)
+            .expect("local metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&local)
+            .expect("local metadata should exist")
+            .mtime(),
+        fs::metadata(&remote)
+            .expect("remote metadata should exist")
+            .mtime()
+    );
+    assert_checkpoint_dir_empty(harness.app_checkpoint_dir("threaded-download-resume"));
+}
+
+#[tokio::test]
+async fn openssh_threaded_upload_retries_transient_chunk_failures() {
+    let harness = OpenSshHarness::start();
+    let prompt = AcceptPrompt;
+    let app = harness.app_with_profile("threaded-upload-retry", AuthMode::StoredOnly, true);
+    let source = harness.root().join("threaded-upload-retry-source.bin");
+    let remote = harness.root().join("threaded-upload-retry-remote.bin");
+    write_pattern_file(&source, 96 * 1024 * 1024);
+
+    let retrying_ssh = FaultInjectingSshClient::new(
+        RusshClient::new(),
+        RangeFailureSpec::transient_upload_once(remote.display().to_string()),
+    );
+    let mut spec = parse_copy_spec(
+        source.to_str().expect("source path should be utf-8"),
+        &format!("threaded-upload-retry:{}", remote.display()),
+        false,
+        false,
+        false,
+    )
+    .expect("copy spec should parse");
+    spec.effective_threads = 4;
+    spec.retry = true;
+
+    let summary = app
+        .copy(&spec, &retrying_ssh, &prompt)
+        .await
+        .expect("threaded upload retry should succeed");
+
+    assert_eq!(summary.bytes_copied, 96 * 1024 * 1024);
+    assert_files_equal(&source, &remote);
+    assert_checkpoint_dir_empty(harness.app_checkpoint_dir("threaded-upload-retry"));
 }
 
 #[tokio::test]
@@ -617,6 +807,19 @@ Subsystem sftp internal-sftp
     fn user_key_path(&self) -> &Path {
         &self.user_key_path
     }
+
+    fn app_checkpoint_dir(&self, name: &str) -> PathBuf {
+        let payload = format!(
+            "v1\0{}\0{}\0{}\0{}",
+            name, "127.0.0.1", self.port, self.username
+        );
+        self.root
+            .path()
+            .join(format!("app-{name}"))
+            .join("data")
+            .join("copy-checkpoints")
+            .join(format!("{:016x}", fnv1a64(payload.as_bytes())))
+    }
 }
 
 #[derive(Clone)]
@@ -624,6 +827,331 @@ struct LimitedConnectSshClient {
     inner: RusshClient,
     limit: usize,
     attempts: Arc<Mutex<usize>>,
+}
+
+#[derive(Clone)]
+struct FaultInjectingSshClient {
+    inner: RusshClient,
+    failure: Arc<Mutex<RangeFailureSpec>>,
+}
+
+impl FaultInjectingSshClient {
+    fn new(inner: RusshClient, failure: RangeFailureSpec) -> Self {
+        Self {
+            inner,
+            failure: Arc::new(Mutex::new(failure)),
+        }
+    }
+}
+
+impl SshClient for FaultInjectingSshClient {
+    fn connect<'a>(
+        &'a self,
+        profile: &'a Profile,
+        expected_host_key: Option<&'a HostKeyRecord>,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Box<dyn SshSession + Send>>> + Send + 'a>>
+    {
+        let failure = Arc::clone(&self.failure);
+        Box::pin(async move {
+            let session = self.inner.connect(profile, expected_host_key).await?;
+            Ok(Box::new(FaultInjectingSshSession { inner: session, failure }) as Box<dyn SshSession + Send>)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectedFailureKind {
+    Fatal,
+    Transient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectedFailureDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone)]
+struct RangeFailureSpec {
+    direction: InjectedFailureDirection,
+    target_path: String,
+    kind: InjectedFailureKind,
+    remaining_failures: usize,
+}
+
+impl RangeFailureSpec {
+    fn fatal_upload_once(target_path: String) -> Self {
+        Self {
+            direction: InjectedFailureDirection::Upload,
+            target_path,
+            kind: InjectedFailureKind::Fatal,
+            remaining_failures: 1,
+        }
+    }
+
+    fn fatal_download_once(target_path: String) -> Self {
+        Self {
+            direction: InjectedFailureDirection::Download,
+            target_path,
+            kind: InjectedFailureKind::Fatal,
+            remaining_failures: 1,
+        }
+    }
+
+    fn transient_upload_once(target_path: String) -> Self {
+        Self {
+            direction: InjectedFailureDirection::Upload,
+            target_path,
+            kind: InjectedFailureKind::Transient,
+            remaining_failures: 1,
+        }
+    }
+
+    fn should_fail(
+        &mut self,
+        direction: InjectedFailureDirection,
+        target_path: &str,
+    ) -> Option<InjectedFailureKind> {
+        if self.remaining_failures == 0
+            || self.direction != direction
+            || self.target_path != target_path
+        {
+            return None;
+        }
+
+        self.remaining_failures = self.remaining_failures.saturating_sub(1);
+        Some(self.kind)
+    }
+}
+
+struct FaultInjectingSshSession {
+    inner: Box<dyn SshSession + Send>,
+    failure: Arc<Mutex<RangeFailureSpec>>,
+}
+
+impl FaultInjectingSshSession {
+    fn maybe_fail(
+        &self,
+        direction: InjectedFailureDirection,
+        target_path: &str,
+    ) -> Option<InjectedFailureKind> {
+        self.failure
+            .lock()
+            .expect("failure spec should lock")
+            .should_fail(direction, target_path)
+    }
+}
+
+impl SshSession for FaultInjectingSshSession {
+    fn observe_host_key<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<connect::ssh::ObservedHostKey>> + Send + 'a>>
+    {
+        self.inner.observe_host_key()
+    }
+
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        self.inner.authenticate_agent(username)
+    }
+
+    fn authenticate_public_key<'a>(
+        &'a mut self,
+        username: &'a str,
+        private_key: &'a str,
+        passphrase: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        self.inner
+            .authenticate_public_key(username, private_key, passphrase)
+    }
+
+    fn authenticate_password<'a>(
+        &'a mut self,
+        username: &'a str,
+        password: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        self.inner.authenticate_password(username, password)
+    }
+
+    fn open_shell<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u32>> + Send + 'a>> {
+        self.inner.open_shell()
+    }
+
+    fn execute_command<'a>(
+        &'a mut self,
+        spec: &'a ExecSpec,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u32>> + Send + 'a>> {
+        self.inner.execute_command(spec)
+    }
+
+    fn open_direct_tcpip<'a>(
+        &'a mut self,
+        target_host: &'a str,
+        target_port: u16,
+        originator_host: &'a str,
+        originator_port: u16,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Box<dyn connect::ssh::DirectTcpipStream + Send + Unpin + 'static>>> + Send + 'a>>
+    {
+        self.inner
+            .open_direct_tcpip(target_host, target_port, originator_host, originator_port)
+    }
+
+    fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+
+    fn disconnect<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.inner.disconnect()
+    }
+
+    fn resolve_remote_path<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<String>> + Send + 'a>> {
+        self.inner.resolve_remote_path(path)
+    }
+
+    fn finish_progress_line<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.inner.finish_progress_line()
+    }
+
+    fn supports_parallel_random_access<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        self.inner.supports_parallel_random_access()
+    }
+
+    fn remote_file_type<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<connect::ssh::RemoteFileType>>> + Send + 'a>>
+    {
+        self.inner.remote_file_type(path)
+    }
+
+    fn remote_file_metadata<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<connect::ssh::CopyFileMetadata>>> + Send + 'a>>
+    {
+        self.inner.remote_file_metadata(path)
+    }
+
+    fn read_remote_dir<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Vec<connect::ssh::RemoteDirectoryEntry>>> + Send + 'a>>
+    {
+        self.inner.read_remote_dir(path)
+    }
+
+    fn create_remote_dir_all<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.inner.create_remote_dir_all(path)
+    }
+
+    fn prepare_remote_file_destination<'a>(
+        &'a mut self,
+        path: &'a str,
+        truncate: bool,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.inner.prepare_remote_file_destination(path, truncate)
+    }
+
+    fn upload_file<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+        options: connect::ssh::CopyTransferOptions,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>> + Send + 'a>>
+    {
+        self.inner.upload_file(local_path, remote_path, options)
+    }
+
+    fn download_file<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        options: connect::ssh::CopyTransferOptions,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>> + Send + 'a>>
+    {
+        self.inner.download_file(remote_path, local_path, options)
+    }
+
+    fn upload_file_range<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+        range: connect::ssh::ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u64>> + Send + 'a>> {
+        if let Some(kind) = self.maybe_fail(InjectedFailureDirection::Upload, remote_path) {
+            return Box::pin(async move {
+                match kind {
+                    InjectedFailureKind::Fatal => Err(Error::new(format!(
+                        "injected fatal threaded upload failure for range {}..{}",
+                        range.start, range.end
+                    ))),
+                    InjectedFailureKind::Transient => Err(Error::new(format!(
+                        "transient injected threaded upload failure for range {}..{}",
+                        range.start, range.end
+                    ))),
+                }
+            });
+        }
+
+        self.inner.upload_file_range(local_path, remote_path, range)
+    }
+
+    fn download_file_range<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        range: connect::ssh::ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u64>> + Send + 'a>> {
+        if let Some(kind) = self.maybe_fail(InjectedFailureDirection::Download, remote_path) {
+            return Box::pin(async move {
+                match kind {
+                    InjectedFailureKind::Fatal => Err(Error::new(format!(
+                        "injected fatal threaded download failure for range {}..{}",
+                        range.start, range.end
+                    ))),
+                    InjectedFailureKind::Transient => Err(Error::new(format!(
+                        "transient injected threaded download failure for range {}..{}",
+                        range.start, range.end
+                    ))),
+                }
+            });
+        }
+
+        self.inner.download_file_range(remote_path, local_path, range)
+    }
+
+    fn apply_uploaded_file_metadata<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.inner.apply_uploaded_file_metadata(local_path, remote_path)
+    }
+
+    fn apply_downloaded_file_metadata<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.inner
+            .apply_downloaded_file_metadata(remote_path, local_path)
+    }
 }
 
 impl LimitedConnectSshClient {
@@ -966,4 +1494,68 @@ async fn socks5_connect_ipv4(stream: &mut tokio::net::TcpStream, address: [u8; 4
 
 fn read_optional(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|_| String::new())
+}
+
+fn write_pattern_file(path: &Path, size_bytes: usize) {
+    let mut file = fs::File::create(path).expect("pattern file should be created");
+    let pattern = (0..(1024 * 1024))
+        .map(|index| u8::try_from(index % 251).expect("pattern byte should fit"))
+        .collect::<Vec<_>>();
+    let mut remaining = size_bytes;
+    while remaining > 0 {
+        let chunk = remaining.min(pattern.len());
+        file.write_all(&pattern[..chunk])
+            .expect("pattern chunk should be written");
+        remaining -= chunk;
+    }
+}
+
+fn assert_files_equal(left: &Path, right: &Path) {
+    let left_meta = fs::metadata(left).expect("left metadata should exist");
+    let right_meta = fs::metadata(right).expect("right metadata should exist");
+    assert_eq!(left_meta.len(), right_meta.len(), "file sizes should match");
+
+    let mut left_file = fs::File::open(left).expect("left file should open");
+    let mut right_file = fs::File::open(right).expect("right file should open");
+    let mut left_buf = vec![0_u8; 64 * 1024];
+    let mut right_buf = vec![0_u8; 64 * 1024];
+
+    loop {
+        let left_read = left_file
+            .read(&mut left_buf)
+            .expect("left file should be readable");
+        let right_read = right_file
+            .read(&mut right_buf)
+            .expect("right file should be readable");
+        assert_eq!(left_read, right_read, "read lengths should match");
+        if left_read == 0 {
+            break;
+        }
+        assert_eq!(
+            &left_buf[..left_read],
+            &right_buf[..right_read],
+            "file contents should match"
+        );
+    }
+}
+
+fn assert_checkpoint_dir_empty(path: PathBuf) {
+    let entries = fs::read_dir(&path)
+        .unwrap_or_else(|error| panic!("checkpoint directory should be readable: {error}"));
+    assert!(
+        entries.into_iter().next().is_none(),
+        "checkpoint directory should be empty after successful threaded transfer"
+    );
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
