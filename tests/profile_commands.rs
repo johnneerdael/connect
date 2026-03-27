@@ -1915,7 +1915,7 @@ async fn threaded_copy_fails_when_requested_parallelism_degrades_to_one_session(
 }
 
 #[tokio::test]
-async fn threaded_copy_fails_clearly_when_random_access_support_is_unavailable() {
+async fn threaded_copy_fails_clearly_when_transfer_readiness_is_unavailable() {
     let harness = TestHarness::with_profile("prod");
     harness.save_hostkey("prod.example.com", 22, "fp-123");
     harness
@@ -1945,9 +1945,46 @@ async fn threaded_copy_fails_clearly_when_random_access_support_is_unavailable()
         .await
         .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("random-access sftp support is unavailable"));
+    assert!(error.to_string().contains("transfer-ready sftp session"));
+}
+
+#[tokio::test]
+async fn threaded_copy_does_not_count_sessions_that_fail_transfer_readiness() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-transfer-ready.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-transfer-ready.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let profile = harness.app().get_profile("prod").unwrap();
+    let ssh = FakeCopySshClient::transfer_readiness_fails_on_session(3);
+
+    let pool =
+        establish_transfer_sessions(&ssh, &profile, harness.app(), &FakePrompt::default(), 4)
+            .await
+            .unwrap();
+
+    assert_eq!(pool.effective_threads(), 3);
+    assert!(pool
+        .warnings()
+        .iter()
+        .any(|warning| warning.contains("degraded")));
+    assert_eq!(ssh.connect_attempts(), 4);
 }
 
 #[tokio::test]
@@ -1974,6 +2011,46 @@ async fn threaded_copy_does_not_degrade_on_authentication_failures() {
     .unwrap();
     spec.effective_threads = 4;
     let ssh = FakeCopySshClient::authentication_fails_on_session(2);
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains("could not establish threaded mode"),
+        "{error}"
+    );
+    assert_eq!(ssh.connect_attempts(), 2);
+}
+
+#[tokio::test]
+async fn threaded_copy_does_not_degrade_on_timeout_style_establishment_failures() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-timeout.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-timeout.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::timeout_failure_on_session(2);
 
     let error = harness
         .app()
@@ -2297,7 +2374,8 @@ struct FakeCopyState {
     connect_attempts: usize,
     fail_authentication_on_session: Option<usize>,
     successful_authentications: usize,
-    random_access_supported: bool,
+    transfer_readiness_fail_on_session: Option<usize>,
+    timeout_failure_on_session: Option<usize>,
     upload_failures_remaining: usize,
     upload_attempts: usize,
     remote_home: String,
@@ -2327,7 +2405,8 @@ impl FakeCopySshClient {
                 connect_attempts: 0,
                 fail_authentication_on_session: None,
                 successful_authentications: 0,
-                random_access_supported: true,
+                transfer_readiness_fail_on_session: None,
+                timeout_failure_on_session: None,
                 upload_failures_remaining: 0,
                 upload_attempts: 0,
                 remote_home: "/home/deploy".into(),
@@ -2354,13 +2433,33 @@ impl FakeCopySshClient {
 
     fn without_random_access_support() -> Self {
         let client = Self::with_hostkey("fp-123");
-        client.state.lock().unwrap().random_access_supported = false;
+        client
+            .state
+            .lock()
+            .unwrap()
+            .transfer_readiness_fail_on_session = Some(1);
+        client
+    }
+
+    fn transfer_readiness_fails_on_session(session: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client
+            .state
+            .lock()
+            .unwrap()
+            .transfer_readiness_fail_on_session = Some(session);
         client
     }
 
     fn authentication_fails_on_session(session: usize) -> Self {
         let client = Self::with_hostkey("fp-123");
         client.state.lock().unwrap().fail_authentication_on_session = Some(session);
+        client
+    }
+
+    fn timeout_failure_on_session(session: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().timeout_failure_on_session = Some(session);
         client
     }
 
@@ -2430,6 +2529,14 @@ impl SshClient for FakeCopySshClient {
         let outcome = {
             let mut state = self.state.lock().unwrap();
             state.connect_attempts += 1;
+            if state.timeout_failure_on_session == Some(state.connect_attempts) {
+                return Box::pin(async move {
+                    Err(connect::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out while opening ssh session",
+                    )))
+                });
+            }
             match state.connect_limit {
                 Some(limit) if state.connect_attempts > limit => {
                     Err(Error::new("ssh error: too many concurrent sessions"))
@@ -2538,11 +2645,21 @@ impl SshSession for FakeCopySession {
         })
     }
 
-    fn supports_parallel_random_access<'a>(
+    fn ensure_transfer_ready<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
-        let supported = self.state.lock().unwrap().random_access_supported;
-        Box::pin(async move { Ok(supported) })
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        let supported = {
+            let state = self.state.lock().unwrap();
+            let session_index = state.successful_authentications;
+            state.transfer_readiness_fail_on_session != Some(session_index)
+        };
+        Box::pin(async move {
+            if supported {
+                Ok(())
+            } else {
+                Err(Error::new("sftp subsystem initialization failed"))
+            }
+        })
     }
     fn remote_file_size<'a>(
         &'a mut self,

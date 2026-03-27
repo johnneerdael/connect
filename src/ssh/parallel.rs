@@ -89,13 +89,18 @@ pub async fn establish_transfer_sessions(
     for _ in 0..requested_threads {
         match connect_authenticated_session(ssh, profile, context, prompt).await {
             Ok(mut session) => {
-                if requested_threads > 1
-                    && sessions.is_empty()
-                    && !session.supports_parallel_random_access().await?
-                {
-                    return Err(Error::new(
-                        "random-access sftp support is unavailable for threaded copy",
-                    ));
+                if requested_threads > 1 {
+                    match session.ensure_transfer_ready().await {
+                        Ok(()) => {}
+                        Err(_) if sessions.is_empty() => {
+                            return Err(Error::new(
+                                "threaded copy requires a transfer-ready sftp session",
+                            ));
+                        }
+                        Err(_) => {
+                            continue;
+                        }
+                    }
                 }
                 sessions.push(session);
             }
@@ -126,7 +131,7 @@ pub async fn establish_transfer_sessions(
     let effective_threads = sessions.len();
     let warnings = if requested_threads > effective_threads {
         vec![format!(
-            "parallel copy degraded from {requested_threads} requested sessions to {effective_threads} authenticated transfer sessions"
+            "parallel copy degraded from {requested_threads} requested sessions to {effective_threads} transfer-ready sessions"
         )]
     } else {
         Vec::new()
@@ -144,27 +149,14 @@ pub async fn establish_transfer_sessions(
 
 fn is_degradable_establishment_error(error: &Error) -> bool {
     match error {
-        Error::Io(io_error) => matches!(
-            io_error.kind(),
-            std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::BrokenPipe
-        ),
+        Error::Io(io_error) => matches!(io_error.kind(), std::io::ErrorKind::ConnectionRefused),
         Error::Message(message) => {
             let message = message.to_ascii_lowercase();
             message.contains("too many concurrent sessions")
                 || message.contains("administratively prohibited")
-                || message.contains("resource temporarily unavailable")
-                || message.contains("connection reset")
                 || message.contains("connection refused")
-                || message.contains("connection aborted")
-                || message.contains("timed out")
-                || message.contains("broken pipe")
-                || message.contains("unexpected eof")
+                || message.contains("maxsessions")
+                || message.contains("too many sessions")
         }
         _ => false,
     }

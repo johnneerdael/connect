@@ -22,7 +22,7 @@ use russh_sftp::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::{
@@ -128,10 +128,18 @@ pub trait SshSession: Send {
         Box::pin(async { Ok(()) })
     }
 
-    fn supports_parallel_random_access<'a>(
+    /// Probes whether this session can initialize its transfer subsystem for copy work.
+    ///
+    /// For the current russh backend, the honest production contract is "this
+    /// SSH session can successfully open an SFTP subsystem/session".
+    fn ensure_transfer_ready<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(async { Ok(false) })
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async {
+            Err(Error::new(
+                "ssh session does not support transfer-ready copy operations",
+            ))
+        })
     }
     fn remote_file_type<'a>(
         &'a mut self,
@@ -647,12 +655,12 @@ impl SshSession for RusshSession {
         })
     }
 
-    fn supports_parallel_random_access<'a>(
+    fn ensure_transfer_ready<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let _ = self.sftp().await?;
-            Ok(russh_sftp_supports_parallel_random_access())
+            Ok(())
         })
     }
 
@@ -905,17 +913,6 @@ async fn connect_agent() -> Result<()> {
 
 fn progress_label(direction: &str, local_path: &Path, remote_path: &str) -> String {
     format!("{direction} {} <-> {remote_path}", local_path.display())
-}
-
-fn russh_sftp_supports_parallel_random_access() -> bool {
-    assert_random_access_handle::<russh_sftp::client::fs::File>();
-    true
-}
-
-fn assert_random_access_handle<T>()
-where
-    T: AsyncRead + AsyncWrite + AsyncSeek + Unpin,
-{
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
