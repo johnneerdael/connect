@@ -16,7 +16,7 @@ use connect::{
     app::{App, AppPaths, ProfileSecretsInput, SecretBackend},
     cli::{
         commands::{add, copy as copy_command, edit, list, remove, show},
-        AddArgs, EditArgs, RemoveArgs, ShowArgs,
+        AddArgs, CopyArgs, EditArgs, RemoveArgs, ShowArgs,
     },
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
@@ -1019,14 +1019,31 @@ fn show_command_prints_metadata_and_redacted_secret_availability_only() {
 }
 
 #[test]
-fn show_command_displays_default_copy_threads() {
+fn add_and_show_round_trip_copy_thread_count_default() {
     let harness = TestHarness::new();
     let mut output = Vec::new();
 
-    harness
-        .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
-        .unwrap();
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: Some(4),
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
 
     let args = ShowArgs {
         name: "prod".into(),
@@ -1035,47 +1052,61 @@ fn show_command_displays_default_copy_threads() {
     show::run(harness.app(), &args, &mut output).unwrap();
 
     let stdout = String::from_utf8(output).unwrap();
-    assert!(stdout.contains("Copy threads: 1"));
+    assert!(stdout.contains("Copy threads: 4"));
 }
 
 #[test]
-fn effective_copy_threads_defaults_to_one_when_profile_is_unset() {
+fn copy_uses_cli_threads_override_instead_of_profile_default() {
     let harness = TestHarness::new();
     harness
         .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy").with_copy_threads(4))
         .unwrap();
 
-    assert_eq!(
-        harness.app().effective_copy_threads("prod", None).unwrap(),
-        1
-    );
+    let source_root = unique_temp_path("connect-copy-thread-override");
+    fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("artifact.txt");
+    fs::write(&source, b"payload").unwrap();
+
+    let args = CopyArgs {
+        recursive: false,
+        resume: false,
+        progress: false,
+        threads: Some(8),
+        retry: false,
+        source: source.to_string_lossy().into_owned(),
+        destination: "prod:/tmp/payload".into(),
+    };
+
+    let spec = copy_command::prepare_copy_spec(harness.app(), &args).unwrap();
+    assert_eq!(spec.effective_threads, 8);
 }
 
 #[test]
-fn effective_copy_threads_prefers_cli_override_over_saved_profile_value() {
+fn copy_threads_one_preserves_single_stream_mode() {
     let harness = TestHarness::new();
     harness
         .app()
-        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy").with_copy_threads(1))
         .unwrap();
 
-    let database = Database::new(harness.root.join("data").join("connect.db"));
-    let connection = database.connect().unwrap();
-    connection
-        .execute(
-            "UPDATE profiles SET copy_threads = 4 WHERE name = ?1",
-            ["prod"],
-        )
-        .unwrap();
+    let source_root = unique_temp_path("connect-copy-thread-single");
+    fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("artifact.txt");
+    fs::write(&source, b"payload").unwrap();
 
-    assert_eq!(
-        harness
-            .app()
-            .effective_copy_threads("prod", Some(8))
-            .unwrap(),
-        8
-    );
+    let args = CopyArgs {
+        recursive: false,
+        resume: false,
+        progress: false,
+        threads: None,
+        retry: false,
+        source: source.to_string_lossy().into_owned(),
+        destination: "prod:/tmp/payload".into(),
+    };
+
+    let spec = copy_command::prepare_copy_spec(harness.app(), &args).unwrap();
+    assert_eq!(spec.effective_threads, 1);
 }
 
 #[test]

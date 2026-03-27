@@ -50,6 +50,7 @@ pub struct CopySpec {
     pub recursive: bool,
     pub resume: bool,
     pub progress: bool,
+    pub effective_threads: usize,
 }
 
 impl CopySpec {
@@ -145,6 +146,7 @@ pub fn parse_copy_spec(
         recursive,
         resume,
         progress,
+        effective_threads: 1,
     })
 }
 

@@ -207,7 +207,7 @@ fn copy_parses_thread_and_retry_flags() {
 }
 
 #[test]
-fn copy_help_lists_thread_and_retry_flags() {
+fn copy_help_lists_threads_and_retry_flags() {
     let mut cmd = connect_test_bin();
     cmd.args(["copy", "--help"])
         .assert()
