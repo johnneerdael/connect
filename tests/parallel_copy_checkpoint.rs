@@ -13,7 +13,7 @@ use connect::{
     error::Error,
     secrets::{MemorySecretStore, SecretStore},
     ssh::{
-        parse_copy_spec, checkpoint_path, CheckpointFileIdentity, ChunkRange,
+        checkpoint_path, parse_copy_spec, CheckpointFileIdentity, ChunkRange,
         CopyCheckpointIdentity, CopyCheckpointState, CopyCheckpointStore, CopyDirection,
         CopyFileMetadata, CopyTransferMode, ObservedHostKey, RemoteFileType, SshClient, SshSession,
     },
@@ -132,11 +132,8 @@ async fn threaded_upload_resumes_only_missing_ranges() {
     let source_identity = file_identity(&source);
     let remote_identity = CheckpointFileIdentity::new(4 * CHUNK_BYTES, 1_700_000_123);
 
-    let mut state = CopyCheckpointState::new(
-        4 * CHUNK_BYTES,
-        source_identity,
-        Some(remote_identity),
-    );
+    let mut state =
+        CopyCheckpointState::new(4 * CHUNK_BYTES, source_identity, Some(remote_identity));
     state.mark_completed(ChunkRange {
         start: 0,
         end: CHUNK_BYTES,
@@ -191,12 +188,7 @@ async fn threaded_upload_resumes_only_missing_ranges() {
             },
         ]
     );
-    assert!(
-        !harness
-            .checkpoints()
-            .checkpoint_path(&identity)
-            .exists()
-    );
+    assert!(!harness.checkpoints().checkpoint_path(&identity).exists());
 }
 
 #[tokio::test]
@@ -411,7 +403,10 @@ impl Drop for CheckpointHarness {
 }
 
 fn profile_checkpoint_namespace(profile_name: &str) -> String {
-    let payload = format!("v1\0{}\0{}.example.com\0{}\0{}", profile_name, profile_name, 22, "deploy");
+    let payload = format!(
+        "v1\0{}\0{}.example.com\0{}\0{}",
+        profile_name, profile_name, 22, "deploy"
+    );
     format!("{:016x}", fnv1a64(payload.as_bytes()))
 }
 
@@ -452,7 +447,12 @@ impl FakeThreadedCopySshClient {
         Self::default()
     }
 
-    fn with_remote_file(self, path: &str, file_type: RemoteFileType, metadata: CopyFileMetadata) -> Self {
+    fn with_remote_file(
+        self,
+        path: &str,
+        file_type: RemoteFileType,
+        metadata: CopyFileMetadata,
+    ) -> Self {
         let mut state = self.state.lock().unwrap();
         state.remote_types.insert(path.into(), file_type);
         state.remote_metadata.insert(path.into(), metadata);
@@ -594,7 +594,13 @@ impl SshSession for FakeThreadedCopySession {
         path: &'a str,
     ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<CopyFileMetadata>>> + Send + 'a>>
     {
-        let metadata = self.state.lock().unwrap().remote_metadata.get(path).copied();
+        let metadata = self
+            .state
+            .lock()
+            .unwrap()
+            .remote_metadata
+            .get(path)
+            .copied();
         Box::pin(async move { Ok(metadata) })
     }
 
@@ -660,11 +666,15 @@ impl SshSession for FakeThreadedCopySession {
                 .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
-            state.remote_types.insert(remote_path.into(), RemoteFileType::File);
+            state
+                .remote_types
+                .insert(remote_path.into(), RemoteFileType::File);
             state.remote_metadata.insert(
                 remote_path.into(),
                 CopyFileMetadata::new(
-                    fs::metadata(local_path).map(|metadata| metadata.len()).unwrap_or(range.end),
+                    fs::metadata(local_path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(range.end),
                     Some(modified),
                 ),
             );
@@ -679,7 +689,12 @@ impl SshSession for FakeThreadedCopySession {
 struct AcceptPrompt;
 
 impl Prompt for AcceptPrompt {
-    fn prompt(&self, _key: &str, _message: &str, _default: Option<&str>) -> connect::error::Result<String> {
+    fn prompt(
+        &self,
+        _key: &str,
+        _message: &str,
+        _default: Option<&str>,
+    ) -> connect::error::Result<String> {
         Err(Error::new("unexpected text prompt"))
     }
 

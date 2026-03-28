@@ -24,6 +24,7 @@ use russh_sftp::{
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
+    time::timeout,
 };
 
 use crate::{
@@ -46,6 +47,7 @@ pub trait DirectTcpipStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> DirectTcpipStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_MAX_MISSES: usize = 3;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const OPENSSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
@@ -302,19 +304,21 @@ impl SshClient for RusshClient {
             let mismatch_state = Arc::clone(&handler.host_key_mismatch);
             let config = Arc::new(Self::config());
 
-            let handle =
-                match client::connect(config, (profile.host.as_str(), profile.port), handler).await
-                {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        if host_key_mismatch(&mismatch_state)? {
-                            return Err(Error::new(
-                                "saved host key does not match the server host key",
-                            ));
-                        }
-                        return Err(map_ssh_error(error));
+            let handle = match connect_with_timeout(
+                profile.host.as_str(),
+                profile.port,
+                client::connect(config, (profile.host.as_str(), profile.port), handler),
+            )
+            .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    if host_key_mismatch(&mismatch_state)? {
+                        return Err(Error::new("saved host key does not match the server host key"));
                     }
-                };
+                    return Err(error);
+                }
+            };
             let observed = host_key_from_state(&observed_state)?;
 
             Ok(Box::new(RusshSession {
@@ -324,6 +328,20 @@ impl SshClient for RusshClient {
                 sftp: None,
             }) as DynSshSession)
         })
+    }
+}
+
+async fn connect_with_timeout<T, F>(host: &str, port: u16, future: F) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, russh::Error>>,
+{
+    match timeout(CONNECT_TIMEOUT, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(map_ssh_error(error)),
+        Err(_) => Err(Error::new(format!(
+            "ssh connection to {host}:{port} timed out after {} seconds",
+            CONNECT_TIMEOUT.as_secs()
+        ))),
     }
 }
 
@@ -339,6 +357,24 @@ mod tests {
         assert_eq!(config.inactivity_timeout, None);
         assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
         assert_eq!(config.keepalive_max, KEEPALIVE_MAX_MISSES);
+    }
+
+    #[tokio::test]
+    async fn ssh_connect_times_out_with_a_clear_error() {
+        let error = connect_with_timeout("example.invalid", 22, async {
+            tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_millis(50)).await;
+            Ok::<(), russh::Error>(())
+        })
+        .await
+        .expect_err("connect should time out");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "ssh connection to example.invalid:22 timed out after {} seconds",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        );
     }
 
     #[tokio::test]
