@@ -1,0 +1,3743 @@
+use std::{
+    collections::HashMap,
+    fs,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use connect::store::AuthMode;
+use connect::{
+    app::{App, AppPaths, ProfileSecretsInput, SecretBackend},
+    cli::{
+        commands::{add, copy as copy_command, edit, list, remove, show},
+        AddArgs, CopyArgs, EditArgs, RemoveArgs, ShowArgs,
+    },
+    error::Error,
+    secrets::{MemorySecretStore, SecretStore},
+    ssh::{
+        checkpoint_path, establish_transfer_sessions, parse_copy_spec, ChunkRange,
+        CopyCheckpointIdentity, CopyCheckpointState, CopyDestinationShape, CopyDirection,
+        CopyFileMetadata, CopyPlanMode, CopySummary, CopyTransferMode, ExecSpec, ObservedHostKey,
+        PlannedCopySource, RemoteDirectoryEntry, RemoteFileType, SshClient, SshSession,
+    },
+    store::{Database, ForwardDefinition, ForwardKind, ForwardStore, ProfileInput},
+    terminal::prompt::Prompt,
+};
+use rusqlite::Connection;
+
+struct TestHarness {
+    root: PathBuf,
+    app: App,
+    secrets: Arc<MemorySecretStore>,
+}
+
+impl TestHarness {
+    fn new() -> Self {
+        let root = unique_temp_path("connect-profile-tests");
+        let paths = AppPaths::from_root(&root);
+        let secrets = Arc::new(MemorySecretStore::default());
+        let app = App::new(paths, secrets.clone()).expect("app should initialize");
+
+        Self { root, app, secrets }
+    }
+
+    fn with_profile(name: &str) -> Self {
+        let harness = Self::new();
+        harness
+            .app()
+            .save_profile(ProfileInput::new(
+                name,
+                format!("{name}.example.com"),
+                "deploy",
+            ))
+            .unwrap();
+        harness
+    }
+
+    fn app(&self) -> &App {
+        &self.app
+    }
+
+    fn secrets(&self) -> Arc<MemorySecretStore> {
+        Arc::clone(&self.secrets)
+    }
+
+    fn save_hostkey(&self, host: &str, port: u16, fingerprint: &str) {
+        self.app()
+            .save_host_key(
+                host,
+                port,
+                "ssh-ed25519",
+                fingerprint,
+                &format!("public-key-{fingerprint}"),
+            )
+            .unwrap();
+    }
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn profile_insert_round_trip_preserves_metadata() {
+    let harness = TestHarness::new();
+    let profile = ProfileInput::new("prod", "prod.example.com", "deploy");
+
+    harness.app().save_profile(profile).unwrap();
+
+    let loaded = harness.app().get_profile("prod").unwrap();
+    assert_eq!(loaded.host, "prod.example.com");
+    assert_eq!(loaded.username, "deploy");
+    assert_eq!(loaded.port, 22);
+}
+
+#[test]
+fn profile_save_updates_existing_metadata() {
+    let harness = TestHarness::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod-2.example.com", "root").with_port(2200))
+        .unwrap();
+
+    let loaded = harness.app().get_profile("prod").unwrap();
+    assert_eq!(loaded.host, "prod-2.example.com");
+    assert_eq!(loaded.username, "root");
+    assert_eq!(loaded.port, 2200);
+}
+
+#[test]
+fn app_save_forward_rejects_duplicate_name_for_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let definition = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+
+    harness.app().save_forward(definition.clone()).unwrap();
+
+    let error = harness.app().save_forward(definition).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "forward 'db' already exists for profile 'prod'"
+    );
+}
+
+#[test]
+fn app_save_forward_enforces_local_and_socks_definition_invariants() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let invalid_local = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: None,
+        target_port: Some(5432),
+        description: None,
+    };
+    assert_eq!(
+        harness
+            .app()
+            .save_forward(invalid_local)
+            .unwrap_err()
+            .to_string(),
+        "local forward requires target_host and target_port"
+    );
+
+    let invalid_socks = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "proxy".into(),
+        kind: ForwardKind::Socks,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 1080,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+    assert_eq!(
+        harness
+            .app()
+            .save_forward(invalid_socks)
+            .unwrap_err()
+            .to_string(),
+        "socks forward must not include target_host or target_port"
+    );
+}
+
+#[test]
+fn forward_store_rejects_duplicate_name_for_profile_atomically() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let store = ForwardStore::new(Database::new(harness.root.join("data").join("connect.db")));
+    let definition = ForwardDefinition {
+        profile_name: "prod".into(),
+        name: "db".into(),
+        kind: ForwardKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port: 15432,
+        target_host: Some("db.internal".into()),
+        target_port: Some(5432),
+        description: None,
+    };
+
+    store.save(&definition).unwrap();
+
+    let error = store.save(&definition).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "forward 'db' already exists for profile 'prod'"
+    );
+}
+
+#[test]
+fn add_command_imports_private_key_and_persists_profile() {
+    let harness = TestHarness::new();
+    let temp_key = TestKey::write_temp_pem();
+    let mut output = Vec::new();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: Some(temp_key.path().into()),
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.host, "prod.example.com");
+    assert_eq!(profile.username, "deploy");
+    assert!(profile.has_private_key);
+    assert_eq!(
+        harness.secrets().get_private_key("prod").unwrap(),
+        Some(temp_key.contents().to_string())
+    );
+}
+
+#[test]
+fn add_command_prompts_for_missing_required_fields() {
+    let harness = TestHarness::new();
+    let prompt = FakePrompt::new()
+        .with_text("host", "prod.example.com")
+        .with_text("user", "deploy");
+    let mut output = Vec::new();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(harness.app(), &prompt, &args, &mut output).unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.host, "prod.example.com");
+    assert_eq!(profile.username, "deploy");
+}
+
+#[test]
+fn add_command_stores_password_and_key_passphrase_from_secret_prompt() {
+    let harness = TestHarness::new();
+    let temp_key = TestKey::write_temp_pem();
+    let prompt = FakePrompt::new()
+        .with_secret("password", "super-secret")
+        .with_secret("key_passphrase", "unlock");
+    let mut output = Vec::new();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: true,
+        password_stdin: false,
+        private_key: Some(temp_key.path().into()),
+        key_passphrase: true,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(harness.app(), &prompt, &args, &mut output).unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert!(profile.has_password);
+    assert!(profile.has_private_key);
+    assert!(profile.has_key_passphrase);
+    assert_eq!(
+        harness.secrets().get_password("prod").unwrap(),
+        Some("super-secret".into())
+    );
+    assert_eq!(
+        harness.secrets().get_key_passphrase("prod").unwrap(),
+        Some("unlock".into())
+    );
+}
+
+#[test]
+fn add_command_persists_selected_auth_mode() {
+    let harness = TestHarness::new();
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::PasswordOnly,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.auth_mode, AuthMode::PasswordOnly);
+}
+
+#[test]
+fn add_command_rejects_invalid_host() {
+    let harness = TestHarness::new();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("not a host name".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "host must be a valid hostname, fqdn, or IP address"
+    );
+}
+
+#[test]
+fn add_command_accepts_absolute_fqdn_and_internal_hostname() {
+    let harness = TestHarness::new();
+
+    let fqdn_args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com.".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &fqdn_args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let internal_args = AddArgs {
+        name: "stage".into(),
+        host: Some("stage_api".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &internal_args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn add_command_rejects_duplicate_profile_names() {
+    let harness = TestHarness::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "old-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod-2.example.com".into()),
+        user: Some("root".into()),
+        port: Some(2200),
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "profile 'prod' already exists");
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.host, "prod.example.com");
+    assert_eq!(profile.username, "deploy");
+    assert_eq!(profile.port, 22);
+    assert_eq!(
+        harness.secrets().get_password("prod").unwrap(),
+        Some("old-secret".into())
+    );
+}
+
+#[test]
+fn add_command_rejects_reserved_profile_name() {
+    let harness = TestHarness::new();
+
+    let args = AddArgs {
+        name: "list".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "profile name 'list' is reserved");
+    assert!(matches!(
+        harness.app().get_profile("list"),
+        Err(Error::ProfileNotFound(_))
+    ));
+}
+
+#[test]
+fn add_command_rejects_single_letter_profile_name() {
+    let harness = TestHarness::new();
+
+    let args = AddArgs {
+        name: "c".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "single-letter profile names are reserved to avoid Windows path ambiguity"
+    );
+    assert!(matches!(
+        harness.app().get_profile("c"),
+        Err(Error::ProfileNotFound(_))
+    ));
+}
+
+#[test]
+fn add_command_rolls_back_secrets_when_secret_write_fails() {
+    let root = unique_temp_path("connect-add-secret-failure");
+    let paths = AppPaths::from_root(&root);
+    let secrets = Arc::new(FailsOnKeyPassphraseSecretStore::default());
+    let app = App::new(paths, secrets.clone()).unwrap();
+
+    let prompt = FakePrompt::new()
+        .with_secret("password", "super-secret")
+        .with_secret("key_passphrase", "unlock");
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: true,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: true,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
+    assert_eq!(error.to_string(), "key passphrase write failed");
+    assert!(matches!(
+        app.get_profile("prod"),
+        Err(Error::ProfileNotFound(_))
+    ));
+    assert_eq!(secrets.get_password("prod").unwrap(), None);
+    assert_eq!(secrets.get_key_passphrase("prod").unwrap(), None);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn add_command_preserves_primary_error_when_rollback_fails() {
+    let root = unique_temp_path("connect-add-rollback-failure");
+    let paths = AppPaths::from_root(&root);
+    let secrets = Arc::new(FailsOnKeyPassphraseAndDeleteSecretStore::default());
+    let app = App::new(paths, secrets).unwrap();
+
+    let prompt = FakePrompt::new()
+        .with_secret("password", "super-secret")
+        .with_secret("key_passphrase", "unlock");
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: true,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: true,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("key passphrase write failed"));
+    assert!(message.contains("rollback failed"));
+    assert!(message.contains("secret deletion failed"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn add_command_rolls_back_new_secrets_when_metadata_save_fails() {
+    let harness = TestHarness::new();
+    break_database(&harness.root);
+
+    let prompt = FakePrompt::new().with_secret("password", "super-secret");
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: true,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = add::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("directory") || error.to_string().contains("unable"));
+    assert!(matches!(
+        harness.app().get_profile("prod"),
+        Err(Error::ProfileNotFound(_)) | Err(Error::Io(_)) | Err(Error::Sqlite(_))
+    ));
+    assert_eq!(harness.secrets().get_password("prod").unwrap(), None);
+}
+
+#[test]
+fn edit_command_updates_only_supplied_fields() {
+    let harness = TestHarness::new();
+    let temp_key = TestKey::write_temp_pem();
+    let prompt = FakePrompt::new().with_secret("password", "new-password");
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: Some("prod-2.example.com".into()),
+        user: None,
+        port: Some(2200),
+        auth_mode: None,
+        password: true,
+        password_stdin: false,
+        private_key: Some(temp_key.path().into()),
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    edit::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.host, "prod-2.example.com");
+    assert_eq!(profile.username, "deploy");
+    assert_eq!(profile.port, 2200);
+    assert!(profile.has_password);
+    assert!(profile.has_private_key);
+    assert_eq!(
+        harness.secrets().get_password("prod").unwrap(),
+        Some("new-password".into())
+    );
+    assert_eq!(
+        harness.secrets().get_private_key("prod").unwrap(),
+        Some(temp_key.contents().into())
+    );
+}
+
+#[test]
+fn edit_command_updates_auth_mode_when_supplied() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: Some(AuthMode::AgentOnly),
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let profile = harness.app().get_profile("prod").unwrap();
+    assert_eq!(profile.auth_mode, AuthMode::AgentOnly);
+}
+
+#[test]
+fn edit_command_rejects_invalid_host() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: Some("not a host name".into()),
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "host must be a valid hostname, fqdn, or IP address"
+    );
+}
+
+#[test]
+fn edit_command_accepts_absolute_fqdn() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com.".into()),
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn edit_command_rejects_reserved_profile_name() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("list", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "list".into(),
+        host: Some("prod-2.example.com".into()),
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "profile name 'list' is reserved");
+
+    let profile = harness.app().get_profile("list").unwrap();
+    assert_eq!(profile.host, "prod.example.com");
+}
+
+#[test]
+fn edit_command_allows_existing_single_letter_profile_name() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("c", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "c".into(),
+        host: Some("prod-2.example.com".into()),
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    edit::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let profile = harness.app().get_profile("c").unwrap();
+    assert_eq!(profile.host, "prod-2.example.com");
+}
+
+#[test]
+fn edit_command_rolls_back_overwritten_secrets_when_secret_write_fails() {
+    let root = unique_temp_path("connect-edit-secret-failure");
+    let paths = AppPaths::from_root(&root);
+    let secrets = Arc::new(FailsOnKeyPassphraseSecretStore::default());
+    let app = App::new(paths, secrets.clone()).unwrap();
+
+    app.save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    app.save_profile_with_secrets(
+        ProfileInput::new("prod", "prod.example.com", "deploy"),
+        ProfileSecretsInput {
+            password: Some("old-secret".into()),
+            private_key: None,
+            key_passphrase: None,
+        },
+    )
+    .unwrap();
+
+    let prompt = FakePrompt::new()
+        .with_secret("password", "new-secret")
+        .with_secret("key_passphrase", "unlock");
+    let args = EditArgs {
+        name: "prod".into(),
+        host: Some("prod-2.example.com".into()),
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: true,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: true,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    let error = edit::run(&app, &prompt, &args, &mut Vec::new()).unwrap_err();
+    assert_eq!(error.to_string(), "key passphrase write failed");
+
+    let profile = app.get_profile("prod").unwrap();
+    assert_eq!(profile.host, "prod.example.com");
+    assert_eq!(profile.username, "deploy");
+    assert!(profile.has_password);
+    assert!(!profile.has_key_passphrase);
+    assert_eq!(
+        secrets.get_password("prod").unwrap(),
+        Some("old-secret".into())
+    );
+    assert_eq!(secrets.get_key_passphrase("prod").unwrap(), None);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn remove_command_requires_confirmation_without_yes_flag() {
+    let harness = TestHarness::new();
+    let prompt = FakePrompt::new().with_confirm("remove", false);
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = RemoveArgs {
+        name: "prod".into(),
+        yes: false,
+    };
+
+    remove::run(harness.app(), &prompt, &args, &mut Vec::new()).unwrap();
+
+    assert!(harness.app().get_profile("prod").is_ok());
+}
+
+#[test]
+fn remove_command_deletes_profile_and_secrets_with_yes_flag() {
+    let harness = TestHarness::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness.secrets().set_password("prod", "secret").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let args = RemoveArgs {
+        name: "prod".into(),
+        yes: true,
+    };
+
+    remove::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        harness.app().get_profile("prod"),
+        Err(Error::ProfileNotFound(_))
+    ));
+    assert_eq!(harness.secrets().get_password("prod").unwrap(), None);
+}
+
+#[test]
+fn list_command_prints_concise_rows() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("stage", "stage.example.com", "tester").with_port(2200))
+        .unwrap();
+
+    list::run(harness.app(), &mut output).unwrap();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("prod\tdeploy@prod.example.com:22"));
+    assert!(stdout.contains("stage\ttester@stage.example.com:2200"));
+}
+
+#[test]
+fn show_command_prints_metadata_and_redacted_secret_availability_only() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness.secrets().set_password("prod", "secret").unwrap();
+    harness.secrets().set_private_key("prod", "pem").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, true, false)
+        .unwrap();
+
+    let args = ShowArgs {
+        name: "prod".into(),
+    };
+
+    show::run(harness.app(), &args, &mut output).unwrap();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("Name: prod"));
+    assert!(stdout.contains("Host: prod.example.com"));
+    assert!(stdout.contains("Username: deploy"));
+    assert!(stdout.contains("Auth mode: auto"));
+    assert!(stdout.contains("Password: configured"));
+    assert!(stdout.contains("Private key: configured"));
+    assert!(stdout.contains("Key passphrase: not configured"));
+    assert!(!stdout.contains("secret"));
+    assert!(!stdout.contains("pem"));
+}
+
+#[test]
+fn add_and_show_round_trip_copy_thread_count_default() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    let args = AddArgs {
+        name: "prod".into(),
+        host: Some("prod.example.com".into()),
+        user: Some("deploy".into()),
+        port: None,
+        auth_mode: AuthMode::Auto,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    add::run(
+        harness.app(),
+        &FakePrompt::default(),
+        &args,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let stored_threads: i64 = Connection::open(harness.root.join("data").join("connect.db"))
+        .unwrap()
+        .query_row(
+            "SELECT copy_threads FROM profiles WHERE name = 'prod'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_threads, 1);
+
+    let args = ShowArgs {
+        name: "prod".into(),
+    };
+
+    show::run(harness.app(), &args, &mut output).unwrap();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("Copy threads: 1"));
+}
+
+#[test]
+fn app_save_profile_rejects_zero_copy_threads() {
+    let harness = TestHarness::new();
+
+    let error = harness
+        .app()
+        .save_profile(ProfileInput {
+            name: "prod".into(),
+            host: "prod.example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_mode: AuthMode::Auto,
+            copy_threads: 0,
+            has_password: false,
+            has_private_key: false,
+            has_key_passphrase: false,
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("copy_threads"));
+}
+
+#[test]
+fn edit_command_updates_copy_threads_when_supplied() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy").with_copy_threads(4))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: Some(8),
+    };
+
+    edit::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
+
+    assert_eq!(harness.app().get_profile("prod").unwrap().copy_threads, 8);
+}
+
+#[test]
+fn edit_command_keeps_existing_copy_threads_when_unspecified() {
+    let harness = TestHarness::new();
+    let mut output = Vec::new();
+
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let args = EditArgs {
+        name: "prod".into(),
+        host: None,
+        user: None,
+        port: None,
+        auth_mode: None,
+        password: false,
+        password_stdin: false,
+        private_key: None,
+        key_passphrase: false,
+        key_passphrase_stdin: false,
+        copy_threads: None,
+    };
+
+    edit::run(harness.app(), &FakePrompt::default(), &args, &mut output).unwrap();
+
+    assert_eq!(harness.app().get_profile("prod").unwrap().copy_threads, 1);
+}
+
+#[test]
+fn copy_uses_cli_threads_override_instead_of_profile_default() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy").with_copy_threads(4))
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-copy-thread-override");
+    fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("artifact.txt");
+    fs::write(&source, b"payload").unwrap();
+
+    let args = CopyArgs {
+        recursive: false,
+        resume: false,
+        progress: false,
+        threads: Some(8),
+        retry: false,
+        source: source.to_string_lossy().into_owned(),
+        destination: "prod:/tmp/payload".into(),
+    };
+
+    let spec = copy_command::prepare_copy_spec(harness.app(), &args).unwrap();
+    assert_eq!(spec.effective_threads, 8);
+}
+
+#[test]
+fn copy_threads_one_preserves_single_stream_mode() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("prod", "prod.example.com", "deploy").with_copy_threads(1))
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-copy-thread-single");
+    fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("artifact.txt");
+    fs::write(&source, b"payload").unwrap();
+
+    let args = CopyArgs {
+        recursive: false,
+        resume: false,
+        progress: false,
+        threads: None,
+        retry: false,
+        source: source.to_string_lossy().into_owned(),
+        destination: "prod:/tmp/payload".into(),
+    };
+
+    let spec = copy_command::prepare_copy_spec(harness.app(), &args).unwrap();
+    assert_eq!(spec.effective_threads, 1);
+}
+
+#[test]
+fn database_initialize_defaults_legacy_profiles_without_copy_threads_column() {
+    let root = unique_temp_path("connect-copy-thread-migration");
+    let legacy_db = root.join("data").join("connect.db");
+    std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+
+    let connection = Connection::open(&legacy_db).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE profiles (
+                name TEXT PRIMARY KEY,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                auth_mode TEXT NOT NULL DEFAULT 'auto',
+                copy_threads INTEGER,
+                has_password INTEGER NOT NULL DEFAULT 0,
+                has_private_key INTEGER NOT NULL DEFAULT 0,
+                has_key_passphrase INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            INSERT INTO profiles (
+                name, host, port, username, auth_mode, copy_threads, has_password, has_private_key, has_key_passphrase
+            ) VALUES (
+                'prod', 'prod.example.com', 22, 'deploy', 'auto', NULL, 0, 0, 0
+            );
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let paths = AppPaths::from_root(&root);
+    let app = App::new(paths, Arc::new(MemorySecretStore::default())).unwrap();
+
+    let connection = Connection::open(&legacy_db).unwrap();
+    let stored_threads: i64 = connection
+        .query_row(
+            "SELECT copy_threads FROM profiles WHERE name = 'prod'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut statement = connection.prepare("PRAGMA table_info(profiles)").unwrap();
+    let (notnull, default_value): (i64, Option<String>) = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .unwrap()
+        .find_map(|result| {
+            let (name, notnull, default_value) = result.unwrap();
+            (name == "copy_threads").then_some((notnull, default_value))
+        })
+        .unwrap();
+
+    assert_eq!(stored_threads, 1);
+    assert_eq!(notnull, 1);
+    assert_eq!(default_value.as_deref(), Some("1"));
+    assert_eq!(app.get_profile("prod").unwrap().copy_threads, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_store_rejects_malformed_persisted_copy_threads() {
+    let root = unique_temp_path("connect-copy-thread-invalid");
+    let legacy_db = root.join("data").join("connect.db");
+    std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+
+    let connection = Connection::open(&legacy_db).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE profiles (
+                name TEXT PRIMARY KEY,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                auth_mode TEXT NOT NULL DEFAULT 'auto',
+                copy_threads INTEGER NOT NULL DEFAULT 1,
+                has_password INTEGER NOT NULL DEFAULT 0,
+                has_private_key INTEGER NOT NULL DEFAULT 0,
+                has_key_passphrase INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            INSERT INTO profiles (
+                name, host, port, username, auth_mode, copy_threads, has_password, has_private_key, has_key_passphrase
+            ) VALUES (
+                'prod', 'prod.example.com', 22, 'deploy', 'auto', 0, 0, 0, 0
+            );
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = connect::store::ProfileStore::new(Database::new(legacy_db.clone()));
+    let error = store.get("prod").unwrap_err();
+    assert!(error.to_string().contains("copy_threads"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn runtime_app_defaults_to_keyring_secret_store() {
+    let root = unique_temp_path("connect-runtime-app");
+    let paths = AppPaths::from_root(&root);
+
+    let app = App::with_default_secret_store(paths).unwrap();
+
+    assert_eq!(app.secret_backend(), SecretBackend::Keyring);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_delete_keeps_metadata_when_secret_cleanup_fails() {
+    let root = unique_temp_path("connect-delete-failure");
+    let paths = AppPaths::from_root(&root);
+    let secrets = Arc::new(DeleteFailsSecretStore);
+    let app = App::new(paths, secrets).unwrap();
+
+    app.save_profile(ProfileInput::new("prod", "prod.example.com", "deploy"))
+        .unwrap();
+
+    let error = app.delete_profile("prod").unwrap_err();
+    assert_eq!(error.to_string(), "secret deletion failed");
+
+    let loaded = app.get_profile("prod").unwrap();
+    assert_eq!(loaded.name, "prod");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn connect_uses_profile_and_rejects_host_key_mismatch() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "expected-fingerprint");
+
+    let ssh = FakeConnectSshClient::with_hostkey("different-fingerprint");
+    let result = harness
+        .app()
+        .connect_profile("prod", &ssh, &FakePrompt::default())
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key")
+    );
+}
+
+#[tokio::test]
+async fn connect_tries_private_key_before_password() {
+    let harness = TestHarness::with_profile("prod");
+    harness
+        .app()
+        .save_profile(
+            ProfileInput::new("prod", "prod.example.com", "deploy")
+                .with_auth_mode(AuthMode::StoredOnly),
+        )
+        .unwrap();
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_private_key(
+            "prod",
+            "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, true, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::key_rejected_then_password_succeeds();
+
+    harness
+        .app()
+        .connect_profile("prod", &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.auth_attempts(), vec!["key", "password"]);
+}
+
+#[tokio::test]
+async fn connect_auto_prefers_agent_before_stored_auth() {
+    let _agent = EnvVarGuard::set("SSH_AUTH_SOCK", "/tmp/connect-test-agent.sock");
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_private_key(
+            "prod",
+            "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", false, true, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::agent_succeeds();
+
+    harness
+        .app()
+        .connect_profile("prod", &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.auth_attempts(), vec!["agent"]);
+}
+
+#[tokio::test]
+async fn exec_uses_profile_and_propagates_remote_exit_status() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_exec_exit_status(17);
+    let spec = ExecSpec::new(vec!["printf".into(), "hello world".into()], false);
+    let error = harness
+        .app()
+        .exec("prod", &spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RemoteExitStatus(17)));
+    assert_eq!(
+        ssh.executed_command(),
+        Some(("printf 'hello world'".into(), false))
+    );
+}
+
+#[tokio::test]
+async fn connect_propagates_remote_exit_status() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_exit_status(23);
+    let error = harness
+        .app()
+        .connect_profile("prod", &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::RemoteExitStatus(23)));
+}
+
+#[tokio::test]
+async fn connect_does_not_block_on_disconnect_after_remote_exit() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_pending_disconnect();
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        harness
+            .app()
+            .connect_profile("prod", &ssh, &FakePrompt::default()),
+    )
+    .await
+    .expect("connect should return without waiting for disconnect")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn exec_does_not_block_on_disconnect_after_remote_exit() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let ssh = FakeConnectSshClient::with_pending_disconnect();
+    let spec = ExecSpec::new(vec!["true".into()], false);
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        harness
+            .app()
+            .exec("prod", &spec, &ssh, &FakePrompt::default()),
+    )
+    .await
+    .expect("exec should return without waiting for disconnect")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn copy_uses_profile_and_rejects_host_key_mismatch() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "expected-fingerprint");
+    let source = TestFile::write_temp("artifact.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/artifact.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let ssh = FakeCopySshClient::with_hostkey("different-fingerprint");
+    let result = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await;
+
+    assert!(
+        matches!(result, Err(Error::Message(message)) if message == "saved host key does not match the server host key")
+    );
+}
+
+#[tokio::test]
+async fn copy_tries_private_key_before_password() {
+    let harness = TestHarness::with_profile("prod");
+    harness
+        .app()
+        .save_profile(
+            ProfileInput::new("prod", "prod.example.com", "deploy")
+                .with_auth_mode(AuthMode::StoredOnly),
+        )
+        .unwrap();
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_private_key(
+            "prod",
+            "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, true, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("artifact.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/artifact.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::key_rejected_then_password_succeeds();
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.auth_attempts(), vec!["key", "password"]);
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Upload,
+            source.path().to_path_buf(),
+            "/tmp/artifact.txt".into()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn copy_rejects_remote_directory_without_recursive_flag() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-download");
+    let spec = parse_copy_spec(
+        "prod:/var/log",
+        &destination.to_string_lossy(),
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123").with_remote_directory("/var/log");
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("--recursive"));
+
+    let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn copy_rejects_resume_when_destination_is_larger_than_source() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("resume-source.txt", "hello");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/resume-source.txt",
+        false,
+        true,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123").with_remote_file(
+        "/tmp/resume-source.txt",
+        RemoteFileType::File,
+        10,
+    );
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("destination is larger than the source"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_copy_uploads_symlinked_files() {
+    use std::os::unix::fs::symlink;
+
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-copy-symlink-tree");
+    fs::write(source_root.join("real.txt"), "payload").unwrap();
+    symlink(source_root.join("real.txt"), source_root.join("link.txt")).unwrap();
+
+    let spec = parse_copy_spec(
+        &source_root.to_string_lossy(),
+        "prod:/tmp/tree",
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    let transfers = ssh.transfers();
+    assert!(transfers.iter().any(|(direction, path, remote)| {
+        *direction == CopyDirection::Upload
+            && path == &source_root.join("link.txt")
+            && remote == "/tmp/tree/link.txt"
+    }));
+
+    let _ = fs::remove_dir_all(source_root);
+}
+
+#[test]
+fn copy_summary_is_emitted_by_the_cli_boundary() {
+    let summary = CopySummary {
+        direction: CopyDirection::Upload,
+        bytes_copied: 12,
+        resumed_bytes: 4,
+        destination: "prod:/tmp/artifact.txt".into(),
+        effective_threads: 2,
+        failed_files: 0,
+        warnings: vec!["parallel copy degraded".into()],
+    };
+    let mut output = Vec::new();
+
+    copy_command::emit_summary_to(&summary, &mut output).unwrap();
+
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "copy upload complete: 12 bytes copied (4 resumed) to prod:/tmp/artifact.txt (effective threads: 2)\nwarning: parallel copy degraded\n"
+    );
+}
+
+#[test]
+fn threaded_summary_reports_effective_thread_count_and_failures() {
+    let summary = CopySummary {
+        direction: CopyDirection::Download,
+        bytes_copied: 32,
+        resumed_bytes: 8,
+        destination: "/tmp/tree".into(),
+        effective_threads: 3,
+        failed_files: 1,
+        warnings: Vec::new(),
+    };
+
+    let rendered = summary.to_string();
+    assert!(rendered.contains("effective threads: 3"));
+    assert!(rendered.contains("failed files: 1"));
+}
+
+#[test]
+fn threaded_summary_reports_resumed_bytes_and_degradation_warning() {
+    let summary = CopySummary {
+        direction: CopyDirection::Upload,
+        bytes_copied: 128,
+        resumed_bytes: 64,
+        destination: "/tmp/archive.bin".into(),
+        effective_threads: 2,
+        failed_files: 0,
+        warnings: vec![
+            "parallel copy degraded from 4 requested sessions to 2 random-access-capable sessions"
+                .into(),
+        ],
+    };
+    let mut output = Vec::new();
+
+    copy_command::emit_summary_to(&summary, &mut output).unwrap();
+
+    let rendered = String::from_utf8(output).unwrap();
+    assert!(rendered.contains("(64 resumed)"));
+    assert!(rendered.contains("degraded"));
+}
+
+#[tokio::test]
+async fn copy_records_explicit_progress_override() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("progress-source.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/progress-source.txt",
+        false,
+        false,
+        true,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    let transfer_options = ssh.transfer_options();
+    assert!(!transfer_options.is_empty());
+    assert!(transfer_options.iter().all(|options| options.show_progress));
+}
+
+#[tokio::test]
+async fn copy_expands_remote_home_syntax_for_uploads() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("artifact.txt", "payload");
+    let spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:~/artifact.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123").with_remote_home("/home/ubuntu");
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Upload,
+            source.path().to_path_buf(),
+            "/home/ubuntu/artifact.txt".into()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn copy_expands_remote_home_syntax_for_downloads() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-home-download");
+    let spec = parse_copy_spec(
+        "prod:~/artifact.txt",
+        &destination.to_string_lossy(),
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123")
+        .with_remote_home("/home/ubuntu")
+        .with_remote_file("/home/ubuntu/artifact.txt", RemoteFileType::File, 7);
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Download,
+            destination.join("artifact.txt"),
+            "/home/ubuntu/artifact.txt".into()
+        )]
+    );
+
+    let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn copy_accepts_explicit_remote_prefix_for_single_letter_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("p", "prod.example.com", "deploy"))
+        .unwrap();
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness.secrets().set_password("p", "super-secret").unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("p", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-single-letter");
+    let spec = parse_copy_spec(
+        "@p:/tmp/artifact.txt",
+        &destination.to_string_lossy(),
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+    ssh.state
+        .lock()
+        .unwrap()
+        .remote_paths
+        .insert("/tmp/artifact.txt".into(), RemoteFileType::File);
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Download,
+            destination.join("artifact.txt"),
+            "/tmp/artifact.txt".into()
+        )]
+    );
+
+    let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn copy_accepts_explicit_remote_prefix_for_at_prefixed_profile() {
+    let harness = TestHarness::new();
+    harness
+        .app()
+        .save_profile(ProfileInput::new("@prod", "prod.example.com", "deploy"))
+        .unwrap();
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("@prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("@prod", true, false, false)
+        .unwrap();
+
+    let destination = unique_temp_path("connect-copy-at-profile");
+    let spec = parse_copy_spec(
+        "@@prod:/tmp/artifact.txt",
+        &destination.to_string_lossy(),
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+    ssh.state
+        .lock()
+        .unwrap()
+        .remote_paths
+        .insert("/tmp/artifact.txt".into(), RemoteFileType::File);
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ssh.transfers(),
+        vec![(
+            CopyDirection::Download,
+            destination.join("artifact.txt"),
+            "/tmp/artifact.txt".into()
+        )]
+    );
+
+    let _ = fs::remove_dir_all(destination);
+}
+
+#[tokio::test]
+async fn threaded_copy_warns_and_degrades_when_only_subset_of_sessions_connect() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-degrade.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-degrade.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::with_connect_limit(2);
+
+    let result = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.effective_threads, 2);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("degraded")),
+        "{result:?}"
+    );
+    assert_eq!(ssh.connect_attempts(), 3);
+}
+
+#[tokio::test]
+async fn threaded_copy_fails_when_requested_parallelism_degrades_to_one_session() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-one-session.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-one-session.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::with_connect_limit(1);
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("could not establish threaded mode"));
+}
+
+#[tokio::test]
+async fn threaded_copy_fails_clearly_when_random_access_support_is_unavailable() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-random-access.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-random-access.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::without_random_access_support();
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("random-access-capable sftp session"));
+}
+
+#[tokio::test]
+async fn threaded_copy_fails_when_an_extra_session_lacks_random_access_support() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-random-access-extra.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-random-access-extra.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let profile = harness.app().get_profile("prod").unwrap();
+    let ssh = FakeCopySshClient::transfer_readiness_fails_on_session(3);
+
+    let error =
+        match establish_transfer_sessions(&ssh, &profile, harness.app(), &FakePrompt::default(), 4)
+            .await
+        {
+            Ok(_) => panic!("expected random-access probe failure"),
+            Err(error) => error,
+        };
+
+    assert!(error
+        .to_string()
+        .contains("random-access-capable sftp session"));
+    assert_eq!(ssh.connect_attempts(), 3);
+}
+
+#[tokio::test]
+async fn threaded_copy_does_not_degrade_on_authentication_failures() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-auth-failure.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-auth-failure.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::authentication_fails_on_session(2);
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains("could not establish threaded mode"),
+        "{error}"
+    );
+    assert_eq!(ssh.connect_attempts(), 2);
+}
+
+#[tokio::test]
+async fn threaded_copy_does_not_degrade_on_timeout_style_establishment_failures() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-timeout.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-timeout.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::timeout_failure_on_session(2);
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(
+        !error
+            .to_string()
+            .contains("could not establish threaded mode"),
+        "{error}"
+    );
+    assert_eq!(ssh.connect_attempts(), 2);
+}
+
+#[tokio::test]
+async fn threaded_copy_refinalizes_the_plan_against_the_degraded_effective_threads() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-replan.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-replan.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let profile = harness.app().get_profile("prod").unwrap();
+    let ssh = FakeCopySshClient::with_connect_limit(2);
+
+    let pool =
+        establish_transfer_sessions(&ssh, &profile, harness.app(), &FakePrompt::default(), 4)
+            .await
+            .unwrap();
+    let prepared = pool
+        .prepare_plan(
+            spec,
+            CopyDestinationShape::new(false),
+            PlannedCopySource::File {
+                path: source.path().display().to_string(),
+                size: 128 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(prepared.effective_threads(), 2);
+    assert!(prepared
+        .warnings()
+        .iter()
+        .any(|warning| warning.contains("degraded")));
+    match &prepared.plan().mode {
+        CopyPlanMode::StripedFile { chunks } => assert_eq!(chunks.len(), 2),
+        mode => panic!("expected striped plan after refinalization, got {mode:?}"),
+    }
+}
+
+#[tokio::test]
+async fn single_session_retry_retries_transient_copy_failures() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source = TestFile::write_temp("parallel-retry.txt", "payload");
+    let mut spec = parse_copy_spec(
+        source.path().to_string_lossy().as_ref(),
+        "prod:/tmp/parallel-retry.txt",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 1;
+    spec.retry = true;
+    let ssh = FakeCopySshClient::single_session_with_transient_failure();
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(ssh.upload_attempts(), 2);
+}
+
+#[tokio::test]
+async fn recursive_threaded_copy_processes_multiple_files_and_large_file_chunks() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-recursive-threaded-tree");
+    fs::create_dir_all(source_root.join("nested")).unwrap();
+    fs::write(source_root.join("small.txt"), "small").unwrap();
+    fs::write(source_root.join("nested/child.txt"), "child").unwrap();
+    let large = source_root.join("large.bin");
+    fs::File::create(&large)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+
+    let mut spec = parse_copy_spec(
+        source_root.to_string_lossy().as_ref(),
+        "prod:/tmp/tree",
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    let ssh = FakeCopySshClient::with_hostkey("fp-123");
+
+    let summary = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.destination, "/tmp/tree");
+    let transfers = ssh.transfers();
+    assert!(transfers
+        .iter()
+        .any(|(_, _, remote)| remote == "/tmp/tree/small.txt"));
+    assert!(transfers
+        .iter()
+        .any(|(_, _, remote)| remote == "/tmp/tree/nested/child.txt"));
+    let ranges = ssh.upload_ranges();
+    assert!(ranges
+        .iter()
+        .any(|(_, remote, range)| remote == "/tmp/tree/large.bin" && range.start < range.end));
+    let events = ssh.event_log();
+    let nested_dir_index = events
+        .iter()
+        .position(|event| event == "mkdir:/tmp/tree/nested")
+        .unwrap();
+    let child_upload_index = events
+        .iter()
+        .position(|event| event == "upload:/tmp/tree/nested/child.txt")
+        .unwrap();
+    assert!(nested_dir_index <= child_upload_index);
+
+    let _ = fs::remove_dir_all(source_root);
+}
+
+#[tokio::test]
+async fn recursive_resume_skips_completed_files_and_resumes_partial_striped_files() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-recursive-resume-tree");
+    fs::create_dir_all(&source_root).unwrap();
+    let small = source_root.join("small.txt");
+    fs::write(&small, "small").unwrap();
+    let large = source_root.join("large.bin");
+    fs::File::create(&large)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+
+    let identity = CopyCheckpointIdentity {
+        profile_name: "prod".into(),
+        direction: CopyDirection::Upload,
+        source_path: large.display().to_string(),
+        destination_path: "/tmp/tree/large.bin".into(),
+        transfer_mode: CopyTransferMode::RecursiveTree,
+    };
+    let source_mtime = fs::metadata(&large)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut checkpoint = CopyCheckpointState::new(
+        128 * 1024 * 1024,
+        connect::ssh::CheckpointFileIdentity::new(128 * 1024 * 1024, Some(source_mtime)),
+        Some(connect::ssh::CheckpointFileIdentity::new(
+            128 * 1024 * 1024,
+            Some(1_700_000_000),
+        )),
+    );
+    checkpoint.mark_completed(ChunkRange {
+        start: 0,
+        end: 64 * 1024 * 1024,
+    });
+    fs::create_dir_all(profile_checkpoint_root(&harness.root, "prod")).unwrap();
+    fs::write(
+        checkpoint_path(
+            profile_checkpoint_root(&harness.root, "prod").as_path(),
+            &identity,
+        ),
+        serde_json::to_vec_pretty(&checkpoint).unwrap(),
+    )
+    .unwrap();
+
+    let small_len = fs::metadata(&small).unwrap().len();
+    let ssh = FakeCopySshClient::with_hostkey("fp-123")
+        .with_remote_file("/tmp/tree/small.txt", RemoteFileType::File, small_len)
+        .with_remote_file(
+            "/tmp/tree/large.bin",
+            RemoteFileType::File,
+            128 * 1024 * 1024,
+        );
+    let mut spec = parse_copy_spec(
+        source_root.to_string_lossy().as_ref(),
+        "prod:/tmp/tree",
+        true,
+        true,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+
+    let summary = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert!(summary.resumed_bytes >= small_len + 64 * 1024 * 1024);
+    assert!(!ssh
+        .transfers()
+        .iter()
+        .any(|(_, _, remote)| remote == "/tmp/tree/small.txt"));
+    let ranges = ssh.upload_ranges();
+    assert_eq!(
+        ranges
+            .iter()
+            .filter(|(_, remote, _)| remote == "/tmp/tree/large.bin")
+            .count(),
+        1
+    );
+    assert_eq!(
+        ranges
+            .iter()
+            .find(|(_, remote, _)| remote == "/tmp/tree/large.bin")
+            .unwrap()
+            .2,
+        ChunkRange {
+            start: 64 * 1024 * 1024,
+            end: 128 * 1024 * 1024,
+        }
+    );
+
+    let _ = fs::remove_dir_all(source_root);
+}
+
+#[tokio::test]
+async fn recursive_retry_requeues_failed_files_without_recopying_completed_ones() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-recursive-retry-tree");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(source_root.join("stable.txt"), "stable").unwrap();
+    fs::write(source_root.join("retry.txt"), "retry").unwrap();
+
+    let ssh = FakeCopySshClient::with_hostkey("fp-123")
+        .with_whole_file_failure("/tmp/tree/retry.txt", InjectedCopyFailure::Transient);
+    let mut spec = parse_copy_spec(
+        source_root.to_string_lossy().as_ref(),
+        "prod:/tmp/tree",
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    spec.retry = true;
+
+    harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    let retry_count = ssh
+        .transfers()
+        .iter()
+        .filter(|(_, _, remote)| remote == "/tmp/tree/retry.txt")
+        .count();
+    let stable_count = ssh
+        .transfers()
+        .iter()
+        .filter(|(_, _, remote)| remote == "/tmp/tree/stable.txt")
+        .count();
+    assert_eq!(retry_count, 2);
+    assert_eq!(stable_count, 1);
+
+    let _ = fs::remove_dir_all(source_root);
+}
+
+#[tokio::test]
+async fn recursive_retry_reports_fatal_failures_without_looping_forever() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let source_root = unique_temp_path("connect-recursive-fatal-tree");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(source_root.join("stable.txt"), "stable").unwrap();
+    fs::write(source_root.join("fatal.txt"), "fatal").unwrap();
+
+    let ssh = FakeCopySshClient::with_hostkey("fp-123")
+        .with_whole_file_failure("/tmp/tree/fatal.txt", InjectedCopyFailure::Fatal);
+    let mut spec = parse_copy_spec(
+        source_root.to_string_lossy().as_ref(),
+        "prod:/tmp/tree",
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+    spec.retry = true;
+
+    let error = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("/tmp/tree/fatal.txt"));
+    let stable_count = ssh
+        .transfers()
+        .iter()
+        .filter(|(_, _, remote)| remote == "/tmp/tree/stable.txt")
+        .count();
+    assert_eq!(stable_count, 1);
+
+    let _ = fs::remove_dir_all(source_root);
+}
+
+#[tokio::test]
+async fn recursive_threaded_download_processes_multiple_files_and_large_file_chunks() {
+    let harness = TestHarness::with_profile("prod");
+    harness.save_hostkey("prod.example.com", 22, "fp-123");
+    harness
+        .secrets()
+        .set_password("prod", "super-secret")
+        .unwrap();
+    harness
+        .app()
+        .update_profile_secret_flags("prod", true, false, false)
+        .unwrap();
+
+    let destination_root = unique_temp_path("connect-recursive-threaded-download");
+    let ssh = FakeCopySshClient::with_hostkey("fp-123")
+        .with_remote_directory("/remote/tree")
+        .with_remote_entries(
+            "/remote/tree",
+            vec![
+                RemoteDirectoryEntry {
+                    name: "small.txt".into(),
+                    file_type: RemoteFileType::File,
+                },
+                RemoteDirectoryEntry {
+                    name: "large.bin".into(),
+                    file_type: RemoteFileType::File,
+                },
+            ],
+        )
+        .with_remote_file("/remote/tree/small.txt", RemoteFileType::File, 5)
+        .with_remote_file(
+            "/remote/tree/large.bin",
+            RemoteFileType::File,
+            128 * 1024 * 1024,
+        );
+    let mut spec = parse_copy_spec(
+        "prod:/remote/tree",
+        destination_root.to_string_lossy().as_ref(),
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    spec.effective_threads = 4;
+
+    let summary = harness
+        .app()
+        .copy(&spec, &ssh, &FakePrompt::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.destination,
+        destination_root.join("tree").display().to_string()
+    );
+    assert!(ssh
+        .transfers()
+        .iter()
+        .any(
+            |(direction, _, remote)| *direction == CopyDirection::Download
+                && remote == "/remote/tree/small.txt"
+        ));
+    assert!(ssh
+        .download_ranges()
+        .iter()
+        .any(|(remote, _, range)| remote == "/remote/tree/large.bin" && range.start < range.end));
+
+    let _ = fs::remove_dir_all(destination_root);
+}
+
+fn unique_temp_path(prefix: &str) -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    let temp_root = std::env::temp_dir();
+    let process_id = std::process::id();
+
+    for _ in 0..1024 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = temp_root.join(format!("{prefix}-{process_id}-{id}"));
+
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("failed to create test temp dir {}: {error}", path.display()),
+        }
+    }
+
+    panic!("failed to allocate a unique temp dir for {prefix}");
+}
+
+fn profile_checkpoint_root(app_root: &Path, profile_name: &str) -> PathBuf {
+    let payload = format!(
+        "v1\0{}\0{}.example.com\0{}\0{}",
+        profile_name, profile_name, 22, "deploy"
+    );
+    AppPaths::from_root(app_root)
+        .copy_checkpoint_dir()
+        .join(format!("{:016x}", fnv1a64(payload.as_bytes())))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn break_database(root: &Path) {
+    let database_path = AppPaths::from_root(root).database_path;
+    fs::remove_file(&database_path).expect("database file should be removable");
+    fs::create_dir(&database_path).expect("database path should become a directory");
+}
+
+#[allow(dead_code)]
+fn _assert_path_exists(path: &Path) {
+    assert!(path.exists(), "expected path to exist: {}", path.display());
+}
+
+#[derive(Debug, Default)]
+struct DeleteFailsSecretStore;
+
+impl SecretStore for DeleteFailsSecretStore {
+    fn set_password(&self, _profile_name: &str, _password: &str) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_password(&self, _profile_name: &str) -> connect::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn set_private_key(&self, _profile_name: &str, _pem: &str) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_private_key(&self, _profile_name: &str) -> connect::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn set_key_passphrase(
+        &self,
+        _profile_name: &str,
+        _passphrase: &str,
+    ) -> connect::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_key_passphrase(&self, _profile_name: &str) -> connect::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn delete_profile_secrets(&self, _profile_name: &str) -> connect::error::Result<()> {
+        Err(Error::new("secret deletion failed"))
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailsOnKeyPassphraseSecretStore {
+    inner: MemorySecretStore,
+}
+
+impl SecretStore for FailsOnKeyPassphraseSecretStore {
+    fn set_password(&self, profile_name: &str, password: &str) -> connect::error::Result<()> {
+        self.inner.set_password(profile_name, password)
+    }
+
+    fn get_password(&self, profile_name: &str) -> connect::error::Result<Option<String>> {
+        self.inner.get_password(profile_name)
+    }
+
+    fn set_private_key(&self, profile_name: &str, pem: &str) -> connect::error::Result<()> {
+        self.inner.set_private_key(profile_name, pem)
+    }
+
+    fn get_private_key(&self, profile_name: &str) -> connect::error::Result<Option<String>> {
+        self.inner.get_private_key(profile_name)
+    }
+
+    fn set_key_passphrase(
+        &self,
+        _profile_name: &str,
+        _passphrase: &str,
+    ) -> connect::error::Result<()> {
+        Err(Error::new("key passphrase write failed"))
+    }
+
+    fn get_key_passphrase(&self, profile_name: &str) -> connect::error::Result<Option<String>> {
+        self.inner.get_key_passphrase(profile_name)
+    }
+
+    fn delete_profile_secrets(&self, profile_name: &str) -> connect::error::Result<()> {
+        self.inner.delete_profile_secrets(profile_name)
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailsOnKeyPassphraseAndDeleteSecretStore {
+    inner: MemorySecretStore,
+}
+
+impl SecretStore for FailsOnKeyPassphraseAndDeleteSecretStore {
+    fn set_password(&self, profile_name: &str, password: &str) -> connect::error::Result<()> {
+        self.inner.set_password(profile_name, password)
+    }
+
+    fn get_password(&self, profile_name: &str) -> connect::error::Result<Option<String>> {
+        self.inner.get_password(profile_name)
+    }
+
+    fn set_private_key(&self, profile_name: &str, pem: &str) -> connect::error::Result<()> {
+        self.inner.set_private_key(profile_name, pem)
+    }
+
+    fn get_private_key(&self, profile_name: &str) -> connect::error::Result<Option<String>> {
+        self.inner.get_private_key(profile_name)
+    }
+
+    fn set_key_passphrase(
+        &self,
+        _profile_name: &str,
+        _passphrase: &str,
+    ) -> connect::error::Result<()> {
+        Err(Error::new("key passphrase write failed"))
+    }
+
+    fn get_key_passphrase(&self, profile_name: &str) -> connect::error::Result<Option<String>> {
+        self.inner.get_key_passphrase(profile_name)
+    }
+
+    fn delete_profile_secrets(&self, _profile_name: &str) -> connect::error::Result<()> {
+        Err(Error::new("secret deletion failed"))
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakePrompt {
+    text: HashMap<String, String>,
+    secret: HashMap<String, String>,
+    confirm: HashMap<String, bool>,
+}
+
+impl FakePrompt {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_text(mut self, key: &str, value: &str) -> Self {
+        self.text.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    fn with_confirm(mut self, key: &str, value: bool) -> Self {
+        self.confirm.insert(key.to_string(), value);
+        self
+    }
+
+    fn with_secret(mut self, key: &str, value: &str) -> Self {
+        self.secret.insert(key.to_string(), value.to_string());
+        self
+    }
+}
+
+impl Prompt for FakePrompt {
+    fn prompt(
+        &self,
+        key: &str,
+        _message: &str,
+        _default: Option<&str>,
+    ) -> connect::error::Result<String> {
+        self.text
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Error::new(format!("missing text response for {key}")))
+    }
+
+    fn prompt_secret(&self, key: &str, _message: &str) -> connect::error::Result<Option<String>> {
+        Ok(self.secret.get(key).cloned())
+    }
+
+    fn confirm(&self, key: &str, _message: &str, _default: bool) -> connect::error::Result<bool> {
+        self.confirm
+            .get(key)
+            .copied()
+            .ok_or_else(|| Error::new(format!("missing confirm response for {key}")))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FakeConnectSshClient {
+    state: Arc<std::sync::Mutex<FakeConnectState>>,
+}
+
+#[derive(Debug, Clone)]
+struct FakeCopySshClient {
+    state: Arc<std::sync::Mutex<FakeCopyState>>,
+}
+
+#[derive(Debug, Clone)]
+struct FakeCopyState {
+    observed: ObservedHostKey,
+    auth_attempts: Vec<&'static str>,
+    agent_result: bool,
+    key_result: bool,
+    password_result: bool,
+    connect_limit: Option<usize>,
+    connect_attempts: usize,
+    fail_authentication_on_session: Option<usize>,
+    successful_authentications: usize,
+    transfer_readiness_fail_on_session: Option<usize>,
+    timeout_failure_on_session: Option<usize>,
+    upload_failures_remaining: usize,
+    upload_attempts: usize,
+    whole_file_failures: HashMap<String, Vec<InjectedCopyFailure>>,
+    remote_home: String,
+    remote_paths: HashMap<String, RemoteFileType>,
+    remote_sizes: HashMap<String, u64>,
+    remote_directories: HashMap<String, Vec<RemoteDirectoryEntry>>,
+    transfers: Vec<(CopyDirection, PathBuf, String)>,
+    upload_ranges: Vec<(PathBuf, String, ChunkRange)>,
+    download_ranges: Vec<(String, PathBuf, ChunkRange)>,
+    created_remote_dirs: Vec<String>,
+    event_log: Vec<String>,
+    transfer_options: Vec<connect::ssh::CopyTransferOptions>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectedCopyFailure {
+    Transient,
+    Fatal,
+}
+
+impl FakeCopySshClient {
+    fn with_hostkey(fingerprint: &str) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(FakeCopyState {
+                observed: ObservedHostKey {
+                    host: "prod.example.com".into(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".into(),
+                    fingerprint: fingerprint.into(),
+                    public_key: format!("public-key-{fingerprint}"),
+                },
+                auth_attempts: Vec::new(),
+                agent_result: false,
+                key_result: true,
+                password_result: true,
+                connect_limit: None,
+                connect_attempts: 0,
+                fail_authentication_on_session: None,
+                successful_authentications: 0,
+                transfer_readiness_fail_on_session: None,
+                timeout_failure_on_session: None,
+                upload_failures_remaining: 0,
+                upload_attempts: 0,
+                whole_file_failures: HashMap::new(),
+                remote_home: "/home/deploy".into(),
+                remote_paths: HashMap::new(),
+                remote_sizes: HashMap::new(),
+                remote_directories: HashMap::new(),
+                transfers: Vec::new(),
+                upload_ranges: Vec::new(),
+                download_ranges: Vec::new(),
+                created_remote_dirs: Vec::new(),
+                event_log: Vec::new(),
+                transfer_options: Vec::new(),
+            })),
+        }
+    }
+
+    fn key_rejected_then_password_succeeds() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().key_result = false;
+        client
+    }
+
+    fn with_connect_limit(limit: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().connect_limit = Some(limit);
+        client
+    }
+
+    fn without_random_access_support() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client
+            .state
+            .lock()
+            .unwrap()
+            .transfer_readiness_fail_on_session = Some(1);
+        client
+    }
+
+    fn transfer_readiness_fails_on_session(session: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client
+            .state
+            .lock()
+            .unwrap()
+            .transfer_readiness_fail_on_session = Some(session);
+        client
+    }
+
+    fn authentication_fails_on_session(session: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().fail_authentication_on_session = Some(session);
+        client
+    }
+
+    fn timeout_failure_on_session(session: usize) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().timeout_failure_on_session = Some(session);
+        client
+    }
+
+    fn single_session_with_transient_failure() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        let mut state = client.state.lock().unwrap();
+        state.connect_limit = Some(1);
+        state.upload_failures_remaining = 1;
+        drop(state);
+        client
+    }
+
+    fn with_remote_directory(self, path: &str) -> Self {
+        let client = self;
+        client
+            .state
+            .lock()
+            .unwrap()
+            .remote_paths
+            .insert(path.into(), RemoteFileType::Directory);
+        client
+    }
+
+    fn auth_attempts(&self) -> Vec<&'static str> {
+        self.state.lock().unwrap().auth_attempts.clone()
+    }
+
+    fn transfers(&self) -> Vec<(CopyDirection, PathBuf, String)> {
+        self.state.lock().unwrap().transfers.clone()
+    }
+
+    fn upload_ranges(&self) -> Vec<(PathBuf, String, ChunkRange)> {
+        self.state.lock().unwrap().upload_ranges.clone()
+    }
+
+    fn download_ranges(&self) -> Vec<(String, PathBuf, ChunkRange)> {
+        self.state.lock().unwrap().download_ranges.clone()
+    }
+
+    fn event_log(&self) -> Vec<String> {
+        self.state.lock().unwrap().event_log.clone()
+    }
+
+    fn transfer_options(&self) -> Vec<connect::ssh::CopyTransferOptions> {
+        self.state.lock().unwrap().transfer_options.clone()
+    }
+
+    fn connect_attempts(&self) -> usize {
+        self.state.lock().unwrap().connect_attempts
+    }
+
+    fn upload_attempts(&self) -> usize {
+        self.state.lock().unwrap().upload_attempts
+    }
+
+    fn with_remote_file(self, path: &str, file_type: RemoteFileType, size: u64) -> Self {
+        let client = self;
+        {
+            let mut state = client.state.lock().unwrap();
+            state.remote_paths.insert(path.into(), file_type);
+            state.remote_sizes.insert(path.into(), size);
+        }
+        client
+    }
+
+    fn with_remote_home(self, remote_home: &str) -> Self {
+        let client = self;
+        client.state.lock().unwrap().remote_home = remote_home.into();
+        client
+    }
+
+    fn with_remote_entries(self, path: &str, entries: Vec<RemoteDirectoryEntry>) -> Self {
+        let client = self;
+        client
+            .state
+            .lock()
+            .unwrap()
+            .remote_directories
+            .insert(path.into(), entries);
+        client
+    }
+
+    fn with_whole_file_failure(self, remote_path: &str, failure: InjectedCopyFailure) -> Self {
+        let client = self;
+        client
+            .state
+            .lock()
+            .unwrap()
+            .whole_file_failures
+            .entry(remote_path.into())
+            .or_default()
+            .push(failure);
+        client
+    }
+}
+
+impl SshClient for FakeCopySshClient {
+    fn connect<'a>(
+        &'a self,
+        _profile: &'a connect::store::Profile,
+        _expected_host_key: Option<&'a connect::store::HostKeyRecord>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<Box<dyn SshSession + Send + 'static>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let outcome = {
+            let mut state = self.state.lock().unwrap();
+            state.connect_attempts += 1;
+            if state.timeout_failure_on_session == Some(state.connect_attempts) {
+                return Box::pin(async move {
+                    Err(connect::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out while opening ssh session",
+                    )))
+                });
+            }
+            match state.connect_limit {
+                Some(limit) if state.connect_attempts > limit => {
+                    Err(Error::new("ssh error: too many concurrent sessions"))
+                }
+                _ => Ok(Arc::clone(&self.state)),
+            }
+        };
+        Box::pin(async move {
+            let state = outcome?;
+            Ok(Box::new(FakeCopySession { state }) as Box<dyn SshSession + Send>)
+        })
+    }
+}
+
+struct FakeCopySession {
+    state: Arc<std::sync::Mutex<FakeCopyState>>,
+}
+
+impl SshSession for FakeCopySession {
+    fn observe_host_key<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<ObservedHostKey>> + Send + 'a>> {
+        let observed = self.state.lock().unwrap().observed.clone();
+        Box::pin(async move { Ok(observed) })
+    }
+
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        _username: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("agent");
+            state.agent_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn authenticate_public_key<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _private_key: &'a str,
+        _passphrase: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("key");
+            state.key_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn authenticate_password<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _password: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("password");
+            let session_index = state.successful_authentications + 1;
+            if state.fail_authentication_on_session == Some(session_index) {
+                false
+            } else {
+                if state.password_result {
+                    state.successful_authentications += 1;
+                }
+                state.password_result
+            }
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn open_shell<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u32>> + Send + 'a>> {
+        Box::pin(async move { Ok(0) })
+    }
+
+    fn remote_file_type<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<RemoteFileType>>> + Send + 'a>>
+    {
+        let file_type = self.state.lock().unwrap().remote_paths.get(path).copied();
+        Box::pin(async move { Ok(file_type) })
+    }
+
+    fn remote_file_metadata<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<CopyFileMetadata>>> + Send + 'a>>
+    {
+        let metadata = self
+            .state
+            .lock()
+            .unwrap()
+            .remote_sizes
+            .get(path)
+            .copied()
+            .map(|size| CopyFileMetadata::new(size, Some(1_700_000_000)));
+        Box::pin(async move { Ok(metadata) })
+    }
+
+    fn resolve_remote_path<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<String>> + Send + 'a>> {
+        let remote_home = self.state.lock().unwrap().remote_home.clone();
+        Box::pin(async move {
+            if path == "~" || path == "~/" {
+                Ok(remote_home)
+            } else if let Some(suffix) = path.strip_prefix("~/") {
+                Ok(format!(
+                    "{}/{}",
+                    remote_home.trim_end_matches('/'),
+                    suffix.trim_start_matches('/')
+                ))
+            } else {
+                Ok(path.to_string())
+            }
+        })
+    }
+
+    fn supports_parallel_random_access<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<bool>> + Send + 'a>> {
+        let supported = {
+            let state = self.state.lock().unwrap();
+            let session_index = state.successful_authentications;
+            state.transfer_readiness_fail_on_session != Some(session_index)
+        };
+        Box::pin(async move {
+            if supported {
+                Ok(true)
+            } else {
+                Err(Error::new("sftp subsystem initialization failed"))
+            }
+        })
+    }
+
+    fn remote_file_size<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Option<u64>>> + Send + 'a>> {
+        let size = self.state.lock().unwrap().remote_sizes.get(path).copied();
+        Box::pin(async move { Ok(size) })
+    }
+
+    fn read_remote_dir<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<Vec<RemoteDirectoryEntry>>> + Send + 'a>>
+    {
+        let entries = self
+            .state
+            .lock()
+            .unwrap()
+            .remote_directories
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(entries) })
+    }
+
+    fn create_remote_dir_all<'a>(
+        &'a mut self,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        let mut state = self.state.lock().unwrap();
+        state.created_remote_dirs.push(path.to_string());
+        state.event_log.push(format!("mkdir:{path}"));
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn prepare_remote_file_destination<'a>(
+        &'a mut self,
+        path: &'a str,
+        _truncate: bool,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<()>> + Send + 'a>> {
+        self.state
+            .lock()
+            .unwrap()
+            .remote_paths
+            .insert(path.to_string(), RemoteFileType::File);
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn upload_file<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+        options: connect::ssh::CopyTransferOptions,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let failure_message = {
+            let mut state = self.state.lock().unwrap();
+            state.upload_attempts += 1;
+            state.transfers.push((
+                CopyDirection::Upload,
+                local_path.to_path_buf(),
+                remote_path.into(),
+            ));
+            state.event_log.push(format!("upload:{remote_path}"));
+            state.transfer_options.push(options);
+            if let Some(failures) = state.whole_file_failures.get_mut(remote_path) {
+                if !failures.is_empty() {
+                    Some(match failures.remove(0) {
+                        InjectedCopyFailure::Transient => "ssh error: transient upload failure",
+                        InjectedCopyFailure::Fatal => "ssh error: fatal upload failure",
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(message) = failure_message {
+            return Box::pin(async move { Err(Error::new(message)) });
+        }
+        let outcome: connect::error::Result<u64> = {
+            let mut state = self.state.lock().unwrap();
+            if state.upload_failures_remaining > 0 {
+                state.upload_failures_remaining -= 1;
+                Err(Error::new("ssh error: transient upload failure"))
+            } else {
+                let bytes_copied = std::fs::metadata(local_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                Ok(bytes_copied)
+            }
+        };
+        Box::pin(async move {
+            let bytes_copied = outcome?;
+            Ok(connect::ssh::CopyTransferResult {
+                bytes_copied: bytes_copied.saturating_sub(options.resume_offset),
+                resumed_bytes: options.resume_offset,
+            })
+        })
+    }
+
+    fn download_file<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        options: connect::ssh::CopyTransferOptions,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = connect::error::Result<connect::ssh::CopyTransferResult>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let mut state = self.state.lock().unwrap();
+        state.transfers.push((
+            CopyDirection::Download,
+            local_path.to_path_buf(),
+            remote_path.into(),
+        ));
+        state.event_log.push(format!("download:{remote_path}"));
+        state.transfer_options.push(options);
+        let bytes_copied = state.remote_sizes.get(remote_path).copied().unwrap_or(0);
+        Box::pin(async move {
+            Ok(connect::ssh::CopyTransferResult {
+                bytes_copied: bytes_copied.saturating_sub(options.resume_offset),
+                resumed_bytes: options.resume_offset,
+            })
+        })
+    }
+
+    fn upload_file_range<'a>(
+        &'a mut self,
+        local_path: &'a Path,
+        remote_path: &'a str,
+        range: ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u64>> + Send + 'a>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .upload_ranges
+            .push((local_path.to_path_buf(), remote_path.to_string(), range));
+        state.event_log.push(format!(
+            "upload-range:{remote_path}:{}-{}",
+            range.start, range.end
+        ));
+        Box::pin(async move { Ok(range.end.saturating_sub(range.start)) })
+    }
+
+    fn download_file_range<'a>(
+        &'a mut self,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        range: ChunkRange,
+    ) -> Pin<Box<dyn Future<Output = connect::error::Result<u64>> + Send + 'a>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .download_ranges
+            .push((remote_path.to_string(), local_path.to_path_buf(), range));
+        state.event_log.push(format!(
+            "download-range:{remote_path}:{}-{}",
+            range.start, range.end
+        ));
+        Box::pin(async move { Ok(range.end.saturating_sub(range.start)) })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FakeConnectState {
+    observed: ObservedHostKey,
+    auth_attempts: Vec<&'static str>,
+    agent_result: bool,
+    key_result: bool,
+    password_result: bool,
+    shell_opened: bool,
+    exit_status: u32,
+    exec_status: u32,
+    executed_command: Option<(String, bool)>,
+    disconnect_pending: bool,
+}
+
+impl FakeConnectSshClient {
+    fn with_hostkey(fingerprint: &str) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(FakeConnectState {
+                observed: ObservedHostKey {
+                    host: "prod.example.com".into(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".into(),
+                    fingerprint: fingerprint.into(),
+                    public_key: format!("public-key-{fingerprint}"),
+                },
+                auth_attempts: Vec::new(),
+                agent_result: false,
+                key_result: true,
+                password_result: true,
+                shell_opened: false,
+                exit_status: 0,
+                exec_status: 0,
+                executed_command: None,
+                disconnect_pending: false,
+            })),
+        }
+    }
+
+    fn key_rejected_then_password_succeeds() -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(FakeConnectState {
+                observed: ObservedHostKey {
+                    host: "prod.example.com".into(),
+                    port: 22,
+                    algorithm: "ssh-ed25519".into(),
+                    fingerprint: "fp-123".into(),
+                    public_key: "public-key-fp-123".into(),
+                },
+                auth_attempts: Vec::new(),
+                agent_result: false,
+                key_result: false,
+                password_result: true,
+                shell_opened: false,
+                exit_status: 0,
+                exec_status: 0,
+                executed_command: None,
+                disconnect_pending: false,
+            })),
+        }
+    }
+
+    fn agent_succeeds() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().agent_result = true;
+        client
+    }
+
+    fn with_exit_status(exit_status: u32) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().exit_status = exit_status;
+        client
+    }
+
+    fn with_exec_exit_status(exit_status: u32) -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().exec_status = exit_status;
+        client
+    }
+
+    fn with_pending_disconnect() -> Self {
+        let client = Self::with_hostkey("fp-123");
+        client.state.lock().unwrap().disconnect_pending = true;
+        client
+    }
+
+    fn auth_attempts(&self) -> Vec<&'static str> {
+        self.state.lock().unwrap().auth_attempts.clone()
+    }
+
+    fn executed_command(&self) -> Option<(String, bool)> {
+        self.state.lock().unwrap().executed_command.clone()
+    }
+}
+
+impl SshClient for FakeConnectSshClient {
+    fn connect<'a>(
+        &'a self,
+        _profile: &'a connect::store::Profile,
+        _expected_host_key: Option<&'a connect::store::HostKeyRecord>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = connect::error::Result<Box<dyn SshSession + Send + 'static>>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let state = Arc::clone(&self.state);
+        Box::pin(
+            async move { Ok(Box::new(FakeConnectSession { state }) as Box<dyn SshSession + Send>) },
+        )
+    }
+}
+
+struct FakeConnectSession {
+    state: Arc<std::sync::Mutex<FakeConnectState>>,
+}
+
+impl SshSession for FakeConnectSession {
+    fn observe_host_key<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<ObservedHostKey>> + Send + 'a>,
+    > {
+        let observed = self.state.lock().unwrap().observed.clone();
+        Box::pin(async move { Ok(observed) })
+    }
+
+    fn authenticate_agent<'a>(
+        &'a mut self,
+        _username: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>,
+    > {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("agent");
+            state.agent_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn authenticate_public_key<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _private_key: &'a str,
+        _passphrase: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>,
+    > {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("key");
+            state.key_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn authenticate_password<'a>(
+        &'a mut self,
+        _username: &'a str,
+        _password: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = connect::error::Result<bool>> + Send + 'a>,
+    > {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.auth_attempts.push("password");
+            state.password_result
+        };
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn open_shell<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<u32>> + Send + 'a>>
+    {
+        let exit_status = {
+            let mut state = self.state.lock().unwrap();
+            state.shell_opened = true;
+            state.exit_status
+        };
+        Box::pin(async move { Ok(exit_status) })
+    }
+
+    fn execute_command<'a>(
+        &'a mut self,
+        spec: &'a ExecSpec,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<u32>> + Send + 'a>>
+    {
+        let exit_status = {
+            let mut state = self.state.lock().unwrap();
+            state.executed_command = Some((spec.command_line().unwrap(), spec.pty));
+            state.exec_status
+        };
+        Box::pin(async move { Ok(exit_status) })
+    }
+
+    fn disconnect<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = connect::error::Result<()>> + Send + 'a>>
+    {
+        let disconnect_pending = self.state.lock().unwrap().disconnect_pending;
+        Box::pin(async move {
+            if disconnect_pending {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+struct TestKey {
+    path: PathBuf,
+    contents: &'static str,
+}
+
+struct TestFile {
+    path: PathBuf,
+}
+
+impl TestFile {
+    fn write_temp(name: &str, contents: &str) -> Self {
+        let root = unique_temp_path("connect-test-file");
+        let path = root.join(name);
+        std::fs::write(&path, contents).expect("test file should be written");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestFile {
+    fn drop(&mut self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+}
+
+impl TestKey {
+    fn write_temp_pem() -> Self {
+        let root = unique_temp_path("connect-test-key");
+        let path = root.join("id_rsa");
+        let contents = "-----BEGIN TEST PRIVATE KEY-----\nabc123\n-----END TEST PRIVATE KEY-----\n";
+        std::fs::write(&path, contents).expect("test private key should be written");
+
+        Self { path, contents }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn contents(&self) -> &str {
+        self.contents
+    }
+}
+
+impl Drop for TestKey {
+    fn drop(&mut self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+}

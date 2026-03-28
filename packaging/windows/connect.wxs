@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="connect"
+    Manufacturer="connect"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="8dcf49a4-8d7f-4f95-8ed3-7a9aa69f9c21"
+    Scope="perMachine"
+    Compressed="yes"
+    InstallerVersion="500">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of connect is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="connect">
+        <Component Id="ConnectBinary" Guid="*">
+          <File Id="ConnectExe" Source="!(bindpath.SourceDir)\connect.exe" KeyPath="yes" />
+          <Environment
+            Id="ConnectPath"
+            Name="PATH"
+            Action="set"
+            Part="last"
+            Permanent="no"
+            System="yes"
+            Value="[INSTALLFOLDER]" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="connect" Level="1">
+      <ComponentRef Id="ConnectBinary" />
+    </Feature>
+  </Package>
+</Wix>
