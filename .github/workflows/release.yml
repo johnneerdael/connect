@@ -48,6 +48,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
+        shell: bash
         env:
           CONNECT_ARCHIVE_APP_KEY_HEX: ${{ secrets.CONNECT_ARCHIVE_APP_KEY_HEX }}
         run: |
