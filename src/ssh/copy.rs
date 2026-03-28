@@ -443,9 +443,8 @@ fn validate_planning_endpoints(spec: &CopySpec) -> Result<CopyDirection> {
     }
 }
 
-fn build_chunk_ranges(size: u64, effective_threads: usize) -> Vec<ChunkRange> {
-    let chunk_count = effective_threads
-        .min(usize::try_from(size.div_ceil(STRIPE_THRESHOLD_BYTES)).unwrap_or(usize::MAX));
+fn build_chunk_ranges(size: u64, _effective_threads: usize) -> Vec<ChunkRange> {
+    let chunk_count = usize::try_from(size.div_ceil(STRIPE_THRESHOLD_BYTES)).unwrap_or(usize::MAX);
     let chunk_count = chunk_count.max(1);
     let chunk_count_u64 = chunk_count as u64;
     let base = size / chunk_count_u64;

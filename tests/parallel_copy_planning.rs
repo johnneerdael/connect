@@ -137,6 +137,39 @@ fn planner_stripes_large_single_file_when_threads_exceed_one() {
 }
 
 #[test]
+fn planner_splits_large_threaded_files_into_many_work_chunks() {
+    let spec = single_file_spec(true);
+    let effective_threads = 8;
+
+    let plan = plan_copy(
+        spec,
+        CopyPlannerConfig {
+            effective_threads,
+            retry: true,
+        },
+        recursive_destination(false),
+        single_file_source(10 * 1024 * 1024 * 1024),
+    )
+    .unwrap();
+
+    let chunks = match &plan.jobs[..] {
+        [CopyJob::StripedFile { chunks, .. }] => chunks,
+        _ => panic!("expected exactly one striped job"),
+    };
+
+    assert!(
+        chunks.len() > effective_threads,
+        "expected more work chunks than workers for long-running progress updates"
+    );
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk.end.saturating_sub(chunk.start) <= 64 * 1024 * 1024),
+        "expected planner to keep striped work chunks at or below the stripe threshold"
+    );
+}
+
+#[test]
 fn planner_mixes_file_queue_and_striped_large_files_for_recursive_trees() {
     let plan = plan_copy(
         recursive_tree_spec(),
