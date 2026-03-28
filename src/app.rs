@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -6,12 +7,17 @@ use std::{
 
 use clap::Parser;
 use directories::ProjectDirs;
+use rusqlite::params;
 
 use crate::{
+    archive::{
+        BackupForwardRecord, BackupHostKeyRecord, BackupPayload, BackupProfileRecord,
+        ProfileExportPayload, ProfileSecretRecord,
+    },
     cli::{
         commands::{
-            add, completion, copy, doctor, edit, exec, forward, hostkeys, list, open, remove, show,
-            version,
+            add, backup, completion, copy, doctor, edit, exec, forward, hostkeys, list, open,
+            profile, remove, show, version,
         },
         Cli, Command, HostkeysCommand,
     },
@@ -95,6 +101,7 @@ impl AppPaths {
 
 pub struct App {
     paths: AppPaths,
+    database: Database,
     profile_store: ProfileStore,
     forward_store: ForwardStore,
     hostkey_store: HostKeyStore,
@@ -153,6 +160,7 @@ impl App {
 
         Ok(Self {
             paths,
+            database: database.clone(),
             profile_store: ProfileStore::new(database.clone()),
             forward_store: ForwardStore::new(database.clone()),
             hostkey_store: HostKeyStore::new(database),
@@ -282,6 +290,173 @@ impl App {
 
     pub fn list_host_keys(&self) -> Result<Vec<crate::store::HostKeyRecord>> {
         self.hostkey_store.list()
+    }
+
+    pub fn create_backup_snapshot(&self) -> Result<BackupPayload> {
+        let profiles = self.list_profiles()?;
+        let mut forwards = Vec::new();
+        let mut secret_bundles = Vec::new();
+
+        for profile in &profiles {
+            forwards.extend(
+                self.list_forwards(&profile.name)?
+                    .into_iter()
+                    .map(|definition| BackupForwardRecord {
+                        profile_name: definition.profile_name,
+                        name: definition.name,
+                        kind: definition.kind.as_str().to_string(),
+                        bind_host: definition.bind_host,
+                        bind_port: definition.bind_port,
+                        target_host: definition.target_host,
+                        target_port: definition.target_port,
+                        description: definition.description,
+                    }),
+            );
+
+            if let Some(bundle) = self.secrets.get_profile_secrets(&profile.name)? {
+                secret_bundles.push(ProfileSecretRecord {
+                    profile_name: profile.name.clone(),
+                    bundle,
+                });
+            }
+        }
+
+        let host_keys = self
+            .list_host_keys()?
+            .into_iter()
+            .map(|record| BackupHostKeyRecord {
+                host: record.host,
+                port: record.port,
+                algorithm: record.algorithm,
+                fingerprint: record.fingerprint,
+                public_key: record.public_key,
+                accepted_at: record.accepted_at,
+            })
+            .collect();
+
+        Ok(BackupPayload {
+            profiles: profiles.into_iter().map(BackupProfileRecord::from).collect(),
+            forwards,
+            host_keys,
+            secret_bundles,
+        })
+    }
+
+    pub fn create_profile_export_snapshot(&self, profile_name: &str) -> Result<ProfileExportPayload> {
+        let profile = self.get_profile(profile_name)?;
+        let secret_bundle = self
+            .secrets
+            .get_profile_secrets(profile_name)?
+            .unwrap_or_default();
+
+        Ok(ProfileExportPayload {
+            profile: profile.into(),
+            forwards: self
+                .list_forwards(profile_name)?
+                .into_iter()
+                .map(|definition| BackupForwardRecord {
+                    profile_name: definition.profile_name,
+                    name: definition.name,
+                    kind: definition.kind.as_str().to_string(),
+                    bind_host: definition.bind_host,
+                    bind_port: definition.bind_port,
+                    target_host: definition.target_host,
+                    target_port: definition.target_port,
+                    description: definition.description,
+                })
+                .collect(),
+            secret_bundle,
+        })
+    }
+
+    pub fn restore_backup_snapshot(&self, payload: BackupPayload) -> Result<()> {
+        validate_backup_payload(&payload)?;
+
+        let existing_profile_names = self
+            .list_profiles()?
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
+        let existing_secret_snapshots = capture_secret_snapshots(&*self.secrets, &existing_profile_names)?;
+
+        let replacement_secret_names = payload
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        let replacement_secret_map = payload
+            .secret_bundles
+            .iter()
+            .map(|record| (record.profile_name.clone(), record.bundle.clone()))
+            .collect::<HashMap<_, _>>();
+        let touched_secret_names = existing_profile_names
+            .iter()
+            .cloned()
+            .chain(replacement_secret_names.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM host_keys", [])?;
+        transaction.execute("DELETE FROM profiles", [])?;
+
+        for profile in &payload.profiles {
+            insert_backup_profile(&transaction, profile)?;
+        }
+        for forward in &payload.forwards {
+            insert_backup_forward(&transaction, forward)?;
+        }
+        for host_key in &payload.host_keys {
+            insert_backup_host_key(&transaction, host_key)?;
+        }
+
+        if let Err(error) = apply_secret_state(
+            &*self.secrets,
+            &touched_secret_names,
+            &replacement_secret_map,
+        ) {
+            restore_secret_snapshots(&*self.secrets, &touched_secret_names, &existing_secret_snapshots)?;
+            return Err(error);
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn import_profile_snapshot(&self, payload: ProfileExportPayload) -> Result<Profile> {
+        validate_profile_export_payload(&payload)?;
+
+        let profile_name = payload.profile.name.clone();
+        let previous_bundle = self.secrets.get_profile_secrets(&profile_name)?;
+
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction()?;
+        insert_backup_profile(&transaction, &payload.profile)?;
+        transaction.execute(
+            "DELETE FROM forward_definitions WHERE profile_name = ?1",
+            params![&profile_name],
+        )?;
+        for forward in &payload.forwards {
+            insert_backup_forward(&transaction, forward)?;
+        }
+
+        let mut replacement_secret_map = HashMap::new();
+        replacement_secret_map.insert(profile_name.clone(), payload.secret_bundle.clone());
+        if let Err(error) =
+            apply_secret_state(&*self.secrets, std::slice::from_ref(&profile_name), &replacement_secret_map)
+        {
+            restore_secret_snapshots(
+                &*self.secrets,
+                std::slice::from_ref(&profile_name),
+                &HashMap::from([(profile_name.clone(), previous_bundle)]),
+            )?;
+            return Err(error);
+        }
+
+        transaction.commit()?;
+        self.get_profile(&profile_name)
     }
 
     pub fn delete_host_key_by_id(&self, id: i64) -> Result<bool> {
@@ -478,6 +653,208 @@ impl SshConnectionContext for App {
     }
 }
 
+impl From<crate::store::Profile> for BackupProfileRecord {
+    fn from(profile: crate::store::Profile) -> Self {
+        Self {
+            name: profile.name,
+            host: profile.host,
+            port: profile.port,
+            username: profile.username,
+            auth_mode: profile.auth_mode.as_str().to_string(),
+            copy_threads: profile.copy_threads,
+            has_password: profile.has_password,
+            has_private_key: profile.has_private_key,
+            has_key_passphrase: profile.has_key_passphrase,
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+        }
+    }
+}
+
+fn validate_backup_payload(payload: &BackupPayload) -> Result<()> {
+    let profile_names = payload
+        .profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect::<HashSet<_>>();
+    if profile_names.len() != payload.profiles.len() {
+        return Err(Error::new("backup payload contains duplicate profile names"));
+    }
+
+    let forward_keys = payload
+        .forwards
+        .iter()
+        .map(|forward| (forward.profile_name.as_str(), forward.name.as_str()))
+        .collect::<HashSet<_>>();
+    if forward_keys.len() != payload.forwards.len() {
+        return Err(Error::new("backup payload contains duplicate forward definitions"));
+    }
+
+    if payload
+        .forwards
+        .iter()
+        .any(|forward| !profile_names.contains(forward.profile_name.as_str()))
+    {
+        return Err(Error::new("backup payload contains a forward for an unknown profile"));
+    }
+
+    if payload
+        .secret_bundles
+        .iter()
+        .any(|secret| !profile_names.contains(secret.profile_name.as_str()))
+    {
+        return Err(Error::new("backup payload contains secrets for an unknown profile"));
+    }
+
+    Ok(())
+}
+
+fn validate_profile_export_payload(payload: &ProfileExportPayload) -> Result<()> {
+    if payload
+        .forwards
+        .iter()
+        .any(|forward| forward.profile_name != payload.profile.name)
+    {
+        return Err(Error::new(
+            "profile export payload contains a forward for a different profile",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_backup_profile(
+    transaction: &rusqlite::Transaction<'_>,
+    profile: &BackupProfileRecord,
+) -> Result<()> {
+    let auth_mode = profile
+        .auth_mode
+        .parse::<crate::store::AuthMode>()
+        .map_err(Error::new)?;
+    transaction.execute(
+        "
+        INSERT INTO profiles (
+            name, host, port, username, auth_mode, copy_threads, has_password, has_private_key, has_key_passphrase, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(name) DO UPDATE SET
+            host = excluded.host,
+            port = excluded.port,
+            username = excluded.username,
+            auth_mode = excluded.auth_mode,
+            copy_threads = excluded.copy_threads,
+            has_password = excluded.has_password,
+            has_private_key = excluded.has_private_key,
+            has_key_passphrase = excluded.has_key_passphrase,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            &profile.name,
+            &profile.host,
+            i64::from(profile.port),
+            &profile.username,
+            auth_mode.as_str(),
+            i64::try_from(profile.copy_threads).expect("copy_threads should fit in i64"),
+            profile.has_password,
+            profile.has_private_key,
+            profile.has_key_passphrase,
+            &profile.created_at,
+            &profile.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_backup_forward(
+    transaction: &rusqlite::Transaction<'_>,
+    forward: &BackupForwardRecord,
+) -> Result<()> {
+    let kind = forward
+        .kind
+        .parse::<crate::store::ForwardKind>()
+        .map_err(Error::new)?;
+    transaction.execute(
+        "
+        INSERT INTO forward_definitions (
+            profile_name, name, kind, bind_host, bind_port, target_host, target_port, description
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            &forward.profile_name,
+            &forward.name,
+            kind.as_str(),
+            &forward.bind_host,
+            i64::from(forward.bind_port),
+            forward.target_host.as_deref(),
+            forward.target_port.map(i64::from),
+            forward.description.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_backup_host_key(
+    transaction: &rusqlite::Transaction<'_>,
+    host_key: &BackupHostKeyRecord,
+) -> Result<()> {
+    transaction.execute(
+        "
+        INSERT INTO host_keys (host, port, algorithm, fingerprint, public_key, accepted_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+        params![
+            &host_key.host,
+            i64::from(host_key.port),
+            &host_key.algorithm,
+            &host_key.fingerprint,
+            &host_key.public_key,
+            &host_key.accepted_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn capture_secret_snapshots(
+    secrets: &dyn SecretStore,
+    profile_names: &[String],
+) -> Result<HashMap<String, Option<crate::secrets::SecretBundle>>> {
+    profile_names
+        .iter()
+        .map(|name| Ok((name.clone(), secrets.get_profile_secrets(name)?)))
+        .collect()
+}
+
+fn apply_secret_state(
+    secrets: &dyn SecretStore,
+    touched_names: &[String],
+    replacement_map: &HashMap<String, crate::secrets::SecretBundle>,
+) -> Result<()> {
+    for name in touched_names {
+        secrets.delete_profile_secrets(name)?;
+    }
+    for name in touched_names {
+        if let Some(bundle) = replacement_map.get(name) {
+            secrets.set_profile_secrets(name, bundle)?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_secret_snapshots(
+    secrets: &dyn SecretStore,
+    touched_names: &[String],
+    snapshots: &HashMap<String, Option<crate::secrets::SecretBundle>>,
+) -> Result<()> {
+    for name in touched_names {
+        secrets.delete_profile_secrets(name)?;
+    }
+    for name in touched_names {
+        if let Some(Some(bundle)) = snapshots.get(name) {
+            secrets.set_profile_secrets(name, bundle)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let prompt = StdioPrompt::new();
@@ -487,6 +864,11 @@ pub fn run() -> Result<()> {
         Some(Command::Add(args)) => {
             let app = App::load()?;
             add::run(&app, &prompt, &args, &mut stdout)
+        }
+        Some(Command::Backup(args)) => {
+            let app = App::load()?;
+            let command = args.command;
+            backup::run(&app, &prompt, &command, &mut stdout)
         }
         Some(Command::Doctor(args)) => {
             let report = doctor::run(&args, &mut stdout)?;
@@ -514,6 +896,11 @@ pub fn run() -> Result<()> {
         Some(Command::Show(args)) => {
             let app = App::load()?;
             show::run(&app, &args, &mut stdout)
+        }
+        Some(Command::Profile(args)) => {
+            let app = App::load()?;
+            let command = args.command;
+            profile::run(&app, &prompt, &command, &mut stdout)
         }
         Some(Command::Open(args)) => {
             let app = App::load()?;

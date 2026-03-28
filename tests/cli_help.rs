@@ -1,7 +1,7 @@
 use assert_cmd::Command as AssertCommand;
 use clap::Parser;
 
-use connect::cli::{Cli, Command as CliCommand, ForwardCommand};
+use connect::cli::{BackupCommand, Cli, Command as CliCommand, ForwardCommand, ProfileCommand};
 
 fn connect_test_bin() -> AssertCommand {
     AssertCommand::cargo_bin("connect").expect("binary should build")
@@ -32,7 +32,9 @@ fn root_help_lists_doctor_and_forward_commands() {
         .assert()
         .success()
         .stdout(predicates::str::contains("doctor"))
-        .stdout(predicates::str::contains("forward"));
+        .stdout(predicates::str::contains("forward"))
+        .stdout(predicates::str::contains("backup"))
+        .stdout(predicates::str::contains("profile"));
 }
 
 #[test]
@@ -214,6 +216,65 @@ fn copy_help_lists_threads_and_retry_flags() {
         .success()
         .stdout(predicates::str::contains("--threads"))
         .stdout(predicates::str::contains("--retry"));
+}
+
+#[test]
+fn backup_create_and_restore_parse_explicit_subcommands() {
+    let create = parse_cli(&["connect", "backup", "create", "--output", "state.connectbak"]);
+    match create.command {
+        Some(CliCommand::Backup(args)) => match args.command {
+            BackupCommand::Create(args) => {
+                assert_eq!(args.output.to_string_lossy(), "state.connectbak");
+            }
+            other => panic!("expected backup create command, got {other:?}"),
+        },
+        other => panic!("expected backup command, got {other:?}"),
+    }
+
+    let restore = parse_cli(&["connect", "backup", "restore", "--input", "state.connectbak"]);
+    match restore.command {
+        Some(CliCommand::Backup(args)) => match args.command {
+            BackupCommand::Restore(args) => {
+                assert_eq!(args.input.to_string_lossy(), "state.connectbak");
+                assert!(!args.yes);
+            }
+            other => panic!("expected backup restore command, got {other:?}"),
+        },
+        other => panic!("expected backup command, got {other:?}"),
+    }
+}
+
+#[test]
+fn profile_export_and_import_parse_explicit_subcommands() {
+    let export = parse_cli(&[
+        "connect",
+        "profile",
+        "export",
+        "prod",
+        "--output",
+        "prod.connectprofile",
+    ]);
+    match export.command {
+        Some(CliCommand::Profile(args)) => match args.command {
+            ProfileCommand::Export(args) => {
+                assert_eq!(args.name, "prod");
+                assert_eq!(args.output.to_string_lossy(), "prod.connectprofile");
+            }
+            other => panic!("expected profile export command, got {other:?}"),
+        },
+        other => panic!("expected profile command, got {other:?}"),
+    }
+
+    let import = parse_cli(&["connect", "profile", "import", "--input", "prod.connectprofile"]);
+    match import.command {
+        Some(CliCommand::Profile(args)) => match args.command {
+            ProfileCommand::Import(args) => {
+                assert_eq!(args.input.to_string_lossy(), "prod.connectprofile");
+            }
+            other => panic!("expected profile import command, got {other:?}"),
+        },
+        other => panic!("expected profile command, got {other:?}"),
+    }
 }
 
 #[test]

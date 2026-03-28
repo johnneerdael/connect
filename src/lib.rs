@@ -1,4 +1,5 @@
 pub mod app;
+pub mod archive;
 pub mod cli;
 pub mod doctor;
 pub mod error;

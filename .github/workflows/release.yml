@@ -48,7 +48,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        env:
+          CONNECT_ARCHIVE_APP_KEY_HEX: ${{ secrets.CONNECT_ARCHIVE_APP_KEY_HEX }}
+        run: |
+          if [ -z "${CONNECT_ARCHIVE_APP_KEY_HEX:-}" ]; then
+            echo "CONNECT_ARCHIVE_APP_KEY_HEX is required for release builds" >&2
+            exit 1
+          fi
+          cargo build --release
 
       - name: Default macOS signing state
         if: matrix.kind == 'macos'

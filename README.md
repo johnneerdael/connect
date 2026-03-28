@@ -20,6 +20,8 @@ It is built for Windows, macOS, and Linux, stores secrets in the OS-native keych
 - TOFU host key verification with commands to list and delete saved host keys
 - local environment and live-profile diagnostics with `connect doctor`
 - saved foreground local TCP forwards and local SOCKS5 proxies
+- encrypted full backup and restore with runtime PSK protection
+- encrypted single-profile export and import with runtime PSK protection
 - standalone release artifacts for Linux, macOS, and Windows
 - shell completion generation
 
@@ -54,8 +56,11 @@ Tagged macOS releases can be signed in GitHub Actions when these repository secr
 - `MACOS_NOTARY_API_KEY_P8`
 - `MACOS_NOTARY_KEY_ID`
 - `MACOS_NOTARY_ISSUER_ID` (optional for team keys only)
+- `CONNECT_ARCHIVE_APP_KEY_HEX`
 
 The certificate payload secrets should contain base64-encoded `.p12` files for your `Developer ID Application` and `Developer ID Installer` certificates. `MACOS_NOTARY_API_KEY_P8` should contain the base64-encoded contents of your App Store Connect API `.p8` key, and `MACOS_NOTARY_KEY_ID` should be the matching key ID. The workflow stores notarization credentials in a temporary keychain profile before submitting the package, which allows both individual keys without an issuer and team keys with `MACOS_NOTARY_ISSUER_ID`. When notarization secrets are present, the workflow notarizes and staples the generated `.pkg`. When they are absent, the workflow still produces a signed-but-unstapled package so local development and forks do not break.
+
+`CONNECT_ARCHIVE_APP_KEY_HEX` must be a 64-character hex-encoded 256-bit key. Release builds fail when it is absent. Local debug builds use a non-production fallback key so backup/import flows remain testable without access to release secrets.
 
 ### Windows
 
@@ -121,6 +126,40 @@ Update or remove a profile:
 connect edit prod --host prod-2.example.com --auth-mode agent-only
 connect remove prod
 ```
+
+## Backup And Profile Transfer
+
+Create a full encrypted backup of all profiles, forwards, host keys, and stored secrets:
+
+```bash
+connect backup create --output ./connect-state.connectbak
+```
+
+Restore a full backup. This replaces all local profiles, forwards, host keys, and stored secrets:
+
+```bash
+connect backup restore --input ./connect-state.connectbak
+```
+
+Export one profile and its stored secrets:
+
+```bash
+connect profile export prod --output ./prod.connectprofile
+```
+
+Import one exported profile and its stored secrets:
+
+```bash
+connect profile import --input ./prod.connectprofile
+```
+
+Notes:
+
+- all four operations prompt for a PSK at runtime
+- backup restore is destructive unless you abort at the confirmation prompt
+- full backups include host keys
+- single-profile exports do not include host keys
+- archive files use two encryption layers: your PSK and an additional application-held key embedded into release builds
 
 ## File Copy
 

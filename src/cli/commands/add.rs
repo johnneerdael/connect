@@ -180,6 +180,8 @@ const RESERVED_PROFILE_NAMES: &[&str] = &[
     "list",
     "show",
     "copy",
+    "backup",
+    "profile",
     "hostkeys",
     "completion",
     "version",

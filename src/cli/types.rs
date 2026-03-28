@@ -23,6 +23,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
+    /// Create or restore complete encrypted backups.
+    Backup(BackupArgs),
     /// Open an interactive SSH shell.
     Open(OpenArgs),
     /// Execute a remote command without opening an interactive shell.
@@ -39,6 +41,8 @@ pub enum Command {
     List(ListArgs),
     /// Show details for an SSH profile.
     Show(ShowArgs),
+    /// Export or import a single saved profile.
+    Profile(ProfileArgs),
     /// Copy files between the local machine and a remote host.
     Copy(CopyArgs),
     /// Manage saved local SSH forwards.
@@ -118,6 +122,64 @@ pub struct ListArgs;
 pub struct ShowArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+pub struct BackupArgs {
+    #[command(subcommand)]
+    pub command: BackupCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum BackupCommand {
+    /// Create a full encrypted backup.
+    Create(BackupCreateArgs),
+    /// Restore a full encrypted backup.
+    Restore(BackupRestoreArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BackupCreateArgs {
+    #[arg(long, value_name = "PATH")]
+    pub output: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BackupRestoreArgs {
+    #[arg(long, value_name = "PATH")]
+    pub input: PathBuf,
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+pub struct ProfileArgs {
+    #[command(subcommand)]
+    pub command: ProfileCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ProfileCommand {
+    /// Export one saved profile and its secrets.
+    Export(ProfileExportArgs),
+    /// Import one saved profile and its secrets.
+    Import(ProfileImportArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProfileExportArgs {
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    #[arg(long, value_name = "PATH")]
+    pub output: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProfileImportArgs {
+    #[arg(long, value_name = "PATH")]
+    pub input: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
