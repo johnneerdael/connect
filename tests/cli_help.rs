@@ -71,7 +71,24 @@ fn completion_command_accepts_shell_argument() {
     cmd.args(["completion", "bash"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("connect"));
+        .stdout(predicates::str::contains("connect"))
+        .stdout(predicates::str::contains("-H"))
+        .stdout(predicates::str::contains("-u"))
+        .stdout(predicates::str::contains("-p"))
+        .stdout(predicates::str::contains("-a"))
+        .stdout(predicates::str::contains("-i"))
+        .stdout(predicates::str::contains("-t"))
+        .stdout(predicates::str::contains("-o"))
+        .stdout(predicates::str::contains("-l"))
+        .stdout(predicates::str::contains("-s"))
+        .stdout(predicates::str::contains("-d"))
+        .stdout(predicates::str::contains("--pk"))
+        .stdout(predicates::str::contains("--pw-stdin"))
+        .stdout(predicates::str::contains("--kp"))
+        .stdout(predicates::str::contains("--kp-stdin"))
+        .stdout(predicates::str::contains("--ct"))
+        .stdout(predicates::str::contains("--rs"))
+        .stdout(predicates::str::contains("--rt"));
 }
 
 #[test]
@@ -149,10 +166,21 @@ fn add_help_lists_secure_secret_input_flags() {
     cmd.args(["add", "--help"])
         .assert()
         .success()
+        .stdout(predicates::str::contains("-H, --host"))
+        .stdout(predicates::str::contains("-u, --user"))
+        .stdout(predicates::str::contains("-p, --port"))
+        .stdout(predicates::str::contains("-a, --auth-mode"))
+        .stdout(predicates::str::contains("-i, --private-key"))
+        .stdout(predicates::str::contains("-t, --copy-threads"))
         .stdout(predicates::str::contains("--auth-mode"))
         .stdout(predicates::str::contains("--password"))
         .stdout(predicates::str::contains("--password-stdin"))
-        .stdout(predicates::str::contains("--key-passphrase-stdin"));
+        .stdout(predicates::str::contains("--key-passphrase-stdin"))
+        .stdout(predicates::str::contains("--pk"))
+        .stdout(predicates::str::contains("--pw-stdin"))
+        .stdout(predicates::str::contains("--kp"))
+        .stdout(predicates::str::contains("--kp-stdin"))
+        .stdout(predicates::str::contains("--ct"));
 }
 
 #[test]
@@ -169,8 +197,8 @@ fn copy_parses_resume_and_progress_flags() {
     let cli = parse_cli(&[
         "connect",
         "copy",
-        "--resume",
-        "--progress",
+        "--rs",
+        "-p",
         "artifact.txt",
         "prod:/tmp/artifact.txt",
     ]);
@@ -192,9 +220,9 @@ fn copy_parses_thread_and_retry_flags() {
     let cli = parse_cli(&[
         "connect",
         "copy",
-        "--threads",
+        "-t",
         "4",
-        "--retry",
+        "--rt",
         "artifact.txt",
         "prod:/tmp/artifact.txt",
     ]);
@@ -214,13 +242,15 @@ fn copy_help_lists_threads_and_retry_flags() {
     cmd.args(["copy", "--help"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("--threads"))
-        .stdout(predicates::str::contains("--retry"));
+        .stdout(predicates::str::contains("-p, --progress"))
+        .stdout(predicates::str::contains("-t, --threads"))
+        .stdout(predicates::str::contains("--rs"))
+        .stdout(predicates::str::contains("--rt"));
 }
 
 #[test]
 fn backup_create_and_restore_parse_explicit_subcommands() {
-    let create = parse_cli(&["connect", "backup", "create", "--output", "state.connectbak"]);
+    let create = parse_cli(&["connect", "backup", "create", "-o", "state.connectbak"]);
     match create.command {
         Some(CliCommand::Backup(args)) => match args.command {
             BackupCommand::Create(args) => {
@@ -231,7 +261,7 @@ fn backup_create_and_restore_parse_explicit_subcommands() {
         other => panic!("expected backup command, got {other:?}"),
     }
 
-    let restore = parse_cli(&["connect", "backup", "restore", "--input", "state.connectbak"]);
+    let restore = parse_cli(&["connect", "backup", "restore", "-i", "state.connectbak"]);
     match restore.command {
         Some(CliCommand::Backup(args)) => match args.command {
             BackupCommand::Restore(args) => {
@@ -251,7 +281,7 @@ fn profile_export_and_import_parse_explicit_subcommands() {
         "profile",
         "export",
         "prod",
-        "--output",
+        "-o",
         "prod.connectprofile",
     ]);
     match export.command {
@@ -265,7 +295,7 @@ fn profile_export_and_import_parse_explicit_subcommands() {
         other => panic!("expected profile command, got {other:?}"),
     }
 
-    let import = parse_cli(&["connect", "profile", "import", "--input", "prod.connectprofile"]);
+    let import = parse_cli(&["connect", "profile", "import", "-i", "prod.connectprofile"]);
     match import.command {
         Some(CliCommand::Profile(args)) => match args.command {
             ProfileCommand::Import(args) => {
@@ -298,15 +328,199 @@ fn exec_help_lists_pty_and_command_usage() {
     cmd.args(["exec", "--help"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("--pty"))
+        .stdout(predicates::str::contains("-t, --pty"))
         .stdout(predicates::str::contains("COMMAND"));
 }
 
 #[test]
 fn exec_command_accepts_separator_and_trailing_args() {
     let mut cmd = connect_test_bin();
-    cmd.args(["exec", "prod", "--", "printf", "hello"])
+    cmd.args(["exec", "-t", "prod", "--", "printf", "hello"])
         .assert()
         .failure()
         .stderr(predicates::str::contains("profile 'prod' was not found"));
+}
+
+#[test]
+fn add_and_edit_accept_short_aliases() {
+    let add = parse_cli(&[
+        "connect",
+        "add",
+        "prod",
+        "-H",
+        "example.internal",
+        "-u",
+        "alice",
+        "-p",
+        "2222",
+        "-a",
+        "stored-only",
+        "-i",
+        "/tmp/id_ed25519",
+        "-t",
+        "6",
+    ]);
+    match add.command {
+        Some(CliCommand::Add(args)) => {
+            assert_eq!(args.host.as_deref(), Some("example.internal"));
+            assert_eq!(args.user.as_deref(), Some("alice"));
+            assert_eq!(args.port, Some(2222));
+            assert_eq!(args.auth_mode.to_string(), "stored-only");
+            assert_eq!(
+                args.private_key.as_deref().map(|path| path.to_string_lossy()),
+                Some("/tmp/id_ed25519".into())
+            );
+            assert_eq!(args.copy_threads, Some(6));
+        }
+        other => panic!("expected add command, got {other:?}"),
+    }
+
+    let edit = parse_cli(&[
+        "connect",
+        "edit",
+        "prod",
+        "-H",
+        "example.net",
+        "-u",
+        "bob",
+        "-p",
+        "2200",
+        "-a",
+        "agent-only",
+        "-i",
+        "/tmp/id_other",
+        "-t",
+        "3",
+    ]);
+    match edit.command {
+        Some(CliCommand::Edit(args)) => {
+            assert_eq!(args.host.as_deref(), Some("example.net"));
+            assert_eq!(args.user.as_deref(), Some("bob"));
+            assert_eq!(args.port, Some(2200));
+            assert_eq!(args.auth_mode.map(|mode| mode.to_string()).as_deref(), Some("agent-only"));
+            assert_eq!(
+                args.private_key.as_deref().map(|path| path.to_string_lossy()),
+                Some("/tmp/id_other".into())
+            );
+            assert_eq!(args.copy_threads, Some(3));
+        }
+        other => panic!("expected edit command, got {other:?}"),
+    }
+}
+
+#[test]
+fn add_and_edit_accept_compact_long_aliases() {
+    let add = parse_cli(&[
+        "connect",
+        "add",
+        "prod",
+        "--pk",
+        "/tmp/id_ed25519",
+        "--pw-stdin",
+        "--kp-stdin",
+        "--ct",
+        "4",
+    ]);
+    match add.command {
+        Some(CliCommand::Add(args)) => {
+            assert_eq!(
+                args.private_key.as_deref().map(|path| path.to_string_lossy()),
+                Some("/tmp/id_ed25519".into())
+            );
+            assert!(args.password_stdin);
+            assert!(args.key_passphrase_stdin);
+            assert_eq!(args.copy_threads, Some(4));
+        }
+        other => panic!("expected add command, got {other:?}"),
+    }
+
+    let add_key_passphrase = parse_cli(&["connect", "add", "prod", "--kp"]);
+    match add_key_passphrase.command {
+        Some(CliCommand::Add(args)) => {
+            assert!(args.key_passphrase);
+        }
+        other => panic!("expected add command, got {other:?}"),
+    }
+
+    let edit = parse_cli(&[
+        "connect",
+        "edit",
+        "prod",
+        "--pk",
+        "/tmp/id_other",
+        "--pw-stdin",
+        "--kp-stdin",
+        "--ct",
+        "2",
+    ]);
+    match edit.command {
+        Some(CliCommand::Edit(args)) => {
+            assert_eq!(
+                args.private_key.as_deref().map(|path| path.to_string_lossy()),
+                Some("/tmp/id_other".into())
+            );
+            assert!(args.password_stdin);
+            assert!(args.key_passphrase_stdin);
+            assert_eq!(args.copy_threads, Some(2));
+        }
+        other => panic!("expected edit command, got {other:?}"),
+    }
+
+    let edit_key_passphrase = parse_cli(&["connect", "edit", "prod", "--kp"]);
+    match edit_key_passphrase.command {
+        Some(CliCommand::Edit(args)) => {
+            assert!(args.key_passphrase);
+        }
+        other => panic!("expected edit command, got {other:?}"),
+    }
+}
+
+#[test]
+fn forward_short_aliases_parse_for_add_and_run() {
+    let add = parse_cli(&[
+        "connect",
+        "forward",
+        "add",
+        "prod",
+        "db",
+        "-l",
+        "127.0.0.1:15432:db.internal:5432",
+        "-d",
+        "Database tunnel",
+    ]);
+    match add.command {
+        Some(CliCommand::Forward(args)) => match args.command {
+            ForwardCommand::Add(args) => {
+                assert_eq!(
+                    args.local.as_deref(),
+                    Some("127.0.0.1:15432:db.internal:5432")
+                );
+                assert_eq!(args.description.as_deref(), Some("Database tunnel"));
+            }
+            other => panic!("expected forward add command, got {other:?}"),
+        },
+        other => panic!("expected forward command, got {other:?}"),
+    }
+
+    let socks = parse_cli(&["connect", "forward", "add", "prod", "web", "-s", "1080"]);
+    match socks.command {
+        Some(CliCommand::Forward(args)) => match args.command {
+            ForwardCommand::Add(args) => {
+                assert_eq!(args.socks.as_deref(), Some("1080"));
+            }
+            other => panic!("expected forward add command, got {other:?}"),
+        },
+        other => panic!("expected forward command, got {other:?}"),
+    }
+
+    let run = parse_cli(&["connect", "forward", "run", "prod", "-a"]);
+    match run.command {
+        Some(CliCommand::Forward(args)) => match args.command {
+            ForwardCommand::Run(args) => {
+                assert!(args.all);
+            }
+            other => panic!("expected forward run command, got {other:?}"),
+        },
+        other => panic!("expected forward command, got {other:?}"),
+    }
 }

@@ -74,6 +74,12 @@ Add a profile with interactive secret entry:
 connect add prod --host prod.example.com --user alice --password --auth-mode auto
 ```
 
+Common short aliases are also available for frequent options, for example:
+
+```bash
+connect add prod -H prod.example.com -u alice -a auto
+```
+
 Import a private key from disk. The key is read once and stored in the OS keychain:
 
 ```bash
@@ -210,6 +216,13 @@ connect copy --threads 4 ./artifact.tgz prod:/tmp/artifact.tgz
 connect copy --recursive --threads 4 ./site prod:/var/www/site
 ```
 
+Short aliases are available for the most common copy flags:
+
+```bash
+connect copy -p -t 4 ./artifact.tgz prod:/tmp/artifact.tgz
+connect copy --rs -r ./site prod:/var/www/site
+```
+
 Retry transient threaded copy failures in-run:
 
 ```bash
@@ -254,6 +267,8 @@ connect forward add prod proxy --socks 127.0.0.1:1080
 connect forward list prod
 connect forward remove prod db
 ```
+
+The forward subcommands also support short aliases like `-l`, `-s`, `-d`, and `-a`.
 
 Run one saved forward:
 
@@ -313,6 +328,8 @@ connect completion zsh
 connect completion fish
 connect completion powershell
 ```
+
+Completion output includes both canonical long flags and the supported short aliases.
 
 ## Development
 

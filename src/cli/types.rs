@@ -59,25 +59,25 @@ pub enum Command {
 pub struct AddArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
-    #[arg(long)]
+    #[arg(long, short = 'H')]
     pub host: Option<String>,
-    #[arg(long = "user")]
+    #[arg(long = "user", short = 'u')]
     pub user: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'p')]
     pub port: Option<u16>,
-    #[arg(long, default_value_t = AuthMode::Auto, value_parser = parse_auth_mode)]
+    #[arg(long, short = 'a', default_value_t = AuthMode::Auto, value_parser = parse_auth_mode)]
     pub auth_mode: AuthMode,
     #[arg(long, conflicts_with = "password_stdin")]
     pub password: bool,
-    #[arg(long = "password-stdin", conflicts_with = "password")]
+    #[arg(long = "password-stdin", visible_alias = "pw-stdin", conflicts_with = "password")]
     pub password_stdin: bool,
-    #[arg(long = "private-key", value_name = "PATH")]
+    #[arg(long = "private-key", short = 'i', visible_alias = "pk", value_name = "PATH")]
     pub private_key: Option<PathBuf>,
-    #[arg(long = "key-passphrase", conflicts_with = "key_passphrase_stdin")]
+    #[arg(long = "key-passphrase", visible_alias = "kp", conflicts_with = "key_passphrase_stdin")]
     pub key_passphrase: bool,
-    #[arg(long = "key-passphrase-stdin", conflicts_with = "key_passphrase")]
+    #[arg(long = "key-passphrase-stdin", visible_alias = "kp-stdin", conflicts_with = "key_passphrase")]
     pub key_passphrase_stdin: bool,
-    #[arg(long = "copy-threads", value_parser = parse_copy_threads)]
+    #[arg(long = "copy-threads", short = 't', visible_alias = "ct", value_parser = parse_copy_threads)]
     pub copy_threads: Option<usize>,
 }
 
@@ -85,25 +85,25 @@ pub struct AddArgs {
 pub struct EditArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
-    #[arg(long)]
+    #[arg(long, short = 'H')]
     pub host: Option<String>,
-    #[arg(long = "user")]
+    #[arg(long = "user", short = 'u')]
     pub user: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'p')]
     pub port: Option<u16>,
-    #[arg(long, value_parser = parse_auth_mode)]
+    #[arg(long, short = 'a', value_parser = parse_auth_mode)]
     pub auth_mode: Option<AuthMode>,
     #[arg(long, conflicts_with = "password_stdin")]
     pub password: bool,
-    #[arg(long = "password-stdin", conflicts_with = "password")]
+    #[arg(long = "password-stdin", visible_alias = "pw-stdin", conflicts_with = "password")]
     pub password_stdin: bool,
-    #[arg(long = "private-key", value_name = "PATH")]
+    #[arg(long = "private-key", short = 'i', visible_alias = "pk", value_name = "PATH")]
     pub private_key: Option<PathBuf>,
-    #[arg(long = "key-passphrase", conflicts_with = "key_passphrase_stdin")]
+    #[arg(long = "key-passphrase", visible_alias = "kp", conflicts_with = "key_passphrase_stdin")]
     pub key_passphrase: bool,
-    #[arg(long = "key-passphrase-stdin", conflicts_with = "key_passphrase")]
+    #[arg(long = "key-passphrase-stdin", visible_alias = "kp-stdin", conflicts_with = "key_passphrase")]
     pub key_passphrase_stdin: bool,
-    #[arg(long = "copy-threads", value_parser = parse_copy_threads)]
+    #[arg(long = "copy-threads", short = 't', visible_alias = "ct", value_parser = parse_copy_threads)]
     pub copy_threads: Option<usize>,
 }
 
@@ -141,13 +141,13 @@ pub enum BackupCommand {
 
 #[derive(Args, Debug, Clone)]
 pub struct BackupCreateArgs {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 'o', value_name = "PATH")]
     pub output: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct BackupRestoreArgs {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 'i', value_name = "PATH")]
     pub input: PathBuf,
     #[arg(long, short = 'y')]
     pub yes: bool,
@@ -172,13 +172,13 @@ pub enum ProfileCommand {
 pub struct ProfileExportArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 'o', value_name = "PATH")]
     pub output: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct ProfileImportArgs {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 'i', value_name = "PATH")]
     pub input: PathBuf,
 }
 
@@ -186,13 +186,13 @@ pub struct ProfileImportArgs {
 pub struct CopyArgs {
     #[arg(long, short = 'r')]
     pub recursive: bool,
-    #[arg(long)]
+    #[arg(long, visible_alias = "rs")]
     pub resume: bool,
-    #[arg(long)]
+    #[arg(long, short = 'p')]
     pub progress: bool,
-    #[arg(long, value_name = "COUNT", value_parser = parse_copy_threads)]
+    #[arg(long, short = 't', value_name = "COUNT", value_parser = parse_copy_threads)]
     pub threads: Option<usize>,
-    #[arg(long)]
+    #[arg(long, visible_alias = "rt")]
     pub retry: bool,
     #[arg(value_name = "SOURCE")]
     pub source: String,
@@ -210,7 +210,7 @@ pub struct OpenArgs {
 pub struct ExecArgs {
     #[arg(value_name = "PROFILE")]
     pub profile: String,
-    #[arg(long)]
+    #[arg(long, short = 't')]
     pub pty: bool,
     #[arg(
         value_name = "COMMAND",
@@ -252,11 +252,11 @@ pub struct ForwardAddArgs {
     pub profile: String,
     #[arg(value_name = "NAME")]
     pub name: String,
-    #[arg(long, conflicts_with = "socks")]
+    #[arg(long, short = 'l', conflicts_with = "socks")]
     pub local: Option<String>,
-    #[arg(long, conflicts_with = "local")]
+    #[arg(long, short = 's', conflicts_with = "local")]
     pub socks: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'd')]
     pub description: Option<String>,
 }
 
@@ -282,7 +282,7 @@ pub struct ForwardRunArgs {
     pub profile: String,
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'a')]
     pub all: bool,
 }
 
