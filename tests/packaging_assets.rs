@@ -36,6 +36,7 @@ fn packaging_assets_exist() {
             "sudo xcode-select -s",
             "xcrun notarytool --version",
             "xcrun notarytool store-credentials",
+            "skipping notarization",
             "--keychain-profile",
             "xcrun notarytool submit",
             "xcrun stapler staple",
@@ -43,6 +44,7 @@ fn packaging_assets_exist() {
             "codesign",
             "productsign",
             "pkgbuild",
+            "dotnet tool install --global wix --version 6.0.2",
             "wix build",
         ],
     );

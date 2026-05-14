@@ -131,16 +131,22 @@ jobs:
           chmod 600 "$NOTARY_KEY_PATH"
 
           if [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
-            xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            if ! xcrun notarytool store-credentials "$NOTARY_PROFILE" \
               --key "$NOTARY_KEY_PATH" \
               --key-id "$MACOS_NOTARY_KEY_ID" \
               --issuer "$MACOS_NOTARY_ISSUER_ID" \
-              --keychain "$KEYCHAIN_PATH"
+              --keychain "$KEYCHAIN_PATH"; then
+              echo "::warning::macOS notarization credential validation failed; skipping notarization"
+              exit 0
+            fi
           else
-            printf '\n' | xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            if ! printf '\n' | xcrun notarytool store-credentials "$NOTARY_PROFILE" \
               --key "$NOTARY_KEY_PATH" \
               --key-id "$MACOS_NOTARY_KEY_ID" \
-              --keychain "$KEYCHAIN_PATH"
+              --keychain "$KEYCHAIN_PATH"; then
+              echo "::warning::macOS notarization credential validation failed; skipping notarization"
+              exit 0
+            fi
           fi
 
           echo "MACOS_NOTARIZATION_ENABLED=true" >> "$GITHUB_ENV"
@@ -197,7 +203,7 @@ jobs:
         if: matrix.kind == 'windows'
         shell: pwsh
         run: |
-          dotnet tool install --global wix
+          dotnet tool install --global wix --version 6.0.2
           $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
 
       - name: Package Windows installer

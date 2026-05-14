@@ -375,4 +375,4 @@ Notarization uses an App Store Connect API key:
 - `MACOS_NOTARY_KEY_ID`
 - `MACOS_NOTARY_ISSUER_ID` only when the key is a team key
 
-When signing secrets are missing, the workflow falls back to unsigned macOS packaging. When signing secrets are present but notarization secrets are missing, the workflow still produces a signed package without notarization.
+When signing secrets are missing, the workflow falls back to unsigned macOS packaging. When signing secrets are present but notarization secrets are missing or cannot be validated, the workflow still produces a signed package without notarization.
