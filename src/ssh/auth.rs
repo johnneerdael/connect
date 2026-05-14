@@ -134,8 +134,13 @@ async fn authenticate_auto(
     profile: &Profile,
     auth: &ProfileAuth,
 ) -> Result<()> {
-    if super::agent_auth_available() && session.authenticate_agent(&profile.username).await? {
-        return Ok(());
+    if super::agent_auth_available() {
+        match session.authenticate_agent(&profile.username).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(_) if !auth.is_empty() => {}
+            Err(error) => return Err(error),
+        }
     }
 
     if try_stored_key(session, profile, auth).await? {
@@ -252,7 +257,13 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, pin::Pin, sync::mpsc, thread, time::Duration};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{mpsc, Arc, Mutex},
+        thread,
+        time::Duration,
+    };
 
     use crate::{
         ssh::ObservedHostKey,
@@ -309,6 +320,32 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn auto_falls_back_to_stored_key_when_agent_is_unconnectable() {
+        let _agent = EnvVarGuard::set("SSH_AUTH_SOCK", "/tmp/connect-test-missing-agent.sock");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut session = AgentErrorThenKeySession {
+            attempts: Arc::clone(&attempts),
+        };
+        let profile = test_profile();
+        let auth = ProfileAuth {
+            auth_mode: AuthMode::Auto,
+            password: None,
+            private_key: Some("-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n".into()),
+            key_passphrase: None,
+        };
+
+        authenticate_session(&mut session, &profile, &auth)
+            .await
+            .expect("stored key should be tried after an unavailable agent");
+
+        assert_eq!(
+            attempts.lock().unwrap().as_slice(),
+            ["agent", "key"],
+            "auto auth should try agent first, then stored key"
+        );
+    }
+
     fn test_profile() -> Profile {
         Profile {
             name: "prod".into(),
@@ -322,6 +359,76 @@ mod tests {
             has_key_passphrase: false,
             created_at: String::new(),
             updated_at: String::new(),
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    struct AgentErrorThenKeySession {
+        attempts: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SshSession for AgentErrorThenKeySession {
+        fn observe_host_key<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<ObservedHostKey>> + Send + 'a>> {
+            Box::pin(async move { unreachable!("auth-only test does not observe host keys") })
+        }
+
+        fn authenticate_agent<'a>(
+            &'a mut self,
+            _username: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+            let attempts = Arc::clone(&self.attempts);
+            Box::pin(async move {
+                attempts.lock().unwrap().push("agent");
+                Err(Error::new("ssh agent is not available: missing socket"))
+            })
+        }
+
+        fn authenticate_public_key<'a>(
+            &'a mut self,
+            _username: &'a str,
+            _private_key: &'a str,
+            _passphrase: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+            let attempts = Arc::clone(&self.attempts);
+            Box::pin(async move {
+                attempts.lock().unwrap().push("key");
+                Ok(true)
+            })
+        }
+
+        fn authenticate_password<'a>(
+            &'a mut self,
+            _username: &'a str,
+            _password: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+            Box::pin(async move { Ok(false) })
+        }
+
+        fn open_shell<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>> {
+            Box::pin(async move { Ok(0) })
         }
     }
 
